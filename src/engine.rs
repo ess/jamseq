@@ -112,11 +112,12 @@ impl JamSeqHost {
     }
 
     pub fn set_sample_rate(&mut self, rate: f32) {
-        if rate > 0.0 {
+        if rate > 0.0 && (rate - self.sample_rate).abs() > 0.01 {
             self.sample_rate = rate;
             self.timeline.sample_rate = rate as f64;
             for t in &mut self.tracks {
                 t.set_sample_rate(rate);
+                t.mark_stem_dirty();
             }
         }
     }
@@ -629,7 +630,10 @@ impl JamSeqHost {
     }
 
     pub fn play(&mut self) {
-        self.timeline.play();
+        if !self.timeline.is_playing {
+            self.generate_stems_for_dirty_tracks();
+            self.timeline.play();
+        }
     }
 
     pub fn pause(&mut self) {
@@ -1014,12 +1018,22 @@ impl JamSeqHost {
         let orig_pos = self.timeline.current_tick;
         let orig_loop = self.timeline.loop_enabled;
         let orig_master_inserts = std::mem::take(&mut self.master_bus.inserts);
+        let orig_track_vol = self.tracks[target_idx].volume;
+        let orig_track_pan = self.tracks[target_idx].pan;
+        let orig_master_gain = self.master_gain;
+        let orig_master_vol = self.master_bus.volume;
+        let orig_master_pan = self.master_bus.pan;
 
-        // Solo target track and mute aux return buses to capture isolated track stem
+        // Solo target track at unity gain and mute aux return buses to capture isolated pure track stem
         for t in &mut self.tracks {
             t.solo = t.id == track_id;
             t.muted = false;
         }
+        self.tracks[target_idx].volume = 1.0;
+        self.tracks[target_idx].pan = 0.0;
+        self.master_gain = 1.0;
+        self.master_bus.volume = 1.0;
+        self.master_bus.pan = 0.0;
         for b in &mut self.aux_buses {
             b.muted = true;
         }
@@ -1048,8 +1062,13 @@ impl JamSeqHost {
 
         self.timeline.pause();
 
-        // Restore target track stem and states
+        // Restore target track stem, faders, and states
         self.tracks[target_idx].cached_stem = orig_stem;
+        self.tracks[target_idx].volume = orig_track_vol;
+        self.tracks[target_idx].pan = orig_track_pan;
+        self.master_gain = orig_master_gain;
+        self.master_bus.volume = orig_master_vol;
+        self.master_bus.pan = orig_master_pan;
         for (i, t) in self.tracks.iter_mut().enumerate() {
             if i < orig_states.len() {
                 t.muted = orig_states[i].0;

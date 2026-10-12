@@ -480,22 +480,22 @@ impl Track {
             if let Some(ref stem) = self.cached_stem {
                 if let Some(ref buf) = stem.buffer {
                     let clip_len = buf.samples_left.len() as u64;
-                    let clip_end = stem.start_sample + clip_len;
-                    let block_end = current_timeline_sample + num_samples as u64;
+                    if clip_len > 0 {
+                        let rel_sample = if current_timeline_sample >= stem.start_sample {
+                            current_timeline_sample - stem.start_sample
+                        } else {
+                            0
+                        };
 
-                    if block_end > stem.start_sample && current_timeline_sample < clip_end {
                         for i in 0..num_samples {
-                            let sample_pos = current_timeline_sample + i as u64;
-                            if sample_pos >= stem.start_sample && sample_pos < clip_end {
-                                let offset = (sample_pos - stem.start_sample) as usize;
-                                if offset < buf.samples_left.len() {
-                                    scratch_left[i] += buf.samples_left[offset];
-                                    scratch_right[i] += buf.samples_right[offset];
-                                }
+                            let offset = ((rel_sample + i as u64) % clip_len) as usize;
+                            if offset < buf.samples_left.len() {
+                                scratch_left[i] += buf.samples_left[offset];
+                                scratch_right[i] += buf.samples_right[offset];
                             }
                         }
+                        played_from_stem = true;
                     }
-                    played_from_stem = true;
                 }
             }
         }

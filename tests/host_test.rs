@@ -730,4 +730,171 @@ fn test_autostem_mid_event_pause_and_unpause() {
     assert!(host.tracks[pad_idx].cached_stem.is_some(), "Pause must auto-bake dirty stems");
 }
 
+#[test]
+fn test_debug_playback_demo() {
+    let mut host = JamSeqHost::new(68.0, 48000.0);
+    let sr = 48000.0;
+    if let Some(jamsynth_path) = jamseq::plugin_scanner::find_jamsynth_plugin() {
+        if let Ok(bass_clap) = jamseq::clap_host::ClapTrack::load(&jamsynth_path.to_string_lossy(), sr) {
+            host.add_track(Track::new_clap("bass", "Sub 808 (Drake Slide)", bass_clap, "JamSynth (Sub 808)"));
+        } else {
+            let mut bass_engine = JamSynthEngine::new(sr);
+            bass_engine.load_patch(JamSynthPatch::preset_808_sub());
+            host.add_track(Track::new_synth("bass", "Sub 808 (Drake Slide)", bass_engine));
+        }
+
+        if let Ok(pad_clap) = jamseq::clap_host::ClapTrack::load(&jamsynth_path.to_string_lossy(), sr) {
+            host.add_track(Track::new_clap("pad", "Cold Pad (D-Minor 9th)", pad_clap, "JamSynth (Cold Pad)"));
+        } else {
+            let mut pad_engine = JamSynthEngine::new(sr);
+            pad_engine.load_patch(JamSynthPatch::preset_cold_pad());
+            host.add_track(Track::new_synth("pad", "Cold Pad (D-Minor 9th)", pad_engine));
+        }
+    } else {
+        let mut bass_engine = JamSynthEngine::new(sr);
+        bass_engine.load_patch(JamSynthPatch::preset_808_sub());
+        host.add_track(Track::new_synth("bass", "Sub 808 (Drake Slide)", bass_engine));
+
+        let mut pad_engine = JamSynthEngine::new(sr);
+        pad_engine.load_patch(JamSynthPatch::preset_cold_pad());
+        host.add_track(Track::new_synth("pad", "Cold Pad (D-Minor 9th)", pad_engine));
+    }
+
+    let avl_uri = "http://gareus.org/oss/lv2/avldrums#BlackPearl";
+    if let Ok(drums_lv2) = jamseq::lv2_host::Lv2Track::load(avl_uri, sr) {
+        host.add_track(Track::new_lv2("drums", "Drums (Black Pearl)", drums_lv2, "Black Pearl Drumkit"));
+    }
+
+    // Schedule 4 bars identical to main.rs
+    let mut events = Vec::new();
+    let mut next_id = 1u64;
+    let mut add_ev = |events: &mut Vec<ScheduledEvent>, tick: u64, track_id: &str, action: ScheduledAction| {
+        events.push(ScheduledEvent::new(next_id, tick, track_id, action));
+        next_id += 1;
+    };
+    add_ev(&mut events, 0, "bass", ScheduledAction::NoteOn { note: 50, velocity: 1.0 });
+    add_ev(&mut events, 6 * 240, "bass", ScheduledAction::NoteOff { note: 50 });
+    add_ev(&mut events, 0, "drums", ScheduledAction::NoteOn { note: 36, velocity: 1.0 });
+    add_ev(&mut events, 120, "drums", ScheduledAction::NoteOff { note: 36 });
+    for &n in &[50, 53, 57, 60, 64] {
+        add_ev(&mut events, 4 * 240, "pad", ScheduledAction::NoteOn { note: n, velocity: 0.7 });
+        add_ev(&mut events, 12 * 240, "pad", ScheduledAction::NoteOff { note: n });
+    }
+
+    let arr = jamseq::timeline::TimelineArrangement {
+        title: "Test".to_string(),
+        bpm: 68.0,
+        total_bars: 4,
+        loop_enabled: true,
+        sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4, 1)],
+        events,
+    };
+    host.load_arrangement(arr);
+
+    for (i, t) in host.tracks.iter().enumerate() {
+        if let Some(ref stem) = t.cached_stem {
+            if let Some(ref buf) = stem.buffer {
+                let max_l: f32 = buf.samples_left.iter().map(|s| s.abs()).fold(0.0, f32::max);
+                println!("Track {} ({}) stem len={}, max_l={}", i, t.id, buf.samples_left.len(), max_l);
+            }
+        } else {
+            println!("Track {} ({}) has NO cached stem", i, t.id);
+        }
+    }
+
+    host.set_sample_rate(44100.0);
+
+    host.play();
+    let mut out_l = vec![0.0f32; 512];
+    let mut out_r = vec![0.0f32; 512];
+    let mut total_peak = 0.0f32;
+    for block in 0..30 {
+        host.process_block(&mut out_l, &mut out_r);
+        let peak: f32 = out_l.iter().chain(out_r.iter()).map(|s| s.abs()).fold(0.0, f32::max);
+        if peak > total_peak {
+            total_peak = peak;
+        }
+        if block == 0 || block == 5 || block == 15 {
+            println!("Block {}: peak = {}", block, peak);
+        }
+    }
+    println!("Total peak over 30 blocks: {}", total_peak);
+    assert!(total_peak > 0.001, "Playback must produce audible output!");
+}
+
+#[test]
+fn test_server_playback_over_ipc() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    let temp_dir = std::env::temp_dir();
+    let sock_path = temp_dir.join("test_server_playback.sock");
+    let _ = std::fs::remove_file(&sock_path);
+
+    let mut host = JamSeqHost::new(68.0, 48000.0);
+    let mut bass = JamSynthEngine::new(48000.0);
+    bass.load_patch(JamSynthPatch::preset_808_sub());
+    host.add_track(Track::new_synth("bass", "Sub 808", bass));
+
+    let mut events = Vec::new();
+    events.push(ScheduledEvent::new(1, 0, "bass", ScheduledAction::NoteOn { note: 50, velocity: 1.0 }));
+    events.push(ScheduledEvent::new(2, 6 * 240, "bass", ScheduledAction::NoteOff { note: 50 }));
+
+    let arr = jamseq::timeline::TimelineArrangement {
+        title: "Test".to_string(),
+        bpm: 68.0,
+        total_bars: 4,
+        loop_enabled: true,
+        sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4, 1)],
+        events,
+    };
+    host.load_arrangement(arr);
+
+    let host_arc = Arc::new(Mutex::new(host));
+
+    let server = jamseq::ipc::IpcServer::new(&sock_path);
+    server.start(Arc::clone(&host_arc)).expect("Failed to start IPC server");
+    thread::sleep(Duration::from_millis(50));
+
+    // Connect client
+    let mut stream = UnixStream::connect(&sock_path).expect("Failed to connect");
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    // 1. Get status before play
+    writeln!(stream, "{{\"cmd\":\"GetStatus\"}}").unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let resp: jamseq::ipc::IpcResponse = serde_json::from_str(&line).unwrap();
+    assert!(!resp.status.unwrap().is_playing);
+
+    // 2. Send Play command
+    writeln!(stream, "{{\"cmd\":\"Play\"}}").unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let resp: jamseq::ipc::IpcResponse = serde_json::from_str(&line).unwrap();
+    let status = resp.status.unwrap();
+    println!("Status after Play: is_playing={}", status.is_playing);
+    assert!(status.is_playing);
+
+    // 3. Process blocks as CPAL would
+    let mut out_l = vec![0.0f32; 512];
+    let mut out_r = vec![0.0f32; 512];
+    let mut total_peak = 0.0f32;
+    for _ in 0..10 {
+        let mut h = host_arc.lock().unwrap();
+        h.process_block(&mut out_l, &mut out_r);
+        let peak: f32 = out_l.iter().chain(out_r.iter()).map(|s| s.abs()).fold(0.0, f32::max);
+        if peak > total_peak {
+            total_peak = peak;
+        }
+    }
+    println!("Total peak in IPC play test: {}", total_peak);
+    assert!(total_peak > 0.001);
+}
+
+
+
 
