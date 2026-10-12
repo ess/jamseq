@@ -131,6 +131,7 @@ pub struct TrackStatus {
     pub pan: f32,
     pub muted: bool,
     pub solo: bool,
+    pub peak_level: f32,
     pub params: Vec<TrackParamStatus>,
     pub current_plugin: Option<String>,
 }
@@ -145,6 +146,7 @@ pub struct IpcStatusResponse {
     pub total_ticks: u64,
     pub bpm: f64,
     pub master_volume: f32,
+    pub master_peak: f32,
     pub is_recording: bool,
     pub mic_peak: f32,
     pub active_section_id: Option<String>,
@@ -434,6 +436,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 pan: t.pan,
                 muted: t.muted,
                 solo: t.solo,
+                peak_level: t.peak_level,
                 params,
                 current_plugin: t.current_plugin.clone(),
             }
@@ -451,6 +454,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
         total_ticks: h.timeline.total_ticks,
         bpm: h.timeline.bpm,
         master_volume: h.master_gain,
+        master_peak: h.master_peak,
         is_recording: h.recorder.is_recording(),
         mic_peak: h.recorder.get_peak_input(),
         active_section_id: active_section,
