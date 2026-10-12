@@ -272,6 +272,16 @@ fn test_clap_and_lv2_plugin_hosting() {
         host.switch_track_instrument("track1", surge_path, "Surge XT");
         assert_eq!(host.tracks[0].current_plugin.as_deref(), Some("Surge XT"));
 
+        // Verify native CLAP parameter introspection
+        let params = host.tracks[0].get_parameters();
+        println!("Introspected {} parameters for Surge XT CLAP", params.len());
+        assert!(!params.is_empty(), "Surge XT should expose parameters natively via clack PluginParams");
+
+        // Test updating a parameter
+        let (ref name, _val, min, max) = params[0];
+        let test_val = (min + max) / 2.0;
+        host.tracks[0].set_parameter(name, test_val);
+
         // Trigger note on and process audio block
         host.tracks[0].note_on(60, 1.0);
         let mut left = vec![0.0f32; 512];
@@ -288,6 +298,24 @@ fn test_clap_and_lv2_plugin_hosting() {
     let avl_uri = "http://gareus.org/oss/lv2/avldrums#BlackPearl";
     host.switch_track_instrument("track1", avl_uri, "Black Pearl Drumkit");
     assert_eq!(host.tracks[0].current_plugin.as_deref(), Some("Black Pearl Drumkit"));
+
+    // Verify native LV2 parameter introspection on AVL Drums (pure sampler with 0 control ports)
+    let avl_params = host.tracks[0].get_parameters();
+    println!("Introspected {} parameters for AVL Drums LV2", avl_params.len());
+
+    // Switch to Surge XT LV2 to verify LV2 ControlPort introspection
+    let surge_lv2_uri = "https://surge-synthesizer.github.io/lv2/surge-xt";
+    host.switch_track_instrument("track1", surge_lv2_uri, "Surge XT LV2");
+    let surge_lv2_params = host.tracks[0].get_parameters();
+    println!("Introspected {} parameters for Surge XT LV2", surge_lv2_params.len());
+    assert!(!surge_lv2_params.is_empty(), "Surge XT LV2 should expose parameters natively via Lilv ControlPorts");
+
+    let (ref name, _val, min, max) = surge_lv2_params[0];
+    let test_val = (min + max) / 2.0;
+    host.tracks[0].set_parameter(name, test_val);
+
+    // Switch back to Black Pearl for drum audio verification
+    host.switch_track_instrument("track1", avl_uri, "Black Pearl Drumkit");
 
     let mut left = vec![0.0f32; 512];
     let mut right = vec![0.0f32; 512];

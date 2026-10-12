@@ -11,8 +11,7 @@ cpal = "0.15"
 hound = "3.5"
 anyhow = "1.0"
 clack-host = "0.2.0"
-clack-extensions = { version = "0.2.0", features = ["clack-host", "gui", "timer", "posix-fd"] }
+clack-extensions = { version = "0.2.0", features = ["clack-host", "params", "timer", "posix-fd"] }
 lilv = "0.2"
 lv2_raw = "0.2"
-x11rb = "0.13"
 libloading = "0.8"

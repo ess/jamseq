@@ -130,8 +130,8 @@ impl Track {
             }
             TrackInstrument::Sampler(_) => {}
             TrackInstrument::AudioClips(_) => {}
-            TrackInstrument::Clap(_) => {}
-            TrackInstrument::Lv2(_) => {}
+            TrackInstrument::Clap(clap) => clap.set_parameter(param_name, value),
+            TrackInstrument::Lv2(lv2) => lv2.set_parameter(param_name, value),
         }
     }
 
@@ -152,8 +152,8 @@ impl Track {
             }
             TrackInstrument::Sampler(_) => Vec::new(),
             TrackInstrument::AudioClips(_) => Vec::new(),
-            TrackInstrument::Clap(_) => Vec::new(),
-            TrackInstrument::Lv2(_) => Vec::new(),
+            TrackInstrument::Clap(clap) => clap.get_parameters(),
+            TrackInstrument::Lv2(lv2) => lv2.get_parameters(),
         }
     }
 
@@ -229,16 +229,6 @@ impl Track {
         for i in 0..num_samples {
             master_left[i] += scratch_left[i] * left_gain;
             master_right[i] += scratch_right[i] * right_gain;
-        }
-    }
-
-    pub fn open_gui(&self) {
-        match &self.instrument {
-            TrackInstrument::Clap(clap) => clap.open_gui(),
-            TrackInstrument::Lv2(lv2) => lv2.open_gui(),
-            _ => {
-                println!("[jamseq] Track '{}' does not have a pop-out GUI plugin", self.name);
-            }
         }
     }
 }

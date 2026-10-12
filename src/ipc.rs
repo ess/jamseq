@@ -93,10 +93,6 @@ pub enum IpcCommand {
         param_name: String,
         value: f32,
     },
-    /// Request opening the plugin's graphical user interface window
-    OpenPluginGui {
-        track_id: String,
-    },
     /// Save track's current synth patch to a preset JSON file
     SaveTrackPreset {
         track_id: String,
@@ -364,11 +360,6 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             if let Some(&idx) = h.track_map.get(&track_id) {
                 h.tracks[idx].set_parameter(&param_name, value);
             }
-            build_status_response(&h)
-        }
-        IpcCommand::OpenPluginGui { track_id } => {
-            println!("[jamseq] Requested open GUI for track: {}", track_id);
-            h.open_track_gui(&track_id);
             build_status_response(&h)
         }
         IpcCommand::SaveTrackPreset { track_id, preset_name } => {

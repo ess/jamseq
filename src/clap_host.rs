@@ -1,12 +1,10 @@
-use clack_extensions::gui::{GuiApiType, GuiConfiguration, PluginGui, Window};
+use clack_extensions::params::{ParamInfoBuffer, PluginParams};
 use clack_extensions::timer::{HostTimer, HostTimerImpl, PluginTimer, TimerId};
-use clack_host::events::event_types::{NoteOffEvent, NoteOnEvent};
+use clack_host::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
 use clack_host::host::HostError;
 use clack_host::prelude::*;
+use std::collections::HashMap;
 use std::sync::{Arc as StdArc, Mutex};
-use x11rb::connection::Connection;
-use x11rb::protocol::xproto::*;
-use x11rb::wrapper::ConnectionExt as _;
 
 pub struct JamSeqClapMainThread {
     pub timers: StdArc<Mutex<Vec<TimerId>>>,
@@ -15,11 +13,10 @@ pub struct JamSeqClapMainThread {
 impl<'a> MainThreadHandler<'a> for JamSeqClapMainThread {}
 
 impl HostTimerImpl for JamSeqClapMainThread {
-    fn register_timer(&self, period_ms: u32) -> Result<TimerId, HostError> {
+    fn register_timer(&self, _period_ms: u32) -> Result<TimerId, HostError> {
         let mut timers = self.timers.lock().unwrap();
         let id = TimerId((timers.len() as u32) + 1);
         timers.push(id);
-        println!("[jamseq:clap] Plugin registered timer #{} ({} ms)", id.0, period_ms);
         Ok(id)
     }
 
@@ -40,24 +37,38 @@ impl HostHandlers for JamSeqClapHost {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct ClapParam {
+    pub id: ClapId,
+    pub name: String,
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+    pub value: f32,
+}
+
 pub struct ClapTrack {
     pub path: String,
     pub processor: StdArc<Mutex<StartedPluginAudioProcessor<JamSeqClapHost>>>,
     pub pending_events: StdArc<Mutex<Vec<(u8, f32, bool)>>>, // (note, vel, is_note_on)
-    pub gui_open_tx: StdArc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    pub pending_params: StdArc<Mutex<Vec<(ClapId, f64)>>>,   // (param_id, value)
+    pub params: StdArc<Mutex<Vec<ClapParam>>>,
+    pub param_index: StdArc<Mutex<HashMap<String, usize>>>,
     pub out_l: Vec<f32>,
     pub out_r: Vec<f32>,
 }
 
 impl ClapTrack {
     pub fn load(path: &str, sample_rate: f32) -> anyhow::Result<Self> {
-        println!("[jamseq:clap] Spawning CLAP host thread for: {}", path);
+        println!("[jamseq:clap] Loading CLAP plugin (headless DSP): {}", path);
 
         let (init_tx, init_rx) = std::sync::mpsc::channel();
-        let (gui_tx, gui_rx) = std::sync::mpsc::channel::<()>();
-        let gui_open_tx = StdArc::new(Mutex::new(Some(gui_tx)));
-
         let path_clone = path.to_string();
+
+        let params_arc = StdArc::new(Mutex::new(Vec::new()));
+        let param_index_arc = StdArc::new(Mutex::new(HashMap::new()));
+        let params_init = params_arc.clone();
+        let param_index_init = param_index_arc.clone();
 
         std::thread::Builder::new()
             .name("clap-host-thread".to_string())
@@ -124,10 +135,45 @@ impl ClapTrack {
                     }
                 };
 
+                // Query and introspect all tweakable parameters via PluginParams extension
+                {
+                    let handle = instance.plugin_handle();
+                    if let Some(params_ext) = handle.get_extension::<PluginParams>() {
+                        let count = params_ext.count(&handle);
+                        let mut buf = ParamInfoBuffer::new();
+                        let mut p_list = params_init.lock().unwrap();
+                        let mut p_map = param_index_init.lock().unwrap();
+
+                        for i in 0..count {
+                            if let Some(info) = params_ext.get_info(&handle, i, &mut buf) {
+                                let name = String::from_utf8_lossy(info.name).to_string();
+                                let min = info.min_value as f32;
+                                let max = info.max_value as f32;
+                                let def = info.default_value as f32;
+                                let val = params_ext.get_value(&handle, info.id).map(|v| v as f32).unwrap_or(def);
+
+                                let idx = p_list.len();
+                                p_map.insert(name.clone(), idx);
+                                p_map.insert(name.to_lowercase(), idx);
+
+                                p_list.push(ClapParam {
+                                    id: info.id,
+                                    name,
+                                    min,
+                                    max,
+                                    default: def,
+                                    value: val,
+                                });
+                            }
+                        }
+                        println!("[jamseq:clap] Introspected {} parameters for {}", p_list.len(), plugin_name);
+                    }
+                }
+
                 let audio_config = PluginAudioConfiguration {
                     sample_rate: sample_rate as f64,
-                    min_frames_count: 64,
-                    max_frames_count: 1024,
+                    min_frames_count: 32,
+                    max_frames_count: 4096,
                 };
 
                 let audio_processor = match instance.activate(|_, _| (), audio_config) {
@@ -149,105 +195,15 @@ impl ClapTrack {
                 let _ = init_tx.send(Ok(started_processor));
                 println!("[jamseq:clap] ✓ Started CLAP DSP processor for: {}", plugin_name);
 
-                let window_title = format!("{} - Native CLAP GUI", plugin_name);
-                let handle = instance.plugin_handle();
-                let gui_ext = handle.get_extension::<PluginGui>();
-                let timer_ext = handle.get_extension::<PluginTimer>();
-
-                if gui_ext.is_none() {
-                    println!("[jamseq:clap] Plugin does not support PluginGui");
-                    return;
-                }
-                let gui = gui_ext.unwrap();
-
-                while let Ok(()) = gui_rx.recv() {
-                    println!("[jamseq:clap] Spawning native X11 window on display :0...");
-                    if let Ok((conn, screen_num)) = x11rb::connect(None) {
-                        let screen = &conn.setup().roots[screen_num];
-                        let win_id = match conn.generate_id() {
-                            Ok(id) => id,
-                            Err(_) => continue,
-                        };
-
-                        let default_w = 800u16;
-                        let default_h = 600u16;
-                        let _ = conn.create_window(
-                            x11rb::COPY_DEPTH_FROM_PARENT,
-                            win_id,
-                            screen.root,
-                            100, 100,
-                            default_w, default_h,
-                            0,
-                            WindowClass::INPUT_OUTPUT,
-                            screen.root_visual,
-                            &CreateWindowAux::new()
-                                .background_pixel(screen.black_pixel)
-                                .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY),
-                        );
-
-                        let _ = conn.change_property8(
-                            PropMode::REPLACE,
-                            win_id,
-                            AtomEnum::WM_NAME,
-                            AtomEnum::STRING,
-                            window_title.as_bytes(),
-                        );
-
-                        let wm_protocols = conn.intern_atom(false, b"WM_PROTOCOLS").ok().and_then(|r| r.reply().ok()).map(|r| r.atom).unwrap_or(0);
-                        let wm_delete_window = conn.intern_atom(false, b"WM_DELETE_WINDOW").ok().and_then(|r| r.reply().ok()).map(|r| r.atom).unwrap_or(0);
-                        if wm_protocols != 0 && wm_delete_window != 0 {
-                            let _ = conn.change_property32(
-                                PropMode::REPLACE,
-                                win_id,
-                                wm_protocols,
-                                AtomEnum::ATOM,
-                                &[wm_delete_window],
-                            );
+                // Main thread timer pump (no GUI/X11 loop needed!)
+                let timer_ext = instance.plugin_handle().get_extension::<PluginTimer>();
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    if let Some(ref timer) = timer_ext {
+                        let active_timers = timers_clone.lock().unwrap().clone();
+                        for timer_id in active_timers {
+                            timer.on_timer(&instance.plugin_handle(), timer_id);
                         }
-
-                        let _ = conn.map_window(win_id);
-                        let _ = conn.flush();
-
-                        let _ = gui.create(&handle, GuiConfiguration { api_type: GuiApiType::X11, is_floating: false });
-                        if let Some(size) = gui.get_size(&handle) {
-                            let _ = conn.configure_window(win_id, &ConfigureWindowAux::new().width(size.width).height(size.height));
-                            let _ = conn.flush();
-                        }
-                        unsafe {
-                            let _ = gui.set_parent(&handle, Window::from_x11_handle(win_id as _));
-                        }
-                        let _ = gui.show(&handle);
-
-                        println!("[jamseq:clap] Native GUI is displayed and active.");
-
-                        'event_loop: loop {
-                            while let Ok(Some(event)) = conn.poll_for_event() {
-                                match event {
-                                    x11rb::protocol::Event::ClientMessage(msg) => {
-                                        if msg.data.as_data32()[0] == wm_delete_window {
-                                            println!("[jamseq:clap] User closed plugin window.");
-                                            break 'event_loop;
-                                        }
-                                    }
-                                    x11rb::protocol::Event::DestroyNotify(_) => break 'event_loop,
-                                    _ => {}
-                                }
-                            }
-
-                            if let Some(ref timer) = timer_ext {
-                                let active_timers = timers_clone.lock().unwrap().clone();
-                                for timer_id in active_timers {
-                                    timer.on_timer(&handle, timer_id);
-                                }
-                            }
-
-                            let _ = conn.flush();
-                            std::thread::sleep(std::time::Duration::from_millis(16));
-                        }
-
-                        gui.destroy(&handle);
-                        let _ = conn.destroy_window(win_id);
-                        let _ = conn.flush();
                     }
                 }
             })?;
@@ -258,7 +214,9 @@ impl ClapTrack {
             path: path.to_string(),
             processor: StdArc::new(Mutex::new(started_processor)),
             pending_events: StdArc::new(Mutex::new(Vec::new())),
-            gui_open_tx,
+            pending_params: StdArc::new(Mutex::new(Vec::new())),
+            params: params_arc,
+            param_index: param_index_arc,
             out_l: vec![0.0f32; 1024],
             out_r: vec![0.0f32; 1024],
         })
@@ -278,9 +236,22 @@ impl ClapTrack {
         }
     }
 
-    pub fn open_gui(&self) {
-        if let Some(tx) = self.gui_open_tx.lock().unwrap().as_ref() {
-            let _ = tx.send(());
+    pub fn get_parameters(&self) -> Vec<(String, f32, f32, f32)> {
+        let params = self.params.lock().unwrap();
+        params.iter().map(|p| (p.name.clone(), p.value, p.min, p.max)).collect()
+    }
+
+    pub fn set_parameter(&self, name: &str, value: f32) {
+        let mut params = self.params.lock().unwrap();
+        let index_map = self.param_index.lock().unwrap();
+        let idx = index_map.get(name).or_else(|| index_map.get(&name.to_lowercase()));
+        if let Some(&i) = idx {
+            if let Some(param) = params.get_mut(i) {
+                let clamped = value.clamp(param.min, param.max);
+                param.value = clamped;
+                let id = param.id;
+                self.pending_params.lock().unwrap().push((id, clamped as f64));
+            }
         }
     }
 
@@ -296,8 +267,8 @@ impl ClapTrack {
 
         let mut input_event_buffer = EventBuffer::new();
         {
-            let mut pending = self.pending_events.lock().unwrap();
-            for (note, vel, is_on) in pending.drain(..) {
+            let mut pending_notes = self.pending_events.lock().unwrap();
+            for (note, vel, is_on) in pending_notes.drain(..) {
                 if is_on {
                     let ev = NoteOnEvent::new(0, Pckn::new(0u16, 0u16, note as u16, 0u32), vel as f64);
                     input_event_buffer.push(&ev);
@@ -305,6 +276,13 @@ impl ClapTrack {
                     let ev = NoteOffEvent::new(0, Pckn::new(0u16, 0u16, note as u16, 0u32), 0.0);
                     input_event_buffer.push(&ev);
                 }
+            }
+        }
+        {
+            let mut pending_params = self.pending_params.lock().unwrap();
+            for (id, val) in pending_params.drain(..) {
+                let ev = ParamValueEvent::new(0, id, Pckn::match_all(), val);
+                input_event_buffer.push(&ev);
             }
         }
 

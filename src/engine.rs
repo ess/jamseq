@@ -220,13 +220,6 @@ impl JamSeqHost {
         }
     }
 
-    /// Open native X11 plugin GUI for a track
-    pub fn open_track_gui(&self, track_id: &str) {
-        if let Some(&idx) = self.track_map.get(track_id) {
-            self.tracks[idx].open_gui();
-        }
-    }
-
     pub fn load_arrangement(&mut self, arrangement: TimelineArrangement) {
         self.timeline.load_arrangement(arrangement);
     }
