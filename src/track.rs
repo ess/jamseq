@@ -39,6 +39,34 @@ impl Track {
         }
     }
 
+    pub fn new_clap(id: &str, name: &str, clap: ClapTrack, plugin_name: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            instrument: TrackInstrument::Clap(Box::new(clap)),
+            muted: false,
+            solo: false,
+            volume: 1.0,
+            pan: 0.0,
+            current_plugin: Some(plugin_name.to_string()),
+            peak_level: 0.0,
+        }
+    }
+
+    pub fn new_lv2(id: &str, name: &str, lv2: Lv2Track, plugin_name: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            instrument: TrackInstrument::Lv2(Box::new(lv2)),
+            muted: false,
+            solo: false,
+            volume: 1.0,
+            pan: 0.0,
+            current_plugin: Some(plugin_name.to_string()),
+            peak_level: 0.0,
+        }
+    }
+
     pub fn new_sampler(id: &str, name: &str, sampler: SamplerInstrument) -> Self {
         Self {
             id: id.to_string(),
@@ -163,28 +191,85 @@ impl Track {
 
     /// Export the synth patch of this track to a JSON preset file
     pub fn save_patch_to_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         match &self.instrument {
+            TrackInstrument::Clap(clap) => {
+                let params = clap.get_parameters();
+                let json = serde_json::to_string_pretty(&params)?;
+                std::fs::write(path, json)?;
+                Ok(())
+            }
+            TrackInstrument::Lv2(lv2) => {
+                let params = lv2.get_parameters();
+                let json = serde_json::to_string_pretty(&params)?;
+                std::fs::write(path, json)?;
+                Ok(())
+            }
             TrackInstrument::Synth(synth) => {
-                if let Some(parent) = path.parent() {
-                    let _ = std::fs::create_dir_all(parent);
-                }
                 let json = synth.patch.to_json()?;
                 std::fs::write(path, json)?;
                 Ok(())
             }
-            _ => anyhow::bail!("Track is not a synth instrument"),
+            _ => anyhow::bail!("Track is not an instrument"),
         }
     }
 
     /// Load a synth patch from a JSON preset file into this track
     pub fn load_patch_from_file(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        let content = std::fs::read_to_string(path)?;
         match &mut self.instrument {
+            TrackInstrument::Clap(clap) => {
+                // Try parsing as legacy or structured JamSynthPatch JSON
+                if let Ok(patch) = jamsynth::JamSynthPatch::from_json(&content) {
+                    clap.set_parameter("cutoff", patch.filter.cutoff_hz);
+                    clap.set_parameter("resonance", patch.filter.resonance);
+                    clap.set_parameter("glide", patch.glide_ms);
+                    clap.set_parameter("drive", patch.drive.amount);
+                    clap.set_parameter("attack", patch.amp_env.attack_ms);
+                    clap.set_parameter("decay", patch.amp_env.decay_ms);
+                    clap.set_parameter("sustain", patch.amp_env.sustain);
+                    clap.set_parameter("release", patch.amp_env.release_ms);
+                    clap.set_parameter("master_gain", patch.master_gain);
+                    return Ok(());
+                }
+                // Try parsing as parameter array [(name, value, min, max)]
+                if let Ok(params) = serde_json::from_str::<Vec<(String, f32, f32, f32)>>(&content) {
+                    for (name, val, _, _) in params {
+                        clap.set_parameter(&name, val);
+                    }
+                    return Ok(());
+                }
+                // Try parsing as key-value map
+                if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, f32>>(&content) {
+                    for (name, val) in map {
+                        clap.set_parameter(&name, val);
+                    }
+                    return Ok(());
+                }
+                anyhow::bail!("Unrecognized preset format in {}", path.display());
+            }
+            TrackInstrument::Lv2(lv2) => {
+                if let Ok(params) = serde_json::from_str::<Vec<(String, f32, f32, f32)>>(&content) {
+                    for (name, val, _, _) in params {
+                        lv2.set_parameter(&name, val);
+                    }
+                    return Ok(());
+                }
+                if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, f32>>(&content) {
+                    for (name, val) in map {
+                        lv2.set_parameter(&name, val);
+                    }
+                    return Ok(());
+                }
+                anyhow::bail!("Unrecognized preset format in {}", path.display());
+            }
             TrackInstrument::Synth(synth) => {
-                let content = std::fs::read_to_string(path)?;
                 synth.load_patch_json(&content)?;
                 Ok(())
             }
-            _ => anyhow::bail!("Track is not a synth instrument"),
+            _ => anyhow::bail!("Track is not an instrument"),
         }
     }
 

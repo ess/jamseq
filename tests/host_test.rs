@@ -335,3 +335,75 @@ fn test_clap_and_lv2_plugin_hosting() {
     println!("LV2 AVL Drums audio output: max_l={}, max_r={}", max_l, max_r);
     assert!(max_l > 0.0001 || max_r > 0.0001, "Expected audio output from AVL Drums LV2");
 }
+
+#[test]
+fn test_jamsynth_clap_hosting() {
+    let jamsynth_path = if std::path::Path::new("target/debug/libjamsynth.so").exists() {
+        "target/debug/libjamsynth.so"
+    } else if std::path::Path::new("../target/debug/libjamsynth.so").exists() {
+        "../target/debug/libjamsynth.so"
+    } else {
+        panic!("libjamsynth.so not found");
+    };
+
+    let mut clap_track = jamseq::clap_host::ClapTrack::load(jamsynth_path, 48000.0)
+        .expect("Failed to load libjamsynth.so via ClapTrack");
+
+    let params = clap_track.get_parameters();
+    println!("Introspected {} parameters for JamSynth CLAP:", params.len());
+    for p in &params {
+        println!("  - {}: val={}, min={}, max={}", p.0, p.1, p.2, p.3);
+    }
+    assert!(params.len() >= 9, "JamSynth should expose at least 9 parameters via CLAP");
+
+    // Test parameter tweak
+    clap_track.set_parameter("Cutoff", 500.0);
+    clap_track.set_parameter("Resonance", 0.7);
+
+    // Play a note and process audio block
+    clap_track.note_on(60, 1.0);
+    let mut left = vec![0.0f32; 512];
+    let mut right = vec![0.0f32; 512];
+    clap_track.process_block(&mut left, &mut right);
+
+    let max_l: f32 = left.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    let max_r: f32 = right.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    println!("JamSynth CLAP audio output: max_l={}, max_r={}", max_l, max_r);
+    assert!(max_l > 0.0001 || max_r > 0.0001, "Expected audio output from JamSynth CLAP");
+}
+
+#[test]
+fn test_jamsynth_clap_track_lifecycle_and_presets() {
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    host.add_custom_track("synth1", "JamSynth Track", "synth:reese");
+
+    assert_eq!(host.tracks.len(), 1);
+    assert_eq!(host.tracks[0].current_plugin.as_deref(), Some("JamSynth (Dark Reese)"));
+
+    // Check parameters
+    let params = host.tracks[0].get_parameters();
+    assert!(params.len() >= 9, "Expected 9 parameters on JamSynth track");
+
+    // Test saving and loading preset
+    let temp_preset = std::env::temp_dir().join("test_reese_preset.json");
+    host.tracks[0].save_patch_to_file(&temp_preset).expect("Failed to save preset");
+    assert!(temp_preset.exists());
+
+    // Modify parameter live
+    host.tracks[0].set_parameter("Resonance", 0.9);
+
+    // Reload preset from file
+    host.tracks[0].load_patch_from_file(&temp_preset).expect("Failed to load preset");
+
+    // Trigger note and render
+    host.tracks[0].note_on(48, 1.0);
+    let mut left = vec![0.0f32; 512];
+    let mut right = vec![0.0f32; 512];
+    host.process_block(&mut left, &mut right);
+
+    let max_l: f32 = left.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    let max_r: f32 = right.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(max_l > 0.0001 || max_r > 0.0001, "Expected audio from JamSynth CLAP track");
+
+    let _ = std::fs::remove_file(temp_preset);
+}
