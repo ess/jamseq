@@ -1,4 +1,5 @@
 use crate::engine::JamSeqHost;
+use crate::midi_input::MidiDeviceStatus;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -197,6 +198,18 @@ pub enum IpcCommand {
         track_id: String,
         bus_id: String,
     },
+    /// List hardware and virtual MIDI input devices
+    ListMidiDevices,
+    /// Connect to a MIDI input device by index
+    ConnectMidiDevice {
+        port_index: usize,
+    },
+    /// Disconnect active MIDI input device
+    DisconnectMidiDevice,
+    /// Set armed track ID for live MIDI performance / recording
+    SetArmedTrack {
+        track_id: Option<String>,
+    },
     /// Rescan system for newly installed LV2 and CLAP plugins
     RescanPlugins,
 }
@@ -264,6 +277,8 @@ pub struct IpcStatusResponse {
     pub master_peak: f32,
     pub master_inserts: Vec<TrackInsertStatus>,
     pub aux_buses: Vec<AuxBusStatus>,
+    pub armed_track_id: Option<String>,
+    pub midi_devices: Vec<MidiDeviceStatus>,
     pub is_recording: bool,
     pub mic_peak: f32,
     pub active_section_id: Option<String>,
@@ -605,6 +620,19 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             ));
             build_status_response(&h)
         }
+        IpcCommand::ListMidiDevices => build_status_response(&h),
+        IpcCommand::ConnectMidiDevice { port_index } => {
+            let _ = h.connect_midi_device(port_index);
+            build_status_response(&h)
+        }
+        IpcCommand::DisconnectMidiDevice => {
+            h.disconnect_midi_device();
+            build_status_response(&h)
+        }
+        IpcCommand::SetArmedTrack { track_id } => {
+            h.set_armed_track(track_id);
+            build_status_response(&h)
+        }
         IpcCommand::RescanPlugins => {
             h.rescan_plugins();
             build_status_response(&h)
@@ -724,6 +752,8 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
         master_peak: h.master_peak,
         master_inserts,
         aux_buses,
+        armed_track_id: h.armed_track_id.clone(),
+        midi_devices: h.list_midi_devices(),
         is_recording: h.recorder.is_recording(),
         mic_peak: h.recorder.get_peak_input(),
         active_section_id: active_section,

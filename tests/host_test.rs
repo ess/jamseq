@@ -518,3 +518,52 @@ fn test_master_inserts_and_aux_send_routing() {
     assert!(host.aux_map.get("aux_reverb").is_none());
     assert_eq!(host.tracks[lead_idx].sends.len(), 0, "Removing aux bus must purge track send entries");
 }
+
+#[test]
+fn test_hardware_midi_input_dispatch() {
+    let mut host = JamSeqHost::new(120.0, 44100.0);
+    host.add_custom_track("hw_lead", "Hardware Lead", "synth:reese");
+    let track_id = "hw_lead".to_string();
+
+    // Initially unarmed: simulated MIDI events should not trigger notes
+    host.midi_input.send_event(jamseq::midi_input::RawMidiEvent {
+        status: 0x90, // Note On Ch 1
+        data1: 60,   // Middle C
+        data2: 100,  // Velocity
+    });
+
+    let mut out_l = vec![0.0f32; 256];
+    let mut out_r = vec![0.0f32; 256];
+    host.process_block(&mut out_l, &mut out_r);
+    let peak_unarmed: f32 = out_l.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert_eq!(peak_unarmed, 0.0, "Unarmed track should not receive MIDI notes");
+
+    // Arm the track and send Note On
+    host.armed_track_id = Some(track_id.clone());
+    host.midi_input.send_event(jamseq::midi_input::RawMidiEvent {
+        status: 0x90, // Note On Ch 1
+        data1: 60,   // Middle C
+        data2: 100,  // Velocity
+    });
+
+    let mut out_l2 = vec![0.0f32; 256];
+    let mut out_r2 = vec![0.0f32; 256];
+    host.process_block(&mut out_l2, &mut out_r2);
+    let peak_armed: f32 = out_l2.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(peak_armed > 0.001, "Armed track must receive and render incoming live MIDI Note On");
+
+    // Send Note Off
+    host.midi_input.send_event(jamseq::midi_input::RawMidiEvent {
+        status: 0x80, // Note Off Ch 1
+        data1: 60,
+        data2: 0,
+    });
+    // Send CC 7 (Volume)
+    host.midi_input.send_event(jamseq::midi_input::RawMidiEvent {
+        status: 0xB0, // CC
+        data1: 7,
+        data2: 64,
+    });
+    host.process_block(&mut out_l2, &mut out_r2);
+}
+

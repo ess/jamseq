@@ -18,6 +18,8 @@ pub struct JamSeqHost {
     pub master_gain: f32,
     pub master_peak: f32,
     pub recorder: AudioRecorder,
+    pub midi_input: crate::midi_input::MidiInputManager,
+    pub armed_track_id: Option<String>,
     pub project_path: Option<String>,
     pub available_plugins: Vec<crate::plugin_scanner::DiscoveredPlugin>,
 
@@ -42,6 +44,8 @@ impl JamSeqHost {
             master_gain: 0.9,
             master_peak: 0.0,
             recorder: AudioRecorder::new(),
+            midi_input: crate::midi_input::MidiInputManager::new(),
+            armed_track_id: None,
             project_path: None,
             available_plugins,
             aux_left: Vec::new(),
@@ -508,6 +512,23 @@ impl JamSeqHost {
         self.timeline.load_arrangement(arrangement);
     }
 
+    pub fn set_armed_track(&mut self, track_id: Option<String>) {
+        println!("[jamseq] Armed track for MIDI input: {:?}", track_id);
+        self.armed_track_id = track_id;
+    }
+
+    pub fn list_midi_devices(&self) -> Vec<crate::midi_input::MidiDeviceStatus> {
+        self.midi_input.list_devices()
+    }
+
+    pub fn connect_midi_device(&mut self, index: usize) -> Result<String> {
+        self.midi_input.connect_device(index)
+    }
+
+    pub fn disconnect_midi_device(&mut self) {
+        self.midi_input.disconnect();
+    }
+
     pub fn play(&mut self) {
         self.timeline.play();
     }
@@ -528,6 +549,23 @@ impl JamSeqHost {
         if self.scratch_left.len() < num_samples {
             self.scratch_left.resize(num_samples, 0.0);
             self.scratch_right.resize(num_samples, 0.0);
+        }
+
+        // 0. Drain live hardware MIDI inputs and dispatch to armed track
+        while let Ok(ev) = self.midi_input.receiver.try_recv() {
+            if let Some(ref track_id) = self.armed_track_id {
+                if let Some(&track_idx) = self.track_map.get(track_id) {
+                    let track = &mut self.tracks[track_idx];
+                    let status_type = ev.status & 0xF0;
+                    if status_type == 0x90 && ev.data2 > 0 {
+                        track.note_on(ev.data1, ev.data2 as f32 / 127.0);
+                    } else if status_type == 0x80 || (status_type == 0x90 && ev.data2 == 0) {
+                        track.note_off(ev.data1);
+                    } else if status_type == 0xB0 {
+                        track.handle_cc(ev.data1, ev.data2);
+                    }
+                }
+            }
         }
 
         // 1. Advance timeline and fetch due events
