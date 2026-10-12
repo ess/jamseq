@@ -567,3 +567,107 @@ fn test_hardware_midi_input_dispatch() {
     host.process_block(&mut out_l2, &mut out_r2);
 }
 
+#[test]
+fn test_inter_track_sidechain_ducking() {
+    let mut host = JamSeqHost::new(120.0, 44100.0);
+
+    // Track 1: Bass
+    let mut bass = JamSynthEngine::new(44100.0);
+    bass.load_patch(JamSynthPatch::preset_808_sub());
+    host.add_track(Track::new_synth("bass", "Sub Bass", bass));
+
+    // Track 2: Kick trigger
+    let mut kick = JamSynthEngine::new(44100.0);
+    kick.load_patch(JamSynthPatch::preset_808_sub());
+    host.add_track(Track::new_synth("kick", "Kick Drum", kick));
+
+    // When kick sends sidechain to bass, kick MUST run first to feed bass's sidechain!
+    let configured = host.set_insert_sidechain("bass", 0, "kick", 1.0);
+    assert!(configured, "Failed to configure sidechain routing");
+
+    let order = host.get_track_processing_order();
+    let kick_idx = *host.track_map.get("kick").unwrap();
+    let bass_idx = *host.track_map.get("bass").unwrap();
+    let kick_pos = order.iter().position(|&x| x == kick_idx).unwrap();
+    let bass_pos = order.iter().position(|&x| x == bass_idx).unwrap();
+    assert!(kick_pos < bass_pos, "Sidechain source (kick) must be processed BEFORE target (bass)");
+
+    // 1. Play bass alone (kick is quiet)
+    host.tracks[bass_idx].note_on(36, 1.0);
+    let mut out_l_solo = vec![0.0f32; 256];
+    let mut out_r_solo = vec![0.0f32; 256];
+    host.process_block(&mut out_l_solo, &mut out_r_solo);
+    let peak_bass_unducked: f32 = out_l_solo.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(peak_bass_unducked > 0.05, "Bass note should produce audio");
+
+    // 2. Play kick simultaneously with sidechain routing
+    // Set kick track fader output to near zero so master level reflects ducked bass
+    host.tracks[kick_idx].volume = 0.001;
+    host.tracks[kick_idx].note_on(36, 1.0);
+    let mut out_l_sc = vec![0.0f32; 256];
+    let mut out_r_sc = vec![0.0f32; 256];
+    host.process_block(&mut out_l_sc, &mut out_r_sc);
+    let peak_bass_ducked: f32 = out_l_sc.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(peak_bass_ducked < peak_bass_unducked, "Bass should be ducked by incoming kick sidechain signal");
+
+    // 3. Remove sidechain and verify removal
+    let removed = host.remove_insert_sidechain("bass", 0);
+    assert!(removed);
+    assert_eq!(host.tracks[kick_idx].sidechains.len(), 0);
+}
+
+#[test]
+fn test_track_freeze_and_unfreeze() {
+    let mut host = JamSeqHost::new(120.0, 44100.0);
+    let mut pad = JamSynthEngine::new(44100.0);
+    pad.load_patch(JamSynthPatch::preset_cold_pad());
+    host.add_track(Track::new_synth("pad", "Pad", pad));
+
+    // Schedule events
+    host.timeline.events.push(ScheduledEvent::new(1, 0, "pad", ScheduledAction::NoteOn { note: 60, velocity: 1.0 }));
+    host.timeline.events.push(ScheduledEvent::new(2, 4 * TICKS_PER_16TH, "pad", ScheduledAction::NoteOff { note: 60 }));
+    host.timeline.seek_tick(0);
+
+    // Freeze track
+    let wav_path_str = host.freeze_track("pad").expect("Failed to freeze track");
+    let wav_path = std::path::Path::new(&wav_path_str);
+    assert!(wav_path.exists(), "Frozen WAV file must exist on disk");
+
+    let pad_idx = *host.track_map.get("pad").unwrap();
+    assert!(host.tracks[pad_idx].is_frozen, "Track must be marked as frozen");
+    assert!(matches!(host.tracks[pad_idx].instrument, jamseq::track::TrackInstrument::AudioClips(_)), "Instrument must be replaced with AudioClip player");
+
+    // Test playback of frozen track
+    host.timeline.seek_tick(0);
+    host.timeline.play();
+    let mut out_l = vec![0.0f32; 512];
+    let mut out_r = vec![0.0f32; 512];
+    host.process_block(&mut out_l, &mut out_r);
+    let peak_frozen: f32 = out_l.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(peak_frozen > 0.001, "Frozen track must play audio from audio clip");
+
+    // Unfreeze track
+    host.unfreeze_track("pad").expect("Failed to unfreeze track");
+    assert!(!host.tracks[pad_idx].is_frozen, "Track must not be marked frozen");
+    assert!(matches!(host.tracks[pad_idx].instrument, jamseq::track::TrackInstrument::Synth(_)), "Original synth instrument must be restored");
+}
+
+#[test]
+fn test_track_bouncing() {
+    let mut host = JamSeqHost::new(120.0, 44100.0);
+    let mut lead = JamSynthEngine::new(44100.0);
+    lead.load_patch(JamSynthPatch::preset_reese_bass());
+    host.add_track(Track::new_synth("lead", "Reese Lead", lead));
+
+    // Schedule event
+    host.timeline.events.push(ScheduledEvent::new(1, 0, "lead", ScheduledAction::NoteOn { note: 48, velocity: 1.0 }));
+    host.timeline.events.push(ScheduledEvent::new(2, 4 * TICKS_PER_16TH, "lead", ScheduledAction::NoteOff { note: 48 }));
+
+    let bounce_id = host.bounce_track("lead", "Lead Stem").expect("Failed to bounce track");
+    assert!(host.track_map.contains_key(&bounce_id), "New bounced track must exist in host track map");
+
+    let bounce_idx = *host.track_map.get(&bounce_id).unwrap();
+    assert_eq!(host.tracks[bounce_idx].name, "Lead Stem");
+    assert!(matches!(host.tracks[bounce_idx].instrument, jamseq::track::TrackInstrument::AudioClips(_)));
+}
+

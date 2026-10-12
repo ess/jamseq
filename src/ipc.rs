@@ -210,6 +210,31 @@ pub enum IpcCommand {
     SetArmedTrack {
         track_id: Option<String>,
     },
+    /// Configure sidechain audio routing from a track into a target track's insert effect
+    SetInsertSidechain {
+        track_id: String,
+        insert_index: usize,
+        source_track_id: String,
+        gain: f32,
+    },
+    /// Remove sidechain audio routing from a target track's insert effect
+    RemoveInsertSidechain {
+        track_id: String,
+        insert_index: usize,
+    },
+    /// Freeze a track into a cached offline audio stem
+    FreezeTrack {
+        track_id: String,
+    },
+    /// Restore frozen track to interactive synth/plugin and editable timeline events
+    UnfreezeTrack {
+        track_id: String,
+    },
+    /// Bounce a track offline into a standalone audio clip track
+    BounceTrack {
+        track_id: String,
+        new_track_name: String,
+    },
     /// Rescan system for newly installed LV2 and CLAP plugins
     RescanPlugins,
 }
@@ -238,6 +263,13 @@ pub struct AuxSendStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SidechainSendStatus {
+    pub target_track_id: String,
+    pub target_insert_index: usize,
+    pub gain: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuxBusStatus {
     pub id: String,
     pub name: String,
@@ -257,10 +289,12 @@ pub struct TrackStatus {
     pub pan: f32,
     pub muted: bool,
     pub solo: bool,
+    pub is_frozen: bool,
     pub peak_level: f32,
     pub params: Vec<TrackParamStatus>,
     pub inserts: Vec<TrackInsertStatus>,
     pub sends: Vec<AuxSendStatus>,
+    pub sidechains: Vec<SidechainSendStatus>,
     pub current_plugin: Option<String>,
 }
 
@@ -633,6 +667,26 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             h.set_armed_track(track_id);
             build_status_response(&h)
         }
+        IpcCommand::SetInsertSidechain { track_id, insert_index, source_track_id, gain } => {
+            h.set_insert_sidechain(&track_id, insert_index, &source_track_id, gain);
+            build_status_response(&h)
+        }
+        IpcCommand::RemoveInsertSidechain { track_id, insert_index } => {
+            h.remove_insert_sidechain(&track_id, insert_index);
+            build_status_response(&h)
+        }
+        IpcCommand::FreezeTrack { track_id } => {
+            let _ = h.freeze_track(&track_id);
+            build_status_response(&h)
+        }
+        IpcCommand::UnfreezeTrack { track_id } => {
+            let _ = h.unfreeze_track(&track_id);
+            build_status_response(&h)
+        }
+        IpcCommand::BounceTrack { track_id, new_track_name } => {
+            let _ = h.bounce_track(&track_id, &new_track_name);
+            build_status_response(&h)
+        }
         IpcCommand::RescanPlugins => {
             h.rescan_plugins();
             build_status_response(&h)
@@ -677,6 +731,16 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 })
                 .collect();
 
+            let sidechains = t
+                .sidechains
+                .iter()
+                .map(|sc| SidechainSendStatus {
+                    target_track_id: sc.target_track_id.clone(),
+                    target_insert_index: sc.target_insert_index,
+                    gain: sc.gain,
+                })
+                .collect();
+
             TrackStatus {
                 id: t.id.clone(),
                 name: t.name.clone(),
@@ -684,10 +748,12 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 pan: t.pan,
                 muted: t.muted,
                 solo: t.solo,
+                is_frozen: t.is_frozen,
                 peak_level: t.peak_level,
                 params,
                 inserts,
                 sends,
+                sidechains,
                 current_plugin: t.current_plugin.clone(),
             }
         })

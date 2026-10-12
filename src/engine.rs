@@ -7,6 +7,12 @@ use hound::{WavSpec, WavWriter};
 use std::collections::HashMap;
 use std::path::Path;
 
+pub struct FrozenTrackState {
+    pub instrument: TrackInstrument,
+    pub inserts: Vec<crate::track::InsertEffect>,
+    pub wav_path: String,
+}
+
 pub struct JamSeqHost {
     pub timeline: Timeline,
     pub tracks: Vec<Track>,
@@ -22,6 +28,8 @@ pub struct JamSeqHost {
     pub armed_track_id: Option<String>,
     pub project_path: Option<String>,
     pub available_plugins: Vec<crate::plugin_scanner::DiscoveredPlugin>,
+    pub frozen_tracks: HashMap<String, FrozenTrackState>,
+    pub sidechain_buffers: HashMap<(String, usize), (Vec<f32>, Vec<f32>)>,
 
     pub aux_left: Vec<Vec<f32>>,
     pub aux_right: Vec<Vec<f32>>,
@@ -48,6 +56,8 @@ impl JamSeqHost {
             armed_track_id: None,
             project_path: None,
             available_plugins,
+            frozen_tracks: HashMap::new(),
+            sidechain_buffers: HashMap::new(),
             aux_left: Vec::new(),
             aux_right: Vec::new(),
             scratch_left: vec![0.0; 2048],
@@ -224,6 +234,12 @@ impl JamSeqHost {
             // Retain timeline events for remaining tracks
             self.timeline.events.retain(|e| e.track_id != track_id);
             self.timeline.seek_tick(self.timeline.current_tick);
+            // Clean up sidechains targeting this track
+            for t in &mut self.tracks {
+                t.sidechains.retain(|s| s.target_track_id != track_id);
+            }
+            // Clean up frozen track cache
+            self.frozen_tracks.remove(track_id);
             true
         } else {
             false
@@ -508,6 +524,80 @@ impl JamSeqHost {
         false
     }
 
+    /// Configure sidechain audio routing from source_track into (target_track, target_insert_index)
+    pub fn set_insert_sidechain(&mut self, target_track_id: &str, target_insert_index: usize, source_track_id: &str, gain: f32) -> bool {
+        // Clear existing sidechains targeting this specific insert
+        self.remove_insert_sidechain(target_track_id, target_insert_index);
+
+        if let Some(&src_idx) = self.track_map.get(source_track_id) {
+            if self.track_map.contains_key(target_track_id) {
+                self.tracks[src_idx].set_sidechain(target_track_id, target_insert_index, gain);
+                println!("[jamseq] ✓ Configured sidechain: '{}' -> ('{}', insert {}) gain: {:.2}",
+                    source_track_id, target_track_id, target_insert_index, gain);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Remove sidechain audio routing targeting (target_track, target_insert_index)
+    pub fn remove_insert_sidechain(&mut self, target_track_id: &str, target_insert_index: usize) -> bool {
+        let mut removed = false;
+        for track in &mut self.tracks {
+            let before = track.sidechains.len();
+            track.remove_sidechain(target_track_id, target_insert_index);
+            if track.sidechains.len() < before {
+                removed = true;
+            }
+        }
+        removed
+    }
+
+    /// Compute dependency-ordered track execution sequence so sidechain sources process before target tracks
+    pub fn get_track_processing_order(&self) -> Vec<usize> {
+        let n = self.tracks.len();
+        if n <= 1 {
+            return (0..n).collect();
+        }
+
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let mut in_degree = vec![0usize; n];
+
+        for (u, track) in self.tracks.iter().enumerate() {
+            for sc in &track.sidechains {
+                if let Some(&v) = self.track_map.get(&sc.target_track_id) {
+                    if u != v {
+                        adj[u].push(v);
+                        in_degree[v] += 1;
+                    }
+                }
+            }
+        }
+
+        let mut queue: std::collections::VecDeque<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
+        let mut order = Vec::with_capacity(n);
+
+        while let Some(u) = queue.pop_front() {
+            order.push(u);
+            for &v in &adj[u] {
+                in_degree[v] -= 1;
+                if in_degree[v] == 0 {
+                    queue.push_back(v);
+                }
+            }
+        }
+
+        if order.len() < n {
+            for i in 0..n {
+                if !order.contains(&i) {
+                    order.push(i);
+                }
+            }
+        }
+
+        order
+    }
+
     pub fn load_arrangement(&mut self, arrangement: TimelineArrangement) {
         self.timeline.load_arrangement(arrangement);
     }
@@ -630,8 +720,12 @@ impl JamSeqHost {
             r[..num_samples].fill(0.0);
         }
 
-        // Render all tracks into master bus and tap aux sends
-        for track in &mut self.tracks {
+        self.sidechain_buffers.clear();
+        let track_order = self.get_track_processing_order();
+
+        // Render all tracks into master bus and tap aux sends & sidechains
+        for &track_idx in &track_order {
+            let track = &mut self.tracks[track_idx];
             if any_solo && !track.solo {
                 continue;
             }
@@ -641,7 +735,25 @@ impl JamSeqHost {
                 &mut master_right[..num_samples],
                 &mut self.scratch_left[..num_samples],
                 &mut self.scratch_right[..num_samples],
+                Some(&self.sidechain_buffers),
             );
+
+            // Tap sidechains: record pre-fader/post-synth audio into sidechain buffers
+            if !track.muted && !track.sidechains.is_empty() {
+                for sc in &track.sidechains {
+                    let entry = self.sidechain_buffers
+                        .entry((sc.target_track_id.clone(), sc.target_insert_index))
+                        .or_insert_with(|| (vec![0.0; num_samples], vec![0.0; num_samples]));
+                    if entry.0.len() < num_samples {
+                        entry.0.resize(num_samples, 0.0);
+                        entry.1.resize(num_samples, 0.0);
+                    }
+                    for i in 0..num_samples {
+                        entry.0[i] += self.scratch_left[i] * sc.gain;
+                        entry.1[i] += self.scratch_right[i] * sc.gain;
+                    }
+                }
+            }
 
             // Tap aux sends
             if !track.muted && !track.sends.is_empty() {
@@ -792,6 +904,169 @@ impl JamSeqHost {
         writer.finalize()?;
         self.timeline.pause();
         Ok(())
+    }
+
+    /// Offline render a single track directly to a stereo 24-bit WAV file.
+    pub fn render_track_to_wav(&mut self, track_id: &str, out_path: &Path, num_bars: u32) -> Result<()> {
+        let spec = WavSpec {
+            channels: 2,
+            sample_rate: self.sample_rate as u32,
+            bits_per_sample: 24,
+            sample_format: hound::SampleFormat::Int,
+        };
+
+        if let Some(parent) = out_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+
+        let mut writer = WavWriter::create(out_path, spec)
+            .with_context(|| format!("Failed to create output WAV at {:?}", out_path))?;
+
+        let total_ticks = num_bars as u64 * 4 * crate::timeline::PPQ;
+        let total_samples = self.timeline.ticks_to_samples(total_ticks);
+
+        let orig_states: Vec<(bool, bool)> = self.tracks.iter().map(|t| (t.muted, t.solo)).collect();
+        let orig_aux_mutes: Vec<bool> = self.aux_buses.iter().map(|b| b.muted).collect();
+        let orig_pos = self.timeline.current_tick;
+        let orig_loop = self.timeline.loop_enabled;
+        let orig_master_inserts = std::mem::take(&mut self.master_bus.inserts);
+
+        // Solo only target track and mute aux return buses to capture isolated track stem
+        for t in &mut self.tracks {
+            t.solo = t.id == track_id;
+            t.muted = false;
+        }
+        for b in &mut self.aux_buses {
+            b.muted = true;
+        }
+
+        self.timeline.seek_tick(0);
+        self.timeline.loop_enabled = false;
+        self.timeline.play();
+
+        let block_size = 512;
+        let mut left = vec![0.0f32; block_size];
+        let mut right = vec![0.0f32; block_size];
+        let mut rendered_samples = 0;
+
+        while rendered_samples < total_samples {
+            let current_block = ((total_samples - rendered_samples) as usize).min(block_size);
+            self.process_block(&mut left[..current_block], &mut right[..current_block]);
+
+            for i in 0..current_block {
+                let sample_i24_l = (left[i] * 8388607.0).clamp(-8388608.0, 8388607.0) as i32;
+                let sample_i24_r = (right[i] * 8388607.0).clamp(-8388608.0, 8388607.0) as i32;
+                writer.write_sample(sample_i24_l)?;
+                writer.write_sample(sample_i24_r)?;
+            }
+
+            rendered_samples += current_block as u64;
+        }
+
+        writer.finalize()?;
+        self.timeline.pause();
+
+        // Restore track solo/mute and aux return states
+        for (i, t) in self.tracks.iter_mut().enumerate() {
+            if i < orig_states.len() {
+                t.muted = orig_states[i].0;
+                t.solo = orig_states[i].1;
+            }
+        }
+        for (i, b) in self.aux_buses.iter_mut().enumerate() {
+            if i < orig_aux_mutes.len() {
+                b.muted = orig_aux_mutes[i];
+            }
+        }
+        self.master_bus.inserts = orig_master_inserts;
+        self.timeline.loop_enabled = orig_loop;
+        self.timeline.seek_tick(orig_pos);
+
+        Ok(())
+    }
+
+    /// Freeze a track by rendering it offline to audio and replacing instrument/inserts with a zero-CPU audio clip player
+    pub fn freeze_track(&mut self, track_id: &str) -> Result<String> {
+        let &idx = self.track_map.get(track_id).ok_or_else(|| anyhow::anyhow!("Track not found: {}", track_id))?;
+        if self.tracks[idx].is_frozen {
+            anyhow::bail!("Track '{}' is already frozen", track_id);
+        }
+
+        let wav_path = if let Some(ref p) = self.project_path {
+            let project_dir = Path::new(p).parent().unwrap_or_else(|| Path::new("."));
+            let freeze_dir = project_dir.join("frozen");
+            let _ = std::fs::create_dir_all(&freeze_dir);
+            freeze_dir.join(format!("{}.wav", track_id))
+        } else {
+            std::env::temp_dir().join(format!("jamseq_frozen_{}.wav", track_id))
+        };
+
+        let num_bars = ((self.timeline.total_ticks / (4 * crate::timeline::PPQ)) as u32).max(1);
+        self.render_track_to_wav(track_id, &wav_path, num_bars)?;
+
+        let track = &mut self.tracks[idx];
+        let mut clip_track = AudioClipTrack::new();
+        clip_track.add_clip(AudioClip::new(&wav_path, 0));
+
+        let orig_instrument = std::mem::replace(&mut track.instrument, TrackInstrument::AudioClips(clip_track));
+        let orig_inserts = std::mem::take(&mut track.inserts);
+
+        self.frozen_tracks.insert(track_id.to_string(), FrozenTrackState {
+            instrument: orig_instrument,
+            inserts: orig_inserts,
+            wav_path: wav_path.to_string_lossy().to_string(),
+        });
+
+        track.is_frozen = true;
+        println!("[jamseq] ✓ Frozen track '{}' -> {:?}", track_id, wav_path);
+        Ok(wav_path.to_string_lossy().to_string())
+    }
+
+    /// Unfreeze a track, restoring original synth/plugin instrument and inserts
+    pub fn unfreeze_track(&mut self, track_id: &str) -> Result<()> {
+        let state = self.frozen_tracks.remove(track_id)
+            .ok_or_else(|| anyhow::anyhow!("Track '{}' is not frozen", track_id))?;
+        let &idx = self.track_map.get(track_id).ok_or_else(|| anyhow::anyhow!("Track not found: {}", track_id))?;
+
+        let track = &mut self.tracks[idx];
+        track.instrument = state.instrument;
+        track.inserts = state.inserts;
+        track.is_frozen = false;
+
+        let _ = std::fs::remove_file(&state.wav_path);
+        println!("[jamseq] ✓ Unfrozen track '{}'", track_id);
+        Ok(())
+    }
+
+    /// Bounce track into a new standalone audio clip track
+    pub fn bounce_track(&mut self, track_id: &str, new_track_name: &str) -> Result<String> {
+        let _ = self.track_map.get(track_id).ok_or_else(|| anyhow::anyhow!("Track not found: {}", track_id))?;
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let bounce_id = format!("bounce_{}_{}", track_id, timestamp);
+
+        let wav_path = if let Some(ref p) = self.project_path {
+            let project_dir = Path::new(p).parent().unwrap_or_else(|| Path::new("."));
+            let bounce_dir = project_dir.join("bounces");
+            let _ = std::fs::create_dir_all(&bounce_dir);
+            bounce_dir.join(format!("{}.wav", bounce_id))
+        } else {
+            std::env::temp_dir().join(format!("jamseq_{}.wav", bounce_id))
+        };
+
+        let num_bars = ((self.timeline.total_ticks / (4 * crate::timeline::PPQ)) as u32).max(1);
+        self.render_track_to_wav(track_id, &wav_path, num_bars)?;
+
+        let mut clip_track = AudioClipTrack::new();
+        clip_track.add_clip(AudioClip::new(&wav_path, 0));
+
+        let new_track = Track::new_audio_clips(&bounce_id, new_track_name, clip_track);
+        self.add_track(new_track);
+        println!("[jamseq] ✓ Bounced track '{}' to new track '{}' ({})", track_id, new_track_name, bounce_id);
+        Ok(bounce_id)
     }
 }
 
