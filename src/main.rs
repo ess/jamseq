@@ -60,7 +60,7 @@ fn run_server(socket_path: &str) -> Result<()> {
     println!("[jamseq:server] Starting JamSeq audio engine and IPC server on {}", socket_path);
     let host = Arc::new(Mutex::new(build_white_flame_demo_host()?));
 
-    let _audio = AudioOutput::start(Arc::clone(&host))?;
+    let audio = AudioOutput::start(Arc::clone(&host))?;
     println!("[jamseq:server] ✓ Audio engine active (PipeWire / ALSA)");
 
     let server = jamseq::ipc::IpcServer::new(socket_path);
@@ -69,7 +69,10 @@ fn run_server(socket_path: &str) -> Result<()> {
     println!("[jamseq:server] Ready for JamOut GUI client connections. Press Ctrl+C to stop.");
 
     loop {
-        thread::sleep(Duration::from_millis(500));
+        if let Ok(mut a) = audio.lock() {
+            a.poll_capture_state();
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 

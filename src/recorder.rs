@@ -13,6 +13,7 @@ pub struct RecordedClipInfo {
 
 pub struct RecorderState {
     pub is_recording: bool,
+    pub capture_requested: bool, // When true, AudioSystem should activate input stream
     pub start_sample: u64,
     pub out_path: PathBuf,
     pub recorded_left: Vec<f32>,
@@ -30,6 +31,7 @@ impl AudioRecorder {
         Self {
             state: Arc::new(Mutex::new(RecorderState {
                 is_recording: false,
+                capture_requested: false,
                 start_sample: 0,
                 out_path: PathBuf::new(),
                 recorded_left: Vec::new(),
@@ -45,6 +47,7 @@ impl AudioRecorder {
         }
         let mut st = self.state.lock().unwrap();
         st.is_recording = true;
+        st.capture_requested = true;
         st.start_sample = start_sample;
         st.out_path = out_path.to_path_buf();
         st.recorded_left.clear();
@@ -54,6 +57,14 @@ impl AudioRecorder {
 
     pub fn is_recording(&self) -> bool {
         self.state.lock().unwrap().is_recording
+    }
+
+    pub fn is_capture_requested(&self) -> bool {
+        self.state.lock().unwrap().capture_requested
+    }
+
+    pub fn set_capture_requested(&self, requested: bool) {
+        self.state.lock().unwrap().capture_requested = requested;
     }
 
     pub fn get_peak_input(&self) -> f32 {
@@ -97,6 +108,7 @@ impl AudioRecorder {
         }
 
         st.is_recording = false;
+        st.capture_requested = false;
         let out_path = st.out_path.clone();
         let start_sample = st.start_sample;
         let total_samples = st.recorded_left.len() as u64;
