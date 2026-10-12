@@ -41,6 +41,7 @@ impl HostHandlers for JamSeqClapHost {
 pub struct ClapParam {
     pub id: ClapId,
     pub name: String,
+    pub module: String, // Hierarchical path (e.g. "Filter/Cutoff", "Amp/Envelope")
     pub min: f32,
     pub max: f32,
     pub default: f32,
@@ -162,9 +163,11 @@ impl ClapTrack {
                                 p_map.insert(format!("{}_ms", stripped_ms), idx);
                                 p_map.insert(format!("{} (ms)", stripped_ms), idx);
 
+                                let mod_path = String::from_utf8_lossy(info.module).to_string();
                                 p_list.push(ClapParam {
                                     id: info.id,
                                     name,
+                                    module: mod_path,
                                     min,
                                     max,
                                     default: def,
@@ -340,6 +343,60 @@ impl ClapTrack {
         for i in 0..num_samples {
             scratch_l[i] += self.out_l[i];
             scratch_r[i] += self.out_r[i];
+        }
+    }
+
+    /// Process a block of audio as an insert effect: transforms in_l and in_r in-place.
+    pub fn process_effect_block(&mut self, buf_l: &mut [f32], buf_r: &mut [f32]) {
+        let num_samples = buf_l.len().min(buf_r.len());
+        if self.out_l.len() < num_samples {
+            self.out_l.resize(num_samples, 0.0);
+            self.out_r.resize(num_samples, 0.0);
+        }
+
+        self.out_l[..num_samples].copy_from_slice(&buf_l[..num_samples]);
+        self.out_r[..num_samples].copy_from_slice(&buf_r[..num_samples]);
+
+        let mut input_event_buffer = EventBuffer::new();
+        {
+            let mut pending_params = self.pending_params.lock().unwrap();
+            for (id, val) in pending_params.drain(..) {
+                let ev = ParamValueEvent::new(0, id, Pckn::match_all(), val);
+                input_event_buffer.push(&ev);
+            }
+        }
+
+        let input_events = input_event_buffer.as_input();
+        let mut output_events_buf = EventBuffer::new();
+        let mut output_events = output_events_buf.as_output();
+
+        let mut in_audio_ports = AudioPorts::with_capacity(2, 1);
+        let in_audio = in_audio_ports.with_input_buffers([AudioPortBuffer {
+            latency: 0,
+            channels: AudioPortBufferType::f32_input_only([
+                InputChannel::variable(&mut self.out_l[..num_samples]),
+                InputChannel::variable(&mut self.out_r[..num_samples]),
+            ]),
+        }]);
+
+        let mut out_audio_ports = AudioPorts::with_capacity(2, 1);
+        let mut out_audio = out_audio_ports.with_output_buffers([AudioPortBuffer {
+            latency: 0,
+            channels: AudioPortBufferType::f32_output_only([
+                &mut buf_l[..num_samples],
+                &mut buf_r[..num_samples],
+            ]),
+        }]);
+
+        if let Ok(mut proc) = self.processor.lock() {
+            let _ = proc.process(
+                &in_audio,
+                &mut out_audio,
+                &input_events,
+                &mut output_events,
+                None,
+                None,
+            );
         }
     }
 }

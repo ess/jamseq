@@ -4,14 +4,18 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleRate, Stream, StreamConfig};
 use std::sync::{Arc, Mutex};
 
-pub struct AudioOutput {
-    _stream: Stream,
-    _input_stream: Option<Stream>,
-    pub host: Arc<Mutex<JamSeqHost>>,
+/// Global audio subsystem managing active cpal output and dynamic input streams.
+#[allow(dead_code)]
+pub struct AudioSystem {
+    output_stream: Stream,
+    input_stream: Option<Stream>,
+    host: Arc<Mutex<JamSeqHost>>,
+    sample_rate: u32,
+    channels: usize,
 }
 
-impl AudioOutput {
-    pub fn start(host: Arc<Mutex<JamSeqHost>>) -> Result<Self> {
+impl AudioSystem {
+    pub fn start(host: Arc<Mutex<JamSeqHost>>) -> Result<Arc<Mutex<Self>>> {
         let cpal_host = cpal::default_host();
         let device = cpal_host
             .default_output_device()
@@ -75,16 +79,93 @@ impl AudioOutput {
 
         stream.play().context("Failed to start audio output stream")?;
 
-        // Note: Do not unconditionally open default microphone stream on startup.
-        // Holding an input stream open causes BlueZ / PipeWire to force Bluetooth earbuds
-        // out of high-fidelity stereo A2DP mode into telephone mono headset (mSBC/SCO) mode,
-        // which completely mutes or breaks audio playback on most Bluetooth earbuds.
-        let input_stream: Option<Stream> = None;
-
-        Ok(Self {
-            _stream: stream,
-            _input_stream: input_stream,
+        let audio_system = Arc::new(Mutex::new(Self {
+            output_stream: stream,
+            input_stream: None,
             host,
-        })
+            sample_rate,
+            channels,
+        }));
+
+        Ok(audio_system)
+    }
+
+    /// Dynamically open the default microphone input stream on demand.
+    /// This prevents Bluetooth earbuds from dropping into low-quality mono SCO mode
+    /// during ordinary playback, and only activates microphone input when requested.
+    pub fn start_input_capture(&mut self) -> Result<()> {
+        if self.input_stream.is_some() {
+            return Ok(()); // Already active
+        }
+
+        let cpal_host = cpal::default_host();
+        let input_device = match cpal_host.default_input_device() {
+            Some(dev) => dev,
+            None => {
+                eprintln!("[jamseq] Warning: No default input device found for recording");
+                return Ok(());
+            }
+        };
+
+        let input_config = match input_device.default_input_config() {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                eprintln!("[jamseq] Warning: Could not retrieve default input config: {:?}", e);
+                return Ok(());
+            }
+        };
+
+        let in_channels = input_config.channels() as usize;
+        let in_sample_rate = input_config.sample_rate().0;
+        let config = StreamConfig {
+            channels: in_channels as u16,
+            sample_rate: SampleRate(in_sample_rate),
+            buffer_size: cpal::BufferSize::Default,
+        };
+
+        let host_clone = Arc::clone(&self.host);
+        let in_stream = input_device.build_input_stream(
+            &config,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                if let Ok(h) = host_clone.lock() {
+                    h.recorder.push_input_frames(data, in_channels);
+                }
+            },
+            |err| {
+                eprintln!("[jamseq] Audio input stream error: {:?}", err);
+            },
+            None,
+        )?;
+
+        in_stream.play().context("Failed to play input stream")?;
+        self.input_stream = Some(in_stream);
+        println!("[jamseq] ✓ Microphone input stream opened dynamically ({in_channels} ch @ {in_sample_rate} Hz)");
+        Ok(())
+    }
+
+    /// Stop and drop the microphone input stream, returning Bluetooth headphones to A2DP stereo mode.
+    pub fn stop_input_capture(&mut self) {
+        if let Some(stream) = self.input_stream.take() {
+            drop(stream);
+            println!("[jamseq] ✓ Microphone input stream closed (Bluetooth A2DP preserved)");
+        }
+    }
+
+    /// Check if recording/monitoring was requested, dynamically opening/closing input stream accordingly.
+    pub fn poll_capture_state(&mut self) {
+        let requested = if let Ok(h) = self.host.lock() {
+            h.recorder.is_capture_requested()
+        } else {
+            false
+        };
+
+        if requested && self.input_stream.is_none() {
+            let _ = self.start_input_capture();
+        } else if !requested && self.input_stream.is_some() {
+            self.stop_input_capture();
+        }
     }
 }
+
+// Retain AudioOutput type alias for backward compatibility
+pub type AudioOutput = AudioSystem;

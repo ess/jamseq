@@ -2,6 +2,7 @@ use crate::audio_clip::AudioClipTrack;
 use crate::clap_host::ClapTrack;
 use crate::lv2_host::Lv2Track;
 use crate::sampler::SamplerInstrument;
+use crate::vst3_host::Vst3Track;
 use jamsynth::JamSynthEngine;
 
 pub enum TrackInstrument {
@@ -10,14 +11,122 @@ pub enum TrackInstrument {
     AudioClips(AudioClipTrack),
     Clap(Box<ClapTrack>),
     Lv2(Box<Lv2Track>),
+    Vst3(Box<Vst3Track>),
+}
+
+pub enum InsertEffect {
+    Clap { name: String, uri: String, track: Box<ClapTrack> },
+    Lv2 { name: String, uri: String, track: Box<Lv2Track> },
+    Vst3 { name: String, uri: String, track: Box<Vst3Track> },
+}
+
+impl InsertEffect {
+    pub fn name(&self) -> &str {
+        match self {
+            InsertEffect::Clap { name, .. } => name,
+            InsertEffect::Lv2 { name, .. } => name,
+            InsertEffect::Vst3 { name, .. } => name,
+        }
+    }
+
+    pub fn uri(&self) -> &str {
+        match self {
+            InsertEffect::Clap { uri, .. } => uri,
+            InsertEffect::Lv2 { uri, .. } => uri,
+            InsertEffect::Vst3 { uri, .. } => uri,
+        }
+    }
+
+    pub fn get_parameters(&self) -> Vec<(String, f32, f32, f32)> {
+        match self {
+            InsertEffect::Clap { track, .. } => track.get_parameters(),
+            InsertEffect::Lv2 { track, .. } => track.get_parameters(),
+            InsertEffect::Vst3 { track, .. } => track.get_parameters(),
+        }
+    }
+
+    pub fn set_parameter(&mut self, param_name: &str, value: f32) {
+        match self {
+            InsertEffect::Clap { track, .. } => track.set_parameter(param_name, value),
+            InsertEffect::Lv2 { track, .. } => track.set_parameter(param_name, value),
+            InsertEffect::Vst3 { track, .. } => track.set_parameter(param_name, value),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SidechainSend {
+    pub target_track_id: String,
+    pub target_insert_index: usize,
+    pub gain: f32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AuxSend {
+    pub target_bus_id: String,
+    pub gain: f32,          // Send gain (0.0 to 1.0+)
+    pub is_pre_fader: bool, // false = post-fader (default)
+    pub is_muted: bool,
+}
+
+pub struct AuxBus {
+    pub id: String,
+    pub name: String,
+    pub volume: f32,
+    pub pan: f32,
+    pub muted: bool,
+    pub solo: bool,
+    pub inserts: Vec<InsertEffect>,
+    pub peak_level: f32,
+}
+
+impl AuxBus {
+    pub fn new(id: &str, name: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            volume: 1.0,
+            pan: 0.0,
+            muted: false,
+            solo: false,
+            inserts: Vec::new(),
+            peak_level: 0.0,
+        }
+    }
+}
+
+pub struct MasterBus {
+    pub volume: f32,
+    pub pan: f32,
+    pub muted: bool,
+    pub inserts: Vec<InsertEffect>,
+    pub peak_level: f32,
+}
+
+impl Default for MasterBus {
+    fn default() -> Self {
+        Self {
+            volume: 0.9,
+            pan: 0.0,
+            muted: false,
+            inserts: Vec::new(),
+            peak_level: 0.0,
+        }
+    }
 }
 
 pub struct Track {
     pub id: String,
     pub name: String,
     pub instrument: TrackInstrument,
+    pub inserts: Vec<InsertEffect>,
+    pub sends: Vec<AuxSend>,
+    pub sidechains: Vec<SidechainSend>,
     pub muted: bool,
     pub solo: bool,
+    pub is_frozen: bool,
+    pub cached_stem: Option<crate::audio_clip::AudioClip>,
+    pub stem_dirty: bool,
     pub volume: f32, // Gain multiplier (0.0 to 2.0)
     pub pan: f32,    // -1.0 (hard left) to 1.0 (hard right)
     pub current_plugin: Option<String>,
@@ -30,8 +139,14 @@ impl Track {
             id: id.to_string(),
             name: name.to_string(),
             instrument: TrackInstrument::Synth(engine),
+            inserts: Vec::new(),
+            sends: Vec::new(),
+            sidechains: Vec::new(),
             muted: false,
             solo: false,
+            is_frozen: false,
+            cached_stem: None,
+            stem_dirty: true,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some("JamSynth (Built-in)".to_string()),
@@ -44,8 +159,14 @@ impl Track {
             id: id.to_string(),
             name: name.to_string(),
             instrument: TrackInstrument::Clap(Box::new(clap)),
+            inserts: Vec::new(),
+            sends: Vec::new(),
+            sidechains: Vec::new(),
             muted: false,
             solo: false,
+            is_frozen: false,
+            cached_stem: None,
+            stem_dirty: true,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some(plugin_name.to_string()),
@@ -58,8 +179,14 @@ impl Track {
             id: id.to_string(),
             name: name.to_string(),
             instrument: TrackInstrument::Lv2(Box::new(lv2)),
+            inserts: Vec::new(),
+            sends: Vec::new(),
+            sidechains: Vec::new(),
             muted: false,
             solo: false,
+            is_frozen: false,
+            cached_stem: None,
+            stem_dirty: true,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some(plugin_name.to_string()),
@@ -72,8 +199,14 @@ impl Track {
             id: id.to_string(),
             name: name.to_string(),
             instrument: TrackInstrument::Sampler(sampler),
+            inserts: Vec::new(),
+            sends: Vec::new(),
+            sidechains: Vec::new(),
             muted: false,
             solo: false,
+            is_frozen: false,
+            cached_stem: None,
+            stem_dirty: true,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some("Sampler".to_string()),
@@ -86,13 +219,78 @@ impl Track {
             id: id.to_string(),
             name: name.to_string(),
             instrument: TrackInstrument::AudioClips(clips),
+            inserts: Vec::new(),
+            sends: Vec::new(),
+            sidechains: Vec::new(),
             muted: false,
             solo: false,
+            is_frozen: false,
+            cached_stem: None,
+            stem_dirty: false,
             volume: 1.0,
             pan: 0.0,
             current_plugin: None,
             peak_level: 0.0,
         }
+    }
+
+    pub fn new_vst3(id: &str, name: &str, vst3: Vst3Track, plugin_name: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            instrument: TrackInstrument::Vst3(Box::new(vst3)),
+            inserts: Vec::new(),
+            sends: Vec::new(),
+            sidechains: Vec::new(),
+            muted: false,
+            solo: false,
+            is_frozen: false,
+            cached_stem: None,
+            stem_dirty: true,
+            volume: 1.0,
+            pan: 0.0,
+            current_plugin: Some(plugin_name.to_string()),
+            peak_level: 0.0,
+        }
+    }
+
+    pub fn set_aux_send(&mut self, bus_id: &str, gain: f32, is_pre_fader: bool) {
+        if let Some(send) = self.sends.iter_mut().find(|s| s.target_bus_id == bus_id) {
+            send.gain = gain;
+            send.is_pre_fader = is_pre_fader;
+        } else {
+            self.sends.push(AuxSend {
+                target_bus_id: bus_id.to_string(),
+                gain,
+                is_pre_fader,
+                is_muted: false,
+            });
+        }
+    }
+
+    pub fn remove_aux_send(&mut self, bus_id: &str) {
+        self.sends.retain(|s| s.target_bus_id != bus_id);
+    }
+
+    pub fn set_sidechain(&mut self, target_track_id: &str, target_insert_index: usize, gain: f32) {
+        if let Some(sc) = self.sidechains.iter_mut().find(|s| s.target_track_id == target_track_id && s.target_insert_index == target_insert_index) {
+            sc.gain = gain;
+        } else {
+            self.sidechains.push(SidechainSend {
+                target_track_id: target_track_id.to_string(),
+                target_insert_index,
+                gain,
+            });
+        }
+    }
+
+    pub fn remove_sidechain(&mut self, target_track_id: &str, target_insert_index: usize) {
+        self.sidechains.retain(|s| !(s.target_track_id == target_track_id && s.target_insert_index == target_insert_index));
+    }
+
+    pub fn mark_stem_dirty(&mut self) {
+        self.cached_stem = None;
+        self.stem_dirty = true;
     }
 
     pub fn set_sample_rate(&mut self, rate: f32) {
@@ -102,11 +300,12 @@ impl Track {
             TrackInstrument::AudioClips(_) => {}
             TrackInstrument::Clap(_) => {}
             TrackInstrument::Lv2(_) => {}
+            TrackInstrument::Vst3(vst3) => vst3.set_sample_rate(rate),
         }
     }
 
     pub fn note_on(&mut self, note: u8, velocity: f32) {
-        if self.muted {
+        if self.muted || self.is_frozen {
             return;
         }
         match &mut self.instrument {
@@ -115,37 +314,52 @@ impl Track {
             TrackInstrument::AudioClips(_) => {}
             TrackInstrument::Clap(clap) => clap.note_on(note, velocity),
             TrackInstrument::Lv2(lv2) => lv2.note_on(note, velocity),
+            TrackInstrument::Vst3(vst3) => vst3.note_on(note, velocity),
         }
     }
 
     pub fn note_off(&mut self, note: u8) {
+        if self.is_frozen {
+            return;
+        }
         match &mut self.instrument {
             TrackInstrument::Synth(synth) => synth.note_off(note),
             TrackInstrument::Sampler(sampler) => sampler.note_off(note),
             TrackInstrument::AudioClips(_) => {}
             TrackInstrument::Clap(clap) => clap.note_off(note),
             TrackInstrument::Lv2(lv2) => lv2.note_off(note),
+            TrackInstrument::Vst3(vst3) => vst3.note_off(note),
         }
     }
 
     pub fn all_notes_off(&mut self) {
+        if self.is_frozen {
+            return;
+        }
         match &mut self.instrument {
             TrackInstrument::Synth(synth) => synth.all_notes_off(),
             TrackInstrument::Sampler(sampler) => sampler.all_notes_off(),
             TrackInstrument::AudioClips(_) => {}
             TrackInstrument::Clap(clap) => clap.all_notes_off(),
             TrackInstrument::Lv2(lv2) => lv2.all_notes_off(),
+            TrackInstrument::Vst3(vst3) => vst3.all_notes_off(),
         }
     }
 
     pub fn handle_cc(&mut self, cc: u8, value: u8) {
-        if let TrackInstrument::Synth(synth) = &mut self.instrument {
-            synth.handle_cc(cc, value);
+        if self.is_frozen {
+            return;
+        }
+        match &mut self.instrument {
+            TrackInstrument::Synth(synth) => synth.handle_cc(cc, value),
+            TrackInstrument::Vst3(vst3) => vst3.handle_cc(cc, value),
+            _ => {}
         }
     }
 
     /// Set a named DSP / engine parameter live
     pub fn set_parameter(&mut self, param_name: &str, value: f32) {
+        self.mark_stem_dirty();
         match &mut self.instrument {
             TrackInstrument::Synth(synth) => {
                 match param_name {
@@ -164,6 +378,7 @@ impl Track {
             TrackInstrument::AudioClips(_) => {}
             TrackInstrument::Clap(clap) => clap.set_parameter(param_name, value),
             TrackInstrument::Lv2(lv2) => lv2.set_parameter(param_name, value),
+            TrackInstrument::Vst3(vst3) => vst3.set_parameter(param_name, value),
         }
     }
 
@@ -186,6 +401,7 @@ impl Track {
             TrackInstrument::AudioClips(_) => Vec::new(),
             TrackInstrument::Clap(clap) => clap.get_parameters(),
             TrackInstrument::Lv2(lv2) => lv2.get_parameters(),
+            TrackInstrument::Vst3(vst3) => vst3.get_parameters(),
         }
     }
 
@@ -207,6 +423,12 @@ impl Track {
                 std::fs::write(path, json)?;
                 Ok(())
             }
+            TrackInstrument::Vst3(vst3) => {
+                let params = vst3.get_parameters();
+                let json = serde_json::to_string_pretty(&params)?;
+                std::fs::write(path, json)?;
+                Ok(())
+            }
             TrackInstrument::Synth(synth) => {
                 let json = synth.patch.to_json()?;
                 std::fs::write(path, json)?;
@@ -218,6 +440,7 @@ impl Track {
 
     /// Load a synth patch from a JSON preset file into this track
     pub fn load_patch_from_file(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.mark_stem_dirty();
         let content = std::fs::read_to_string(path)?;
         match &mut self.instrument {
             TrackInstrument::Clap(clap) => {
@@ -265,6 +488,21 @@ impl Track {
                 }
                 anyhow::bail!("Unrecognized preset format in {}", path.display());
             }
+            TrackInstrument::Vst3(vst3) => {
+                if let Ok(params) = serde_json::from_str::<Vec<(String, f32, f32, f32)>>(&content) {
+                    for (name, val, _, _) in params {
+                        vst3.set_parameter(&name, val);
+                    }
+                    return Ok(());
+                }
+                if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, f32>>(&content) {
+                    for (name, val) in map {
+                        vst3.set_parameter(&name, val);
+                    }
+                    return Ok(());
+                }
+                anyhow::bail!("Unrecognized preset format in {}", path.display());
+            }
             TrackInstrument::Synth(synth) => {
                 synth.load_patch_json(&content)?;
                 Ok(())
@@ -281,6 +519,9 @@ impl Track {
         master_right: &mut [f32],
         scratch_left: &mut [f32],
         scratch_right: &mut [f32],
+        sidechain_buffers: Option<&std::collections::HashMap<(String, usize), (Vec<f32>, Vec<f32>)>>,
+        bypass_cached_stem: bool,
+        is_playing: bool,
     ) {
         if self.muted {
             return;
@@ -290,25 +531,109 @@ impl Track {
         scratch_left[..num_samples].fill(0.0);
         scratch_right[..num_samples].fill(0.0);
 
-        match &mut self.instrument {
-            TrackInstrument::Synth(synth) => {
-                synth.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+        // If a pre-rendered stem is available and not bypassed, stream directly from the cached stem (only while playing)!
+        let mut played_from_stem = false;
+        if !bypass_cached_stem && !self.is_frozen && is_playing {
+            if let Some(ref stem) = self.cached_stem {
+                if let Some(ref buf) = stem.buffer {
+                    let clip_len = buf.samples_left.len() as u64;
+                    if clip_len > 0 {
+                        let rel_sample = if current_timeline_sample >= stem.start_sample {
+                            current_timeline_sample - stem.start_sample
+                        } else {
+                            0
+                        };
+
+                        for i in 0..num_samples {
+                            let offset = ((rel_sample + i as u64) % clip_len) as usize;
+                            if offset < buf.samples_left.len() {
+                                scratch_left[i] += buf.samples_left[offset];
+                                scratch_right[i] += buf.samples_right[offset];
+                            }
+                        }
+                        played_from_stem = true;
+                    }
+                }
             }
-            TrackInstrument::Sampler(sampler) => {
-                sampler.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+        }
+
+        if !played_from_stem {
+            match &mut self.instrument {
+                TrackInstrument::Synth(synth) => {
+                    synth.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                }
+                TrackInstrument::Sampler(sampler) => {
+                    sampler.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                }
+                TrackInstrument::AudioClips(clips) => {
+                    clips.process_block(
+                        current_timeline_sample,
+                        &mut scratch_left[..num_samples],
+                        &mut scratch_right[..num_samples],
+                    );
+                }
+                TrackInstrument::Clap(clap) => {
+                    clap.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                }
+                TrackInstrument::Lv2(lv2) => {
+                    lv2.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                }
+                TrackInstrument::Vst3(vst3) => {
+                    vst3.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                }
             }
-            TrackInstrument::AudioClips(clips) => {
-                clips.process_block(
-                    current_timeline_sample,
-                    &mut scratch_left[..num_samples],
-                    &mut scratch_right[..num_samples],
-                );
+
+            // Pass track signal through insert effects chain in series
+            for (ins_idx, fx) in self.inserts.iter_mut().enumerate() {
+                match fx {
+                    InsertEffect::Clap { track: clap, .. } => {
+                        clap.process_effect_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                    }
+                    InsertEffect::Lv2 { track: lv2, .. } => {
+                        lv2.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                    }
+                    InsertEffect::Vst3 { track: vst3, .. } => {
+                        vst3.process_effect_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                    }
+                }
+
+                // Apply dynamic sidechain ducking if this insert has an incoming sidechain feed
+                if let Some(sc_map) = sidechain_buffers {
+                    if let Some((sc_l, sc_r)) = sc_map.get(&(self.id.clone(), ins_idx)) {
+                        let mut env = 0.0f32;
+                        for i in 0..num_samples {
+                            let sc_mag = sc_l[i].abs().max(sc_r[i].abs());
+                            if sc_mag > env {
+                                env = sc_mag;
+                            } else {
+                                env *= 0.999;
+                            }
+                            let duck = (1.0 - (env * 0.85)).clamp(0.05, 1.0);
+                            scratch_left[i] *= duck;
+                            scratch_right[i] *= duck;
+                        }
+                    }
+                }
             }
-            TrackInstrument::Clap(clap) => {
-                clap.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
-            }
-            TrackInstrument::Lv2(lv2) => {
-                lv2.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+
+            // Native track ducking on slot 0 if track has no external inserts
+            if self.inserts.is_empty() {
+                if let Some(sc_map) = sidechain_buffers {
+                    if let Some((sc_l, sc_r)) = sc_map.get(&(self.id.clone(), 0)) {
+                        let mut env = 0.0f32;
+                        for i in 0..num_samples {
+                            let sc_mag = sc_l[i].abs().max(sc_r[i].abs());
+                            if sc_mag > env {
+                                env = sc_mag;
+                            } else {
+                                env *= 0.999;
+                            }
+                            let duck = (1.0 - (env * 0.85)).clamp(0.05, 1.0);
+                            scratch_left[i] *= duck;
+                            scratch_right[i] *= duck;
+                        }
+                    }
+                }
             }
         }
 

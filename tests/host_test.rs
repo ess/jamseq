@@ -407,3 +407,589 @@ fn test_jamsynth_clap_track_lifecycle_and_presets() {
 
     let _ = std::fs::remove_file(temp_preset);
 }
+
+#[test]
+fn test_robust_jamseq_features_suite() {
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    host.add_custom_track("track_a", "Track A", "synth:sub808");
+    host.add_custom_track("track_b", "Track B", "synth:reese");
+    host.add_custom_track("track_c", "Track C", "audio");
+
+    assert_eq!(host.tracks.len(), 3);
+    assert_eq!(host.track_map.get("track_a"), Some(&0));
+    assert_eq!(host.track_map.get("track_b"), Some(&1));
+    assert_eq!(host.track_map.get("track_c"), Some(&2));
+
+    // Test Reordering tracks: move track_c (idx 2) to beginning (idx 0)
+    assert!(host.reorder_tracks(2, 0));
+    assert_eq!(host.tracks[0].id, "track_c");
+    assert_eq!(host.tracks[1].id, "track_a");
+    assert_eq!(host.tracks[2].id, "track_b");
+    assert_eq!(host.track_map.get("track_c"), Some(&0));
+    assert_eq!(host.track_map.get("track_a"), Some(&1));
+    assert_eq!(host.track_map.get("track_b"), Some(&2));
+
+    // Test Deleting a track
+    assert!(host.delete_track("track_a"));
+    assert_eq!(host.tracks.len(), 2);
+    assert!(host.track_map.get("track_a").is_none());
+    assert_eq!(host.track_map.get("track_c"), Some(&0));
+    assert_eq!(host.track_map.get("track_b"), Some(&1));
+
+    // Test AutomationPoint dispatching on timeline
+    host.timeline.add_event(jamseq::ScheduledEvent::new(
+        999,
+        0,
+        "track_b",
+        jamseq::ScheduledAction::SetParam {
+            param_name: "cutoff".to_string(),
+            value: 800.0,
+        },
+    ));
+
+    host.play();
+    let mut out_l = vec![0.0f32; 256];
+    let mut out_r = vec![0.0f32; 256];
+    host.process_block(&mut out_l, &mut out_r);
+
+    // Verify time signature calculation
+    let sig_3_4 = jamseq::TimeSignature { numerator: 3, denominator: 4 };
+    assert_eq!(sig_3_4.ticks_per_bar(), 3 * jamseq::PPQ);
+
+    let sig_7_8 = jamseq::TimeSignature { numerator: 7, denominator: 8 };
+    assert_eq!(sig_7_8.ticks_per_bar(), (7 * jamseq::PPQ * 4) / 8);
+}
+
+#[test]
+fn test_master_inserts_and_aux_send_routing() {
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    host.add_custom_track("track_lead", "Lead Synth", "synth:reese");
+    host.add_custom_track("track_bass", "Sub Bass", "synth:sub808");
+
+    // 1. Create Aux Bus
+    host.add_aux_bus("aux_reverb", "Space Reverb");
+    assert_eq!(host.aux_buses.len(), 1);
+    assert_eq!(host.aux_map.get("aux_reverb"), Some(&0));
+
+    // 2. Set post-fader send from Lead Synth to Aux Reverb (gain 0.5)
+    assert!(host.set_track_aux_send("track_lead", "aux_reverb", 0.5, false));
+    let lead_idx = host.track_map["track_lead"];
+    assert_eq!(host.tracks[lead_idx].sends.len(), 1);
+    assert_eq!(host.tracks[lead_idx].sends[0].gain, 0.5);
+    assert!(!host.tracks[lead_idx].sends[0].is_pre_fader);
+
+    // 3. Play note on Lead Synth and process block
+    host.tracks[lead_idx].note_on(60, 1.0);
+    let mut out_l = vec![0.0f32; 256];
+    let mut out_r = vec![0.0f32; 256];
+    host.process_block(&mut out_l, &mut out_r);
+
+    // Verify audio arrived in both Master Output and Aux Bus buffer
+    let aux_peak: f32 = host.aux_left[0].iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
+    let master_peak: f32 = out_l.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
+    assert!(aux_peak > 0.001, "Expected audio sent into aux_reverb buffer, got {}", aux_peak);
+    assert!(master_peak > 0.001, "Expected audio in Master output, got {}", master_peak);
+
+    // 4. Test pre-fader send: Mute track or set volume to 0.0
+    // Pre-fader send should STILL feed audio into the aux bus even when track volume is 0!
+    host.tracks[lead_idx].volume = 0.0;
+    host.set_track_aux_send("track_lead", "aux_reverb", 0.8, true); // pre-fader
+
+    let mut out_l2 = vec![0.0f32; 256];
+    let mut out_r2 = vec![0.0f32; 256];
+    host.process_block(&mut out_l2, &mut out_r2);
+
+    let aux_peak_pre: f32 = host.aux_left[0].iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
+    assert!(aux_peak_pre > 0.001, "Pre-fader send must route audio to aux bus when track volume is 0");
+
+    // 5. Test Master Bus controls
+    host.master_bus.pan = 1.0; // Hard right
+    let mut out_l3 = vec![0.0f32; 256];
+    let mut out_r3 = vec![0.0f32; 256];
+    host.process_block(&mut out_l3, &mut out_r3);
+    let peak_l: f32 = out_l3.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    let peak_r: f32 = out_r3.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(peak_l < 0.0001, "Hard right master pan should silence left channel");
+    assert!(peak_r > 0.001, "Hard right master pan should output to right channel");
+
+    // 6. Test removing Aux Bus
+    host.remove_aux_bus("aux_reverb");
+    assert_eq!(host.aux_buses.len(), 0);
+    assert!(host.aux_map.get("aux_reverb").is_none());
+    assert_eq!(host.tracks[lead_idx].sends.len(), 0, "Removing aux bus must purge track send entries");
+}
+
+#[test]
+fn test_hardware_midi_input_dispatch() {
+    let mut host = JamSeqHost::new(120.0, 44100.0);
+    host.add_custom_track("hw_lead", "Hardware Lead", "synth:reese");
+    let track_id = "hw_lead".to_string();
+
+    // Initially unarmed: simulated MIDI events should not trigger notes
+    host.midi_input.send_event(jamseq::midi_input::RawMidiEvent {
+        status: 0x90, // Note On Ch 1
+        data1: 60,   // Middle C
+        data2: 100,  // Velocity
+    });
+
+    let mut out_l = vec![0.0f32; 256];
+    let mut out_r = vec![0.0f32; 256];
+    host.process_block(&mut out_l, &mut out_r);
+    let peak_unarmed: f32 = out_l.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert_eq!(peak_unarmed, 0.0, "Unarmed track should not receive MIDI notes");
+
+    // Arm the track and send Note On
+    host.armed_track_id = Some(track_id.clone());
+    host.midi_input.send_event(jamseq::midi_input::RawMidiEvent {
+        status: 0x90, // Note On Ch 1
+        data1: 60,   // Middle C
+        data2: 100,  // Velocity
+    });
+
+    let mut out_l2 = vec![0.0f32; 256];
+    let mut out_r2 = vec![0.0f32; 256];
+    host.process_block(&mut out_l2, &mut out_r2);
+    let peak_armed: f32 = out_l2.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(peak_armed > 0.001, "Armed track must receive and render incoming live MIDI Note On");
+
+    // Send Note Off
+    host.midi_input.send_event(jamseq::midi_input::RawMidiEvent {
+        status: 0x80, // Note Off Ch 1
+        data1: 60,
+        data2: 0,
+    });
+    // Send CC 7 (Volume)
+    host.midi_input.send_event(jamseq::midi_input::RawMidiEvent {
+        status: 0xB0, // CC
+        data1: 7,
+        data2: 64,
+    });
+    host.process_block(&mut out_l2, &mut out_r2);
+}
+
+#[test]
+fn test_inter_track_sidechain_ducking() {
+    let mut host = JamSeqHost::new(120.0, 44100.0);
+
+    // Track 1: Bass
+    let mut bass = JamSynthEngine::new(44100.0);
+    bass.load_patch(JamSynthPatch::preset_808_sub());
+    host.add_track(Track::new_synth("bass", "Sub Bass", bass));
+
+    // Track 2: Kick trigger
+    let mut kick = JamSynthEngine::new(44100.0);
+    kick.load_patch(JamSynthPatch::preset_808_sub());
+    host.add_track(Track::new_synth("kick", "Kick Drum", kick));
+
+    // When kick sends sidechain to bass, kick MUST run first to feed bass's sidechain!
+    let configured = host.set_insert_sidechain("bass", 0, "kick", 1.0);
+    assert!(configured, "Failed to configure sidechain routing");
+
+    let order = host.get_track_processing_order();
+    let kick_idx = *host.track_map.get("kick").unwrap();
+    let bass_idx = *host.track_map.get("bass").unwrap();
+    let kick_pos = order.iter().position(|&x| x == kick_idx).unwrap();
+    let bass_pos = order.iter().position(|&x| x == bass_idx).unwrap();
+    assert!(kick_pos < bass_pos, "Sidechain source (kick) must be processed BEFORE target (bass)");
+
+    // 1. Play bass alone (kick is quiet)
+    host.tracks[bass_idx].note_on(36, 1.0);
+    let mut out_l_solo = vec![0.0f32; 256];
+    let mut out_r_solo = vec![0.0f32; 256];
+    host.process_block(&mut out_l_solo, &mut out_r_solo);
+    let peak_bass_unducked: f32 = out_l_solo.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(peak_bass_unducked > 0.05, "Bass note should produce audio");
+
+    // 2. Play kick simultaneously with sidechain routing
+    // Set kick track fader output to near zero so master level reflects ducked bass
+    host.tracks[kick_idx].volume = 0.001;
+    host.tracks[kick_idx].note_on(36, 1.0);
+    let mut out_l_sc = vec![0.0f32; 256];
+    let mut out_r_sc = vec![0.0f32; 256];
+    host.process_block(&mut out_l_sc, &mut out_r_sc);
+    let peak_bass_ducked: f32 = out_l_sc.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(peak_bass_ducked < peak_bass_unducked, "Bass should be ducked by incoming kick sidechain signal");
+
+    // 3. Remove sidechain and verify removal
+    let removed = host.remove_insert_sidechain("bass", 0);
+    assert!(removed);
+    assert_eq!(host.tracks[kick_idx].sidechains.len(), 0);
+}
+
+#[test]
+fn test_track_freeze_and_unfreeze() {
+    let mut host = JamSeqHost::new(120.0, 44100.0);
+    let mut pad = JamSynthEngine::new(44100.0);
+    pad.load_patch(JamSynthPatch::preset_cold_pad());
+    host.add_track(Track::new_synth("pad", "Pad", pad));
+
+    // Schedule events
+    host.timeline.events.push(ScheduledEvent::new(1, 0, "pad", ScheduledAction::NoteOn { note: 60, velocity: 1.0 }));
+    host.timeline.events.push(ScheduledEvent::new(2, 4 * TICKS_PER_16TH, "pad", ScheduledAction::NoteOff { note: 60 }));
+    host.timeline.seek_tick(0);
+
+    // Freeze track
+    let wav_path_str = host.freeze_track("pad").expect("Failed to freeze track");
+    let wav_path = std::path::Path::new(&wav_path_str);
+    assert!(wav_path.exists(), "Frozen WAV file must exist on disk");
+
+    let pad_idx = *host.track_map.get("pad").unwrap();
+    assert!(host.tracks[pad_idx].is_frozen, "Track must be marked as frozen");
+    assert!(matches!(host.tracks[pad_idx].instrument, jamseq::track::TrackInstrument::AudioClips(_)), "Instrument must be replaced with AudioClip player");
+
+    // Test playback of frozen track
+    host.timeline.seek_tick(0);
+    host.timeline.play();
+    let mut out_l = vec![0.0f32; 512];
+    let mut out_r = vec![0.0f32; 512];
+    host.process_block(&mut out_l, &mut out_r);
+    let peak_frozen: f32 = out_l.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(peak_frozen > 0.001, "Frozen track must play audio from audio clip");
+
+    // Unfreeze track
+    host.unfreeze_track("pad").expect("Failed to unfreeze track");
+    assert!(!host.tracks[pad_idx].is_frozen, "Track must not be marked frozen");
+    assert!(matches!(host.tracks[pad_idx].instrument, jamseq::track::TrackInstrument::Synth(_)), "Original synth instrument must be restored");
+}
+
+#[test]
+fn test_track_bouncing() {
+    let mut host = JamSeqHost::new(120.0, 44100.0);
+    let mut lead = JamSynthEngine::new(44100.0);
+    lead.load_patch(JamSynthPatch::preset_reese_bass());
+    host.add_track(Track::new_synth("lead", "Reese Lead", lead));
+
+    // Schedule event
+    host.timeline.events.push(ScheduledEvent::new(1, 0, "lead", ScheduledAction::NoteOn { note: 48, velocity: 1.0 }));
+    host.timeline.events.push(ScheduledEvent::new(2, 4 * TICKS_PER_16TH, "lead", ScheduledAction::NoteOff { note: 48 }));
+
+    let bounce_id = host.bounce_track("lead", "Lead Stem").expect("Failed to bounce track");
+    assert!(host.track_map.contains_key(&bounce_id), "New bounced track must exist in host track map");
+
+    let bounce_idx = *host.track_map.get(&bounce_id).unwrap();
+    assert_eq!(host.tracks[bounce_idx].name, "Lead Stem");
+    assert!(matches!(host.tracks[bounce_idx].instrument, jamseq::track::TrackInstrument::AudioClips(_)));
+}
+
+#[test]
+fn test_autostem_mid_event_pause_and_unpause() {
+    let mut host = JamSeqHost::new(120.0, 44100.0);
+    let mut pad = JamSynthEngine::new(44100.0);
+    pad.load_patch(JamSynthPatch::preset_cold_pad());
+    host.add_track(Track::new_synth("pad_long", "Long Ambient Pad", pad));
+
+    // Pad note starts at tick 0 and sustains for an entire bar (1920 ticks)
+    host.timeline.events.push(ScheduledEvent::new(1, 0, "pad_long", ScheduledAction::NoteOn { note: 60, velocity: 1.0 }));
+    host.timeline.events.push(ScheduledEvent::new(2, 1920, "pad_long", ScheduledAction::NoteOff { note: 60 }));
+    host.timeline.events.sort_by_key(|e| e.tick);
+
+    // Initial state: track is dirty
+    let pad_idx = *host.track_map.get("pad_long").unwrap();
+    assert!(host.tracks[pad_idx].stem_dirty);
+    assert!(host.tracks[pad_idx].cached_stem.is_none());
+
+    // 1. Bake stems
+    let count = host.generate_stems_for_dirty_tracks();
+    assert_eq!(count, 1, "Should generate exactly 1 dirty stem");
+    assert!(!host.tracks[pad_idx].stem_dirty);
+    assert!(host.tracks[pad_idx].cached_stem.is_some(), "Stem clip must be attached to track");
+
+    // 2. Play from tick 0 to halfway through the note (tick 960)
+    host.timeline.seek_tick(0);
+    host.timeline.play();
+    let mut out_l = vec![0.0f32; 512];
+    let mut out_r = vec![0.0f32; 512];
+    host.process_block(&mut out_l, &mut out_r);
+
+    // 3. Pause playback mid-note (at tick 960)
+    // In a naive MIDI engine, pause silences all notes. When resuming at tick 960 without stems,
+    // the synth would produce 0 audio because NoteOn was at tick 0!
+    host.timeline.seek_tick(960);
+    host.pause();
+
+    // 4. Unpause at tick 960
+    host.timeline.play();
+    out_l.fill(0.0);
+    out_r.fill(0.0);
+    host.process_block(&mut out_l, &mut out_r);
+
+    let peak_mid_note: f32 = out_l.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(
+        peak_mid_note > 0.001,
+        "Unpausing mid-note must seamlessly continue playing the pad from the autogenerated stem"
+    );
+
+    // 5. Test dirty invalidation on parameter change
+    host.mark_track_dirty("pad_long");
+    assert!(host.tracks[pad_idx].stem_dirty);
+    assert!(host.tracks[pad_idx].cached_stem.is_none(), "Editing must invalidate cached stem for live editing");
+
+    // 6. Test pause automatically regenerates dirty stems
+    host.pause();
+    assert!(!host.tracks[pad_idx].stem_dirty);
+    assert!(host.tracks[pad_idx].cached_stem.is_some(), "Pause must auto-bake dirty stems");
+}
+
+#[test]
+fn test_debug_playback_demo() {
+    let mut host = JamSeqHost::new(68.0, 48000.0);
+    let sr = 48000.0;
+    if let Some(jamsynth_path) = jamseq::plugin_scanner::find_jamsynth_plugin() {
+        if let Ok(bass_clap) = jamseq::clap_host::ClapTrack::load(&jamsynth_path.to_string_lossy(), sr) {
+            host.add_track(Track::new_clap("bass", "Sub 808 (Drake Slide)", bass_clap, "JamSynth (Sub 808)"));
+        } else {
+            let mut bass_engine = JamSynthEngine::new(sr);
+            bass_engine.load_patch(JamSynthPatch::preset_808_sub());
+            host.add_track(Track::new_synth("bass", "Sub 808 (Drake Slide)", bass_engine));
+        }
+
+        if let Ok(pad_clap) = jamseq::clap_host::ClapTrack::load(&jamsynth_path.to_string_lossy(), sr) {
+            host.add_track(Track::new_clap("pad", "Cold Pad (D-Minor 9th)", pad_clap, "JamSynth (Cold Pad)"));
+        } else {
+            let mut pad_engine = JamSynthEngine::new(sr);
+            pad_engine.load_patch(JamSynthPatch::preset_cold_pad());
+            host.add_track(Track::new_synth("pad", "Cold Pad (D-Minor 9th)", pad_engine));
+        }
+    } else {
+        let mut bass_engine = JamSynthEngine::new(sr);
+        bass_engine.load_patch(JamSynthPatch::preset_808_sub());
+        host.add_track(Track::new_synth("bass", "Sub 808 (Drake Slide)", bass_engine));
+
+        let mut pad_engine = JamSynthEngine::new(sr);
+        pad_engine.load_patch(JamSynthPatch::preset_cold_pad());
+        host.add_track(Track::new_synth("pad", "Cold Pad (D-Minor 9th)", pad_engine));
+    }
+
+    let avl_uri = "http://gareus.org/oss/lv2/avldrums#BlackPearl";
+    if let Ok(drums_lv2) = jamseq::lv2_host::Lv2Track::load(avl_uri, sr) {
+        host.add_track(Track::new_lv2("drums", "Drums (Black Pearl)", drums_lv2, "Black Pearl Drumkit"));
+    }
+
+    // Schedule 4 bars identical to main.rs
+    let mut events = Vec::new();
+    let mut next_id = 1u64;
+    let mut add_ev = |events: &mut Vec<ScheduledEvent>, tick: u64, track_id: &str, action: ScheduledAction| {
+        events.push(ScheduledEvent::new(next_id, tick, track_id, action));
+        next_id += 1;
+    };
+    add_ev(&mut events, 0, "bass", ScheduledAction::NoteOn { note: 50, velocity: 1.0 });
+    add_ev(&mut events, 6 * 240, "bass", ScheduledAction::NoteOff { note: 50 });
+    add_ev(&mut events, 0, "drums", ScheduledAction::NoteOn { note: 36, velocity: 1.0 });
+    add_ev(&mut events, 120, "drums", ScheduledAction::NoteOff { note: 36 });
+    for &n in &[50, 53, 57, 60, 64] {
+        add_ev(&mut events, 4 * 240, "pad", ScheduledAction::NoteOn { note: n, velocity: 0.7 });
+        add_ev(&mut events, 12 * 240, "pad", ScheduledAction::NoteOff { note: n });
+    }
+
+    let arr = jamseq::timeline::TimelineArrangement {
+        title: "Test".to_string(),
+        bpm: 68.0,
+        total_bars: 4,
+        loop_enabled: true,
+        sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4, 1)],
+        events,
+    };
+    host.load_arrangement(arr);
+
+    for (i, t) in host.tracks.iter().enumerate() {
+        if let Some(ref stem) = t.cached_stem {
+            if let Some(ref buf) = stem.buffer {
+                let max_l: f32 = buf.samples_left.iter().map(|s| s.abs()).fold(0.0, f32::max);
+                println!("Track {} ({}) stem len={}, max_l={}", i, t.id, buf.samples_left.len(), max_l);
+            }
+        } else {
+            println!("Track {} ({}) has NO cached stem", i, t.id);
+        }
+    }
+
+    host.set_sample_rate(44100.0);
+
+    // Verify that while stopped, there is ZERO audio output (zero hum)
+    let mut out_l = vec![0.0f32; 512];
+    let mut out_r = vec![0.0f32; 512];
+    host.process_block(&mut out_l, &mut out_r);
+    let stopped_peak: f32 = out_l.iter().chain(out_r.iter()).map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(stopped_peak < 1e-6, "Stopped engine must produce zero hum or audible audio (got {})", stopped_peak);
+
+    host.play();
+    let mut out_r = vec![0.0f32; 512];
+    let mut total_peak = 0.0f32;
+    for block in 0..30 {
+        host.process_block(&mut out_l, &mut out_r);
+        let peak: f32 = out_l.iter().chain(out_r.iter()).map(|s| s.abs()).fold(0.0, f32::max);
+        if peak > total_peak {
+            total_peak = peak;
+        }
+        if block == 0 || block == 5 || block == 15 {
+            println!("Block {}: peak = {}", block, peak);
+        }
+    }
+    println!("Total peak over 30 blocks: {}", total_peak);
+    assert!(total_peak > 0.001, "Playback must produce audible output!");
+}
+
+#[test]
+fn test_server_playback_over_ipc() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+    use std::time::Duration;
+
+    let temp_dir = std::env::temp_dir();
+    let sock_path = temp_dir.join("test_server_playback.sock");
+    let _ = std::fs::remove_file(&sock_path);
+
+    let mut host = JamSeqHost::new(68.0, 48000.0);
+    let mut bass = JamSynthEngine::new(48000.0);
+    bass.load_patch(JamSynthPatch::preset_808_sub());
+    host.add_track(Track::new_synth("bass", "Sub 808", bass));
+
+    let mut events = Vec::new();
+    events.push(ScheduledEvent::new(1, 0, "bass", ScheduledAction::NoteOn { note: 50, velocity: 1.0 }));
+    events.push(ScheduledEvent::new(2, 6 * 240, "bass", ScheduledAction::NoteOff { note: 50 }));
+
+    let arr = jamseq::timeline::TimelineArrangement {
+        title: "Test".to_string(),
+        bpm: 68.0,
+        total_bars: 4,
+        loop_enabled: true,
+        sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4, 1)],
+        events,
+    };
+    host.load_arrangement(arr);
+
+    let host_arc = Arc::new(Mutex::new(host));
+
+    let server = jamseq::ipc::IpcServer::new(&sock_path);
+    server.start(Arc::clone(&host_arc)).expect("Failed to start IPC server");
+    thread::sleep(Duration::from_millis(50));
+
+    // Connect client
+    let mut stream = UnixStream::connect(&sock_path).expect("Failed to connect");
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    // 1. Get status before play
+    writeln!(stream, "{{\"cmd\":\"GetStatus\"}}").unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let resp: jamseq::ipc::IpcResponse = serde_json::from_str(&line).unwrap();
+    assert!(!resp.status.unwrap().is_playing);
+
+    // 2. Send Play command
+    writeln!(stream, "{{\"cmd\":\"Play\"}}").unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let resp: jamseq::ipc::IpcResponse = serde_json::from_str(&line).unwrap();
+    let status = resp.status.unwrap();
+    println!("Status after Play: is_playing={}", status.is_playing);
+    assert!(status.is_playing);
+
+    // 3. Process blocks as CPAL would
+    let mut out_l = vec![0.0f32; 512];
+    let mut out_r = vec![0.0f32; 512];
+    let mut total_peak = 0.0f32;
+    for _ in 0..10 {
+        let mut h = host_arc.lock().unwrap();
+        h.process_block(&mut out_l, &mut out_r);
+        let peak: f32 = out_l.iter().chain(out_r.iter()).map(|s| s.abs()).fold(0.0, f32::max);
+        if peak > total_peak {
+            total_peak = peak;
+        }
+    }
+    println!("Total peak in IPC play test: {}", total_peak);
+    assert!(total_peak > 0.001);
+}
+
+
+
+#[test]
+fn test_vst3_scanner_discovery() {
+    let surge_path = "/usr/lib/vst3/Surge XT.vst3";
+    if !std::path::Path::new(surge_path).exists() {
+        println!("Skipping VST3 scanner test: {} not found", surge_path);
+        return;
+    }
+
+    let plugins = jamseq::plugin_scanner::PluginScanner::scan_all();
+    let found = plugins.iter().any(|p| p.plugin_format == "VST3" && p.name.contains("Surge XT"));
+    assert!(found, "PluginScanner failed to discover Surge XT VST3 plugin in /usr/lib/vst3");
+}
+
+#[test]
+fn test_vst3_track_in_engine_and_host() {
+    let surge_path = "/usr/lib/vst3/Surge XT.vst3";
+    if !std::path::Path::new(surge_path).exists() {
+        println!("Skipping VST3 engine test: {} not found", surge_path);
+        return;
+    }
+
+    let mut host = jamseq::JamSeqHost::new(120.0, 44100.0);
+    // Switch or add track
+    host.add_custom_track("vst_test", "Surge Track", surge_path);
+    assert_eq!(host.tracks.len(), 1);
+
+    let track_idx = *host.track_map.get("vst_test").expect("Track not found");
+    assert!(matches!(host.tracks[track_idx].instrument, jamseq::track::TrackInstrument::Vst3(_)));
+
+    // Send NoteOn
+    host.tracks[track_idx].note_on(60, 0.9);
+
+    let mut out_l = vec![0.0f32; 512];
+    let mut out_r = vec![0.0f32; 512];
+    host.process_block(&mut out_l, &mut out_r);
+
+    let peak: f32 = out_l.iter().chain(out_r.iter()).map(|s| s.abs()).fold(0.0, f32::max);
+    println!("VST3 Engine track output peak: {}", peak);
+    assert!(peak > 0.0001, "VST3 track did not produce audio in engine process_block");
+
+    // Test parameter retrieval and preset saving/loading
+    let params = host.tracks[track_idx].get_parameters();
+    assert!(!params.is_empty(), "VST3 track should report parameters");
+
+    let temp_preset = std::env::temp_dir().join("test_surge_preset.json");
+    host.tracks[track_idx].save_patch_to_file(&temp_preset).expect("Failed to save patch");
+    assert!(temp_preset.exists());
+
+    host.tracks[track_idx].load_patch_from_file(&temp_preset).expect("Failed to load patch");
+    let _ = std::fs::remove_file(temp_preset);
+}
+
+#[test]
+fn test_vst3_insert_effect_on_track() {
+    let surge_fx_path = "/usr/lib/vst3/Surge XT Effects.vst3";
+    if !std::path::Path::new(surge_fx_path).exists() {
+        println!("Skipping VST3 effect test: {} not found", surge_fx_path);
+        return;
+    }
+
+    let mut host = jamseq::JamSeqHost::new(120.0, 44100.0);
+    // Add a synth track first
+    let mut bass = jamsynth::JamSynthEngine::new(44100.0);
+    bass.load_patch(jamsynth::JamSynthPatch::preset_808_sub());
+    host.add_track(jamseq::track::Track::new_synth("track_0", "Sub Bass", bass));
+
+    // Add VST3 effect to track 0
+    let success = host.add_track_insert("track_0", surge_fx_path, "Surge FX Insert");
+    assert!(success, "Failed to add VST3 insert to track");
+
+    let track_0 = &host.tracks[0];
+    assert_eq!(track_0.inserts.len(), 1);
+
+    // Play note on track 0
+    host.tracks[0].note_on(60, 0.8);
+
+    let mut out_l = vec![0.0f32; 512];
+    let mut out_r = vec![0.0f32; 512];
+    host.process_block(&mut out_l, &mut out_r);
+
+    let peak: f32 = out_l.iter().chain(out_r.iter()).map(|s| s.abs()).fold(0.0, f32::max);
+    println!("Track with VST3 insert audio output peak: {}", peak);
+    assert!(peak > 0.0001, "Expected audio output from track through VST3 insert");
+}
+
+
+
+
+
+
