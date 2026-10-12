@@ -143,27 +143,49 @@ impl JamSeqHost {
     }
 
     /// Manually add a track of the requested type
+    /// Manually add a track of the requested type
     pub fn add_custom_track(&mut self, id: &str, name: &str, track_type: &str) {
         let sr = self.sample_rate;
         let track = match track_type {
-            "synth:reese" => {
-                let mut engine = jamsynth::JamSynthEngine::new(sr);
-                engine.load_patch(jamsynth::JamSynthPatch::preset_reese_bass());
-                Track::new_synth(id, name, engine)
-            }
-            "synth:pad" => {
-                let mut engine = jamsynth::JamSynthEngine::new(sr);
-                engine.load_patch(jamsynth::JamSynthPatch::preset_cold_pad());
-                Track::new_synth(id, name, engine)
-            }
             "audio" => {
                 Track::new_audio_clips(id, name, AudioClipTrack::new())
             }
             _ => {
-                // Default 808 sub
-                let mut engine = jamsynth::JamSynthEngine::new(sr);
-                engine.load_patch(jamsynth::JamSynthPatch::preset_808_sub());
-                Track::new_synth(id, name, engine)
+                if let Some(jamsynth_path) = crate::plugin_scanner::find_jamsynth_plugin() {
+                    match crate::clap_host::ClapTrack::load(&jamsynth_path.to_string_lossy(), sr) {
+                        Ok(clap_inst) => {
+                            apply_synth_preset(&clap_inst, track_type);
+                            let display = match track_type {
+                                "synth:reese" => "JamSynth (Dark Reese)",
+                                "synth:pad" => "JamSynth (Cold Pad)",
+                                _ => "JamSynth (Sub 808)",
+                            };
+                            Track::new_clap(id, name, clap_inst, display)
+                        }
+                        Err(e) => {
+                            eprintln!("[jamseq] Failed to load JamSynth CLAP: {}", e);
+                            let mut engine = jamsynth::JamSynthEngine::new(sr);
+                            if track_type == "synth:reese" {
+                                engine.load_patch(jamsynth::JamSynthPatch::preset_reese_bass());
+                            } else if track_type == "synth:pad" {
+                                engine.load_patch(jamsynth::JamSynthPatch::preset_cold_pad());
+                            } else {
+                                engine.load_patch(jamsynth::JamSynthPatch::preset_808_sub());
+                            }
+                            Track::new_synth(id, name, engine)
+                        }
+                    }
+                } else {
+                    let mut engine = jamsynth::JamSynthEngine::new(sr);
+                    if track_type == "synth:reese" {
+                        engine.load_patch(jamsynth::JamSynthPatch::preset_reese_bass());
+                    } else if track_type == "synth:pad" {
+                        engine.load_patch(jamsynth::JamSynthPatch::preset_cold_pad());
+                    } else {
+                        engine.load_patch(jamsynth::JamSynthPatch::preset_808_sub());
+                    }
+                    Track::new_synth(id, name, engine)
+                }
             }
         };
         self.add_track(track);
@@ -184,19 +206,32 @@ impl JamSeqHost {
 
             track.current_plugin = Some(display_name.to_string());
 
-            if uri_or_type.starts_with("synth:reese") {
+            if uri_or_type.starts_with("synth:") || uri_or_type == "jamsynth" {
+                if let Some(jamsynth_path) = crate::plugin_scanner::find_jamsynth_plugin() {
+                    match crate::clap_host::ClapTrack::load(&jamsynth_path.to_string_lossy(), sr) {
+                        Ok(clap_inst) => {
+                            apply_synth_preset(&clap_inst, uri_or_type);
+                            println!("[jamseq] ✓ Switched track '{}' to JamSynth CLAP: {}", track_id, display_name);
+                            track.instrument = TrackInstrument::Clap(Box::new(clap_inst));
+                            return;
+                        }
+                        Err(e) => {
+                            eprintln!("[jamseq] Failed to load JamSynth CLAP: {}", e);
+                        }
+                    }
+                }
+
+                // Fallback to internal synth engine if CLAP binary unavailable
                 let mut engine = jamsynth::JamSynthEngine::new(sr);
-                engine.load_patch(jamsynth::JamSynthPatch::preset_reese_bass());
+                if uri_or_type.starts_with("synth:reese") {
+                    engine.load_patch(jamsynth::JamSynthPatch::preset_reese_bass());
+                } else if uri_or_type.starts_with("synth:pad") {
+                    engine.load_patch(jamsynth::JamSynthPatch::preset_cold_pad());
+                } else {
+                    engine.load_patch(jamsynth::JamSynthPatch::preset_808_sub());
+                }
                 track.instrument = TrackInstrument::Synth(engine);
-            } else if uri_or_type.starts_with("synth:pad") {
-                let mut engine = jamsynth::JamSynthEngine::new(sr);
-                engine.load_patch(jamsynth::JamSynthPatch::preset_cold_pad());
-                track.instrument = TrackInstrument::Synth(engine);
-            } else if uri_or_type.starts_with("synth:808") {
-                let mut engine = jamsynth::JamSynthEngine::new(sr);
-                engine.load_patch(jamsynth::JamSynthPatch::preset_808_sub());
-                track.instrument = TrackInstrument::Synth(engine);
-            } else if uri_or_type.ends_with(".clap") {
+            } else if uri_or_type.ends_with(".clap") || uri_or_type.ends_with(".so") {
                 match crate::clap_host::ClapTrack::load(uri_or_type, sr) {
                     Ok(clap_inst) => {
                         println!("[jamseq] ✓ Switched track '{}' to CLAP plugin: {}", track_id, display_name);
@@ -266,8 +301,24 @@ impl JamSeqHost {
                         track.handle_cc(cc, value);
                     }
                     ScheduledAction::LoadPatchJson { json } => {
-                        if let crate::track::TrackInstrument::Synth(synth) = &mut track.instrument {
-                            let _ = synth.load_patch_json(&json);
+                        match &mut track.instrument {
+                            crate::track::TrackInstrument::Clap(clap) => {
+                                if let Ok(patch) = jamsynth::JamSynthPatch::from_json(&json) {
+                                    clap.set_parameter("cutoff", patch.filter.cutoff_hz);
+                                    clap.set_parameter("resonance", patch.filter.resonance);
+                                    clap.set_parameter("glide", patch.glide_ms);
+                                    clap.set_parameter("drive", patch.drive.amount);
+                                    clap.set_parameter("attack", patch.amp_env.attack_ms);
+                                    clap.set_parameter("decay", patch.amp_env.decay_ms);
+                                    clap.set_parameter("sustain", patch.amp_env.sustain);
+                                    clap.set_parameter("release", patch.amp_env.release_ms);
+                                    clap.set_parameter("master_gain", patch.master_gain);
+                                }
+                            }
+                            crate::track::TrackInstrument::Synth(synth) => {
+                                let _ = synth.load_patch_json(&json);
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -354,5 +405,40 @@ impl JamSeqHost {
         writer.finalize()?;
         self.timeline.pause();
         Ok(())
+    }
+}
+
+fn apply_synth_preset(clap: &crate::clap_host::ClapTrack, preset: &str) {
+    if preset.starts_with("synth:reese") {
+        clap.set_parameter("cutoff", 480.0);
+        clap.set_parameter("resonance", 0.3);
+        clap.set_parameter("glide", 60.0);
+        clap.set_parameter("drive", 0.45);
+        clap.set_parameter("attack", 15.0);
+        clap.set_parameter("decay", 2000.0);
+        clap.set_parameter("sustain", 0.8);
+        clap.set_parameter("release", 200.0);
+        clap.set_parameter("master_gain", 0.85);
+    } else if preset.starts_with("synth:pad") {
+        clap.set_parameter("cutoff", 1200.0);
+        clap.set_parameter("resonance", 0.15);
+        clap.set_parameter("glide", 0.0);
+        clap.set_parameter("drive", 0.15);
+        clap.set_parameter("attack", 350.0);
+        clap.set_parameter("decay", 3000.0);
+        clap.set_parameter("sustain", 0.7);
+        clap.set_parameter("release", 1200.0);
+        clap.set_parameter("master_gain", 0.8);
+    } else {
+        // Default 808 sub
+        clap.set_parameter("cutoff", 350.0);
+        clap.set_parameter("resonance", 0.2);
+        clap.set_parameter("glide", 45.0);
+        clap.set_parameter("drive", 0.35);
+        clap.set_parameter("attack", 1.0);
+        clap.set_parameter("decay", 1400.0);
+        clap.set_parameter("sustain", 0.0);
+        clap.set_parameter("release", 100.0);
+        clap.set_parameter("master_gain", 0.9);
     }
 }

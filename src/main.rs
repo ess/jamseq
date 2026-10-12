@@ -76,15 +76,39 @@ fn run_server(socket_path: &str) -> Result<()> {
 fn build_white_flame_demo_host() -> Result<JamSeqHost> {
     let mut host = JamSeqHost::new(68.0, 48000.0);
 
-    // Track 1: Sub 808 (JamSynth)
-    let mut bass_engine = JamSynthEngine::new(48000.0);
-    bass_engine.load_patch(JamSynthPatch::preset_808_sub());
-    host.add_track(Track::new_synth("bass", "Sub 808 (Drake Slide)", bass_engine));
+    // Track 1: Sub 808 (JamSynth CLAP)
+    let sr = 48000.0;
+    if let Some(jamsynth_path) = jamseq::plugin_scanner::find_jamsynth_plugin() {
+        if let Ok(bass_clap) = jamseq::clap_host::ClapTrack::load(&jamsynth_path.to_string_lossy(), sr) {
+            host.add_track(Track::new_clap("bass", "Sub 808 (Drake Slide)", bass_clap, "JamSynth (Sub 808)"));
+        } else {
+            let mut bass_engine = JamSynthEngine::new(sr);
+            bass_engine.load_patch(JamSynthPatch::preset_808_sub());
+            host.add_track(Track::new_synth("bass", "Sub 808 (Drake Slide)", bass_engine));
+        }
 
-    // Track 2: Cold Gothic Pad (JamSynth)
-    let mut pad_engine = JamSynthEngine::new(48000.0);
-    pad_engine.load_patch(JamSynthPatch::preset_cold_pad());
-    host.add_track(Track::new_synth("pad", "Cold Pad (D-Minor 9th)", pad_engine));
+        if let Ok(pad_clap) = jamseq::clap_host::ClapTrack::load(&jamsynth_path.to_string_lossy(), sr) {
+            pad_clap.set_parameter("cutoff", 1200.0);
+            pad_clap.set_parameter("resonance", 0.15);
+            pad_clap.set_parameter("attack", 350.0);
+            pad_clap.set_parameter("decay", 3000.0);
+            pad_clap.set_parameter("sustain", 0.7);
+            pad_clap.set_parameter("release", 1200.0);
+            host.add_track(Track::new_clap("pad", "Cold Pad (D-Minor 9th)", pad_clap, "JamSynth (Cold Pad)"));
+        } else {
+            let mut pad_engine = JamSynthEngine::new(sr);
+            pad_engine.load_patch(JamSynthPatch::preset_cold_pad());
+            host.add_track(Track::new_synth("pad", "Cold Pad (D-Minor 9th)", pad_engine));
+        }
+    } else {
+        let mut bass_engine = JamSynthEngine::new(sr);
+        bass_engine.load_patch(JamSynthPatch::preset_808_sub());
+        host.add_track(Track::new_synth("bass", "Sub 808 (Drake Slide)", bass_engine));
+
+        let mut pad_engine = JamSynthEngine::new(sr);
+        pad_engine.load_patch(JamSynthPatch::preset_cold_pad());
+        host.add_track(Track::new_synth("pad", "Cold Pad (D-Minor 9th)", pad_engine));
+    }
 
     // Schedule 4 bars of The White Flame Verse 1
     let mut events = Vec::new();
@@ -173,8 +197,8 @@ fn run_demo() -> Result<()> {
     }
 
     println!("[jamseq] ▶ PLAYING: 'The White Flame' (Verse 1 Demo @ 68 BPM)");
-    println!("         • Track 1: Sub 808 (JamSynth with Drake slide D3 -> D4)");
-    println!("         • Track 2: Cold Gothic Pad (JamSynth 8-voice polyphonic Dm9)");
+    println!("         • Track 1: Sub 808 (JamSynth CLAP with Drake slide D3 -> D4)");
+    println!("         • Track 2: Cold Gothic Pad (JamSynth CLAP polyphonic Dm9)");
     println!("         • Engine: Zero DAW, real-time PipeWire audio output");
     println!("         (Playing 1 loop iteration for 14 seconds...)");
 

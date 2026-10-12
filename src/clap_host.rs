@@ -155,6 +155,12 @@ impl ClapTrack {
                                 let idx = p_list.len();
                                 p_map.insert(name.clone(), idx);
                                 p_map.insert(name.to_lowercase(), idx);
+                                p_map.insert(name.to_lowercase().replace(' ', "_"), idx);
+                                p_map.insert(name.to_lowercase().replace('_', " "), idx);
+                                let stripped_ms = name.to_lowercase().replace(" (ms)", "").replace("_ms", "").replace(" ms", "");
+                                p_map.insert(stripped_ms.clone(), idx);
+                                p_map.insert(format!("{}_ms", stripped_ms), idx);
+                                p_map.insert(format!("{} (ms)", stripped_ms), idx);
 
                                 p_list.push(ClapParam {
                                     id: info.id,
@@ -244,10 +250,30 @@ impl ClapTrack {
     pub fn set_parameter(&self, name: &str, value: f32) {
         let mut params = self.params.lock().unwrap();
         let index_map = self.param_index.lock().unwrap();
-        let idx = index_map.get(name).or_else(|| index_map.get(&name.to_lowercase()));
+        let idx = index_map.get(name)
+            .or_else(|| index_map.get(&name.to_lowercase()))
+            .or_else(|| index_map.get(&name.to_lowercase().replace(' ', "_")))
+            .or_else(|| index_map.get(&name.to_lowercase().replace('_', " ")));
         if let Some(&i) = idx {
             if let Some(param) = params.get_mut(i) {
-                let clamped = value.clamp(param.min, param.max);
+                let clamped = if param.min >= 0.0 && param.max <= 1.0 && value > 1.0 {
+                    // Plugin parameter expects 0.0..1.0 normalized value, but caller passed an unnormalized plain value
+                    let n = name.to_lowercase();
+                    if n.contains("cutoff") {
+                        // 20..20000 Hz with skew -2.0 (log-like)
+                        let hz = value.clamp(20.0, 20000.0);
+                        ((hz / 20.0).ln() / (20000.0 / 20.0f32).ln()).clamp(0.0, 1.0)
+                    } else if n.contains("glide") {
+                        (value / 1000.0).clamp(0.0, 1.0)
+                    } else if n.contains("attack") || n.contains("decay") || n.contains("release") {
+                        (value / 5000.0).clamp(0.0, 1.0)
+                    } else {
+                        value.clamp(param.min, param.max)
+                    }
+                } else {
+                    value.clamp(param.min, param.max)
+                };
+
                 param.value = clamped;
                 let id = param.id;
                 self.pending_params.lock().unwrap().push((id, clamped as f64));
