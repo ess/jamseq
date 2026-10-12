@@ -13,8 +13,38 @@ pub enum TrackInstrument {
 }
 
 pub enum InsertEffect {
-    Clap(Box<ClapTrack>),
-    Lv2(Box<Lv2Track>),
+    Clap { name: String, uri: String, track: Box<ClapTrack> },
+    Lv2 { name: String, uri: String, track: Box<Lv2Track> },
+}
+
+impl InsertEffect {
+    pub fn name(&self) -> &str {
+        match self {
+            InsertEffect::Clap { name, .. } => name,
+            InsertEffect::Lv2 { name, .. } => name,
+        }
+    }
+
+    pub fn uri(&self) -> &str {
+        match self {
+            InsertEffect::Clap { uri, .. } => uri,
+            InsertEffect::Lv2 { uri, .. } => uri,
+        }
+    }
+
+    pub fn get_parameters(&self) -> Vec<(String, f32, f32, f32)> {
+        match self {
+            InsertEffect::Clap { track, .. } => track.get_parameters(),
+            InsertEffect::Lv2 { track, .. } => track.get_parameters(),
+        }
+    }
+
+    pub fn set_parameter(&mut self, param_name: &str, value: f32) {
+        match self {
+            InsertEffect::Clap { track, .. } => track.set_parameter(param_name, value),
+            InsertEffect::Lv2 { track, .. } => track.set_parameter(param_name, value),
+        }
+    }
 }
 
 pub struct Track {
@@ -326,10 +356,10 @@ impl Track {
         // Pass track signal through insert effects chain in series
         for fx in &mut self.inserts {
             match fx {
-                InsertEffect::Clap(clap) => {
+                InsertEffect::Clap { track: clap, .. } => {
                     clap.process_effect_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
                 }
-                InsertEffect::Lv2(lv2) => {
+                InsertEffect::Lv2 { track: lv2, .. } => {
                     lv2.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
                 }
             }

@@ -290,6 +290,61 @@ impl JamSeqHost {
         }
     }
 
+    /// Add an insert effect plugin to a track's signal chain
+    pub fn add_track_insert(&mut self, track_id: &str, uri_or_path: &str, display_name: &str) -> bool {
+        if let Some(&idx) = self.track_map.get(track_id) {
+            let sr = self.sample_rate;
+            let track = &mut self.tracks[idx];
+
+            if uri_or_path.ends_with(".clap") || uri_or_path.ends_with(".so") {
+                match crate::clap_host::ClapTrack::load(uri_or_path, sr) {
+                    Ok(clap_inst) => {
+                        println!("[jamseq] ✓ Added CLAP insert effect '{}' to track '{}'", display_name, track_id);
+                        track.inserts.push(crate::track::InsertEffect::Clap {
+                            name: display_name.to_string(),
+                            uri: uri_or_path.to_string(),
+                            track: Box::new(clap_inst),
+                        });
+                        return true;
+                    }
+                    Err(e) => {
+                        eprintln!("[jamseq] Failed to load CLAP insert effect '{}': {}", uri_or_path, e);
+                        return false;
+                    }
+                }
+            } else if uri_or_path.starts_with("http://") || uri_or_path.starts_with("https://") || uri_or_path.starts_with("urn:") {
+                match crate::lv2_host::Lv2Track::load(uri_or_path, sr) {
+                    Ok(lv2_inst) => {
+                        println!("[jamseq] ✓ Added LV2 insert effect '{}' to track '{}'", display_name, track_id);
+                        track.inserts.push(crate::track::InsertEffect::Lv2 {
+                            name: display_name.to_string(),
+                            uri: uri_or_path.to_string(),
+                            track: Box::new(lv2_inst),
+                        });
+                        return true;
+                    }
+                    Err(e) => {
+                        eprintln!("[jamseq] Failed to load LV2 insert effect '{}': {}", uri_or_path, e);
+                        return false;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Remove an insert effect from a track by index in chain
+    pub fn remove_track_insert(&mut self, track_id: &str, insert_index: usize) -> bool {
+        if let Some(&idx) = self.track_map.get(track_id) {
+            let track = &mut self.tracks[idx];
+            if insert_index < track.inserts.len() {
+                track.inserts.remove(insert_index);
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn load_arrangement(&mut self, arrangement: TimelineArrangement) {
         self.timeline.load_arrangement(arrangement);
     }

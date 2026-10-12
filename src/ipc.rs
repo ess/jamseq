@@ -128,8 +128,26 @@ pub enum IpcCommand {
         param_name: String,
         value: f32,
     },
+    /// Add an insert effect plugin to a track's signal chain
+    AddTrackInsert {
+        track_id: String,
+        plugin_uri_or_path: String,
+        plugin_name: String,
+    },
+    /// Remove an insert effect plugin from a track by index
+    RemoveTrackInsert {
+        track_id: String,
+        insert_index: usize,
+    },
     /// Rescan system for newly installed LV2 and CLAP plugins
     RescanPlugins,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrackInsertStatus {
+    pub name: String,
+    pub uri: String,
+    pub params: Vec<TrackParamStatus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +168,7 @@ pub struct TrackStatus {
     pub solo: bool,
     pub peak_level: f32,
     pub params: Vec<TrackParamStatus>,
+    pub inserts: Vec<TrackInsertStatus>,
     pub current_plugin: Option<String>,
 }
 
@@ -427,6 +446,14 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             h.switch_track_instrument(&track_id, &plugin_uri_or_type, &plugin_name);
             build_status_response(&h)
         }
+        IpcCommand::AddTrackInsert { track_id, plugin_uri_or_path, plugin_name } => {
+            h.add_track_insert(&track_id, &plugin_uri_or_path, &plugin_name);
+            build_status_response(&h)
+        }
+        IpcCommand::RemoveTrackInsert { track_id, insert_index } => {
+            h.remove_track_insert(&track_id, insert_index);
+            build_status_response(&h)
+        }
         IpcCommand::DeleteTrack { track_id } => {
             h.delete_track(&track_id);
             build_status_response(&h)
@@ -463,6 +490,20 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 .map(|(name, value, min, max)| TrackParamStatus { name, value, min, max })
                 .collect();
 
+            let inserts = t
+                .inserts
+                .iter()
+                .map(|ins| TrackInsertStatus {
+                    name: ins.name().to_string(),
+                    uri: ins.uri().to_string(),
+                    params: ins
+                        .get_parameters()
+                        .into_iter()
+                        .map(|(name, value, min, max)| TrackParamStatus { name, value, min, max })
+                        .collect(),
+                })
+                .collect();
+
             TrackStatus {
                 id: t.id.clone(),
                 name: t.name.clone(),
@@ -472,6 +513,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 solo: t.solo,
                 peak_level: t.peak_level,
                 params,
+                inserts,
                 current_plugin: t.current_plugin.clone(),
             }
         })
