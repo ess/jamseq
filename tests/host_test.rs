@@ -459,3 +459,62 @@ fn test_robust_jamseq_features_suite() {
     let sig_7_8 = jamseq::TimeSignature { numerator: 7, denominator: 8 };
     assert_eq!(sig_7_8.ticks_per_bar(), (7 * jamseq::PPQ * 4) / 8);
 }
+
+#[test]
+fn test_master_inserts_and_aux_send_routing() {
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    host.add_custom_track("track_lead", "Lead Synth", "synth:reese");
+    host.add_custom_track("track_bass", "Sub Bass", "synth:sub808");
+
+    // 1. Create Aux Bus
+    host.add_aux_bus("aux_reverb", "Space Reverb");
+    assert_eq!(host.aux_buses.len(), 1);
+    assert_eq!(host.aux_map.get("aux_reverb"), Some(&0));
+
+    // 2. Set post-fader send from Lead Synth to Aux Reverb (gain 0.5)
+    assert!(host.set_track_aux_send("track_lead", "aux_reverb", 0.5, false));
+    let lead_idx = host.track_map["track_lead"];
+    assert_eq!(host.tracks[lead_idx].sends.len(), 1);
+    assert_eq!(host.tracks[lead_idx].sends[0].gain, 0.5);
+    assert!(!host.tracks[lead_idx].sends[0].is_pre_fader);
+
+    // 3. Play note on Lead Synth and process block
+    host.tracks[lead_idx].note_on(60, 1.0);
+    let mut out_l = vec![0.0f32; 256];
+    let mut out_r = vec![0.0f32; 256];
+    host.process_block(&mut out_l, &mut out_r);
+
+    // Verify audio arrived in both Master Output and Aux Bus buffer
+    let aux_peak: f32 = host.aux_left[0].iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
+    let master_peak: f32 = out_l.iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
+    assert!(aux_peak > 0.001, "Expected audio sent into aux_reverb buffer, got {}", aux_peak);
+    assert!(master_peak > 0.001, "Expected audio in Master output, got {}", master_peak);
+
+    // 4. Test pre-fader send: Mute track or set volume to 0.0
+    // Pre-fader send should STILL feed audio into the aux bus even when track volume is 0!
+    host.tracks[lead_idx].volume = 0.0;
+    host.set_track_aux_send("track_lead", "aux_reverb", 0.8, true); // pre-fader
+
+    let mut out_l2 = vec![0.0f32; 256];
+    let mut out_r2 = vec![0.0f32; 256];
+    host.process_block(&mut out_l2, &mut out_r2);
+
+    let aux_peak_pre: f32 = host.aux_left[0].iter().fold(0.0f32, |acc, &s| acc.max(s.abs()));
+    assert!(aux_peak_pre > 0.001, "Pre-fader send must route audio to aux bus when track volume is 0");
+
+    // 5. Test Master Bus controls
+    host.master_bus.pan = 1.0; // Hard right
+    let mut out_l3 = vec![0.0f32; 256];
+    let mut out_r3 = vec![0.0f32; 256];
+    host.process_block(&mut out_l3, &mut out_r3);
+    let peak_l: f32 = out_l3.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    let peak_r: f32 = out_r3.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(peak_l < 0.0001, "Hard right master pan should silence left channel");
+    assert!(peak_r > 0.001, "Hard right master pan should output to right channel");
+
+    // 6. Test removing Aux Bus
+    host.remove_aux_bus("aux_reverb");
+    assert_eq!(host.aux_buses.len(), 0);
+    assert!(host.aux_map.get("aux_reverb").is_none());
+    assert_eq!(host.tracks[lead_idx].sends.len(), 0, "Removing aux bus must purge track send entries");
+}

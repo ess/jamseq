@@ -1,7 +1,7 @@
 use crate::audio_clip::{AudioClip, AudioClipTrack};
 use crate::recorder::{AudioRecorder, RecordedClipInfo};
 use crate::timeline::{ScheduledAction, ScheduledEvent, Timeline, TimelineArrangement};
-use crate::track::{Track, TrackInstrument};
+use crate::track::{AuxBus, MasterBus, Track, TrackInstrument};
 use anyhow::{Context, Result};
 use hound::{WavSpec, WavWriter};
 use std::collections::HashMap;
@@ -11,6 +11,9 @@ pub struct JamSeqHost {
     pub timeline: Timeline,
     pub tracks: Vec<Track>,
     pub track_map: HashMap<String, usize>,
+    pub master_bus: MasterBus,
+    pub aux_buses: Vec<AuxBus>,
+    pub aux_map: HashMap<String, usize>,
     pub sample_rate: f32,
     pub master_gain: f32,
     pub master_peak: f32,
@@ -18,6 +21,8 @@ pub struct JamSeqHost {
     pub project_path: Option<String>,
     pub available_plugins: Vec<crate::plugin_scanner::DiscoveredPlugin>,
 
+    pub aux_left: Vec<Vec<f32>>,
+    pub aux_right: Vec<Vec<f32>>,
     scratch_left: Vec<f32>,
     scratch_right: Vec<f32>,
 }
@@ -30,12 +35,17 @@ impl JamSeqHost {
             timeline: Timeline::new(bpm, sr as f64),
             tracks: Vec::new(),
             track_map: HashMap::new(),
+            master_bus: MasterBus::default(),
+            aux_buses: Vec::new(),
+            aux_map: HashMap::new(),
             sample_rate: sr,
             master_gain: 0.9,
             master_peak: 0.0,
             recorder: AudioRecorder::new(),
             project_path: None,
             available_plugins,
+            aux_left: Vec::new(),
+            aux_right: Vec::new(),
             scratch_left: vec![0.0; 2048],
             scratch_right: vec![0.0; 2048],
         }
@@ -345,6 +355,155 @@ impl JamSeqHost {
         false
     }
 
+    /// Add an insert effect to the Master Bus
+    pub fn add_master_insert(&mut self, uri_or_path: &str, display_name: &str) -> bool {
+        let sr = self.sample_rate;
+        if uri_or_path.ends_with(".clap") || uri_or_path.ends_with(".so") {
+            match crate::clap_host::ClapTrack::load(uri_or_path, sr) {
+                Ok(clap_inst) => {
+                    println!("[jamseq] ✓ Added CLAP Master insert '{}'", display_name);
+                    self.master_bus.inserts.push(crate::track::InsertEffect::Clap {
+                        name: display_name.to_string(),
+                        uri: uri_or_path.to_string(),
+                        track: Box::new(clap_inst),
+                    });
+                    return true;
+                }
+                Err(e) => {
+                    eprintln!("[jamseq] Failed to load CLAP master insert '{}': {}", uri_or_path, e);
+                    return false;
+                }
+            }
+        } else if uri_or_path.starts_with("http://") || uri_or_path.starts_with("https://") || uri_or_path.starts_with("urn:") {
+            match crate::lv2_host::Lv2Track::load(uri_or_path, sr) {
+                Ok(lv2_inst) => {
+                    println!("[jamseq] ✓ Added LV2 Master insert '{}'", display_name);
+                    self.master_bus.inserts.push(crate::track::InsertEffect::Lv2 {
+                        name: display_name.to_string(),
+                        uri: uri_or_path.to_string(),
+                        track: Box::new(lv2_inst),
+                    });
+                    return true;
+                }
+                Err(e) => {
+                    eprintln!("[jamseq] Failed to load LV2 master insert '{}': {}", uri_or_path, e);
+                    return false;
+                }
+            }
+        }
+        false
+    }
+
+    /// Remove an insert effect from the Master Bus
+    pub fn remove_master_insert(&mut self, insert_index: usize) -> bool {
+        if insert_index < self.master_bus.inserts.len() {
+            self.master_bus.inserts.remove(insert_index);
+            return true;
+        }
+        false
+    }
+
+    /// Add an Aux Bus
+    pub fn add_aux_bus(&mut self, id: &str, name: &str) {
+        if !self.aux_map.contains_key(id) {
+            let idx = self.aux_buses.len();
+            self.aux_buses.push(crate::track::AuxBus::new(id, name));
+            self.aux_map.insert(id.to_string(), idx);
+            self.aux_left.push(vec![0.0; 2048]);
+            self.aux_right.push(vec![0.0; 2048]);
+            println!("[jamseq] ✓ Created Aux Bus '{}' ({})", name, id);
+        }
+    }
+
+    /// Remove an Aux Bus
+    pub fn remove_aux_bus(&mut self, id: &str) {
+        if let Some(idx) = self.aux_map.remove(id) {
+            self.aux_buses.remove(idx);
+            self.aux_left.remove(idx);
+            self.aux_right.remove(idx);
+            self.aux_map.clear();
+            for (i, b) in self.aux_buses.iter().enumerate() {
+                self.aux_map.insert(b.id.clone(), i);
+            }
+            for t in &mut self.tracks {
+                t.remove_aux_send(id);
+            }
+            println!("[jamseq] Removed Aux Bus '{}'", id);
+        }
+    }
+
+    /// Add an insert effect to an Aux Bus
+    pub fn add_aux_insert(&mut self, bus_id: &str, uri_or_path: &str, display_name: &str) -> bool {
+        if let Some(&idx) = self.aux_map.get(bus_id) {
+            let sr = self.sample_rate;
+            let bus = &mut self.aux_buses[idx];
+            if uri_or_path.ends_with(".clap") || uri_or_path.ends_with(".so") {
+                match crate::clap_host::ClapTrack::load(uri_or_path, sr) {
+                    Ok(clap_inst) => {
+                        println!("[jamseq] ✓ Added CLAP insert '{}' to Aux Bus '{}'", display_name, bus_id);
+                        bus.inserts.push(crate::track::InsertEffect::Clap {
+                            name: display_name.to_string(),
+                            uri: uri_or_path.to_string(),
+                            track: Box::new(clap_inst),
+                        });
+                        return true;
+                    }
+                    Err(e) => {
+                        eprintln!("[jamseq] Failed to load CLAP aux insert '{}': {}", uri_or_path, e);
+                        return false;
+                    }
+                }
+            } else if uri_or_path.starts_with("http://") || uri_or_path.starts_with("https://") || uri_or_path.starts_with("urn:") {
+                match crate::lv2_host::Lv2Track::load(uri_or_path, sr) {
+                    Ok(lv2_inst) => {
+                        println!("[jamseq] ✓ Added LV2 insert '{}' to Aux Bus '{}'", display_name, bus_id);
+                        bus.inserts.push(crate::track::InsertEffect::Lv2 {
+                            name: display_name.to_string(),
+                            uri: uri_or_path.to_string(),
+                            track: Box::new(lv2_inst),
+                        });
+                        return true;
+                    }
+                    Err(e) => {
+                        eprintln!("[jamseq] Failed to load LV2 aux insert '{}': {}", uri_or_path, e);
+                        return false;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Remove an insert effect from an Aux Bus
+    pub fn remove_aux_insert(&mut self, bus_id: &str, insert_index: usize) -> bool {
+        if let Some(&idx) = self.aux_map.get(bus_id) {
+            let bus = &mut self.aux_buses[idx];
+            if insert_index < bus.inserts.len() {
+                bus.inserts.remove(insert_index);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Configure a track's aux send level
+    pub fn set_track_aux_send(&mut self, track_id: &str, bus_id: &str, gain: f32, is_pre_fader: bool) -> bool {
+        if let Some(&idx) = self.track_map.get(track_id) {
+            self.tracks[idx].set_aux_send(bus_id, gain, is_pre_fader);
+            return true;
+        }
+        false
+    }
+
+    /// Remove a track's aux send
+    pub fn remove_track_aux_send(&mut self, track_id: &str, bus_id: &str) -> bool {
+        if let Some(&idx) = self.track_map.get(track_id) {
+            self.tracks[idx].remove_aux_send(bus_id);
+            return true;
+        }
+        false
+    }
+
     pub fn load_arrangement(&mut self, arrangement: TimelineArrangement) {
         self.timeline.load_arrangement(arrangement);
     }
@@ -417,10 +576,23 @@ impl JamSeqHost {
         }
 
         let current_sample = self.timeline.current_sample;
-
         let any_solo = self.tracks.iter().any(|t| t.solo);
 
-        // 3. Render all tracks into master bus
+        // 3. Prepare aux buffers
+        for l in &mut self.aux_left {
+            if l.len() < num_samples {
+                l.resize(num_samples, 0.0);
+            }
+            l[..num_samples].fill(0.0);
+        }
+        for r in &mut self.aux_right {
+            if r.len() < num_samples {
+                r.resize(num_samples, 0.0);
+            }
+            r[..num_samples].fill(0.0);
+        }
+
+        // Render all tracks into master bus and tap aux sends
         for track in &mut self.tracks {
             if any_solo && !track.solo {
                 continue;
@@ -432,13 +604,98 @@ impl JamSeqHost {
                 &mut self.scratch_left[..num_samples],
                 &mut self.scratch_right[..num_samples],
             );
+
+            // Tap aux sends
+            if !track.muted && !track.sends.is_empty() {
+                let left_gain = track.volume * (1.0 - track.pan).clamp(0.0, 1.0);
+                let right_gain = track.volume * (1.0 + track.pan).clamp(0.0, 1.0);
+                for send in &track.sends {
+                    if !send.is_muted && send.gain > 0.0 {
+                        if let Some(&bus_idx) = self.aux_map.get(&send.target_bus_id) {
+                            let bus_l = &mut self.aux_left[bus_idx][..num_samples];
+                            let bus_r = &mut self.aux_right[bus_idx][..num_samples];
+                            if send.is_pre_fader {
+                                for i in 0..num_samples {
+                                    bus_l[i] += self.scratch_left[i] * send.gain;
+                                    bus_r[i] += self.scratch_right[i] * send.gain;
+                                }
+                            } else {
+                                for i in 0..num_samples {
+                                    bus_l[i] += self.scratch_left[i] * left_gain * send.gain;
+                                    bus_r[i] += self.scratch_right[i] * right_gain * send.gain;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        // 4. Master volume and soft limiter to prevent digital clipping
+        // Process Aux Return Buses through their inserts and sum into Master
+        for (idx, bus) in self.aux_buses.iter_mut().enumerate() {
+            if bus.muted {
+                continue;
+            }
+            let bus_l = &mut self.aux_left[idx][..num_samples];
+            let bus_r = &mut self.aux_right[idx][..num_samples];
+
+            // Pass through Aux Bus inserts in series
+            for fx in &mut bus.inserts {
+                match fx {
+                    crate::track::InsertEffect::Clap { track: clap, .. } => {
+                        clap.process_effect_block(bus_l, bus_r);
+                    }
+                    crate::track::InsertEffect::Lv2 { track: lv2, .. } => {
+                        lv2.process_block(bus_l, bus_r);
+                    }
+                }
+            }
+
+            let left_gain = bus.volume * (1.0 - bus.pan).clamp(0.0, 1.0);
+            let right_gain = bus.volume * (1.0 + bus.pan).clamp(0.0, 1.0);
+
+            let mut bus_peak = 0.0f32;
+            for i in 0..num_samples {
+                let l = bus_l[i] * left_gain;
+                let r = bus_r[i] * right_gain;
+                master_left[i] += l;
+                master_right[i] += r;
+
+                let s = l.abs().max(r.abs());
+                if s > bus_peak {
+                    bus_peak = s;
+                }
+            }
+
+            if bus_peak >= bus.peak_level {
+                bus.peak_level = bus_peak;
+            } else {
+                bus.peak_level = (bus.peak_level * 0.85).max(0.0);
+            }
+        }
+
+        // 4. Process Master Bus inserts in series
+        if !self.master_bus.muted {
+            for fx in &mut self.master_bus.inserts {
+                match fx {
+                    crate::track::InsertEffect::Clap { track: clap, .. } => {
+                        clap.process_effect_block(&mut master_left[..num_samples], &mut master_right[..num_samples]);
+                    }
+                    crate::track::InsertEffect::Lv2 { track: lv2, .. } => {
+                        lv2.process_block(&mut master_left[..num_samples], &mut master_right[..num_samples]);
+                    }
+                }
+            }
+        }
+
+        // 5. Master volume, pan, and soft limiter to prevent digital clipping
+        let master_l_gain = self.master_gain * self.master_bus.volume * (1.0 - self.master_bus.pan).clamp(0.0, 1.0);
+        let master_r_gain = self.master_gain * self.master_bus.volume * (1.0 + self.master_bus.pan).clamp(0.0, 1.0);
+
         let mut block_peak = 0.0f32;
         for i in 0..num_samples {
-            let l = (master_left[i] * self.master_gain).tanh();
-            let r = (master_right[i] * self.master_gain).tanh();
+            let l = if self.master_bus.muted { 0.0 } else { (master_left[i] * master_l_gain).tanh() };
+            let r = if self.master_bus.muted { 0.0 } else { (master_right[i] * master_r_gain).tanh() };
             master_left[i] = l;
             master_right[i] = r;
 
@@ -453,6 +710,7 @@ impl JamSeqHost {
         } else {
             self.master_peak = (self.master_peak * 0.85).max(0.0);
         }
+        self.master_bus.peak_level = self.master_peak;
     }
 
     /// Offline render the entire song timeline directly to a WAV file.

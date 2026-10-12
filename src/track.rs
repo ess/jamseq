@@ -47,11 +47,66 @@ impl InsertEffect {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AuxSend {
+    pub target_bus_id: String,
+    pub gain: f32,          // Send gain (0.0 to 1.0+)
+    pub is_pre_fader: bool, // false = post-fader (default)
+    pub is_muted: bool,
+}
+
+pub struct AuxBus {
+    pub id: String,
+    pub name: String,
+    pub volume: f32,
+    pub pan: f32,
+    pub muted: bool,
+    pub solo: bool,
+    pub inserts: Vec<InsertEffect>,
+    pub peak_level: f32,
+}
+
+impl AuxBus {
+    pub fn new(id: &str, name: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            volume: 1.0,
+            pan: 0.0,
+            muted: false,
+            solo: false,
+            inserts: Vec::new(),
+            peak_level: 0.0,
+        }
+    }
+}
+
+pub struct MasterBus {
+    pub volume: f32,
+    pub pan: f32,
+    pub muted: bool,
+    pub inserts: Vec<InsertEffect>,
+    pub peak_level: f32,
+}
+
+impl Default for MasterBus {
+    fn default() -> Self {
+        Self {
+            volume: 0.9,
+            pan: 0.0,
+            muted: false,
+            inserts: Vec::new(),
+            peak_level: 0.0,
+        }
+    }
+}
+
 pub struct Track {
     pub id: String,
     pub name: String,
     pub instrument: TrackInstrument,
     pub inserts: Vec<InsertEffect>,
+    pub sends: Vec<AuxSend>,
     pub muted: bool,
     pub solo: bool,
     pub volume: f32, // Gain multiplier (0.0 to 2.0)
@@ -67,6 +122,7 @@ impl Track {
             name: name.to_string(),
             instrument: TrackInstrument::Synth(engine),
             inserts: Vec::new(),
+            sends: Vec::new(),
             muted: false,
             solo: false,
             volume: 1.0,
@@ -82,6 +138,7 @@ impl Track {
             name: name.to_string(),
             instrument: TrackInstrument::Clap(Box::new(clap)),
             inserts: Vec::new(),
+            sends: Vec::new(),
             muted: false,
             solo: false,
             volume: 1.0,
@@ -97,6 +154,7 @@ impl Track {
             name: name.to_string(),
             instrument: TrackInstrument::Lv2(Box::new(lv2)),
             inserts: Vec::new(),
+            sends: Vec::new(),
             muted: false,
             solo: false,
             volume: 1.0,
@@ -112,6 +170,7 @@ impl Track {
             name: name.to_string(),
             instrument: TrackInstrument::Sampler(sampler),
             inserts: Vec::new(),
+            sends: Vec::new(),
             muted: false,
             solo: false,
             volume: 1.0,
@@ -127,6 +186,7 @@ impl Track {
             name: name.to_string(),
             instrument: TrackInstrument::AudioClips(clips),
             inserts: Vec::new(),
+            sends: Vec::new(),
             muted: false,
             solo: false,
             volume: 1.0,
@@ -134,6 +194,24 @@ impl Track {
             current_plugin: None,
             peak_level: 0.0,
         }
+    }
+
+    pub fn set_aux_send(&mut self, bus_id: &str, gain: f32, is_pre_fader: bool) {
+        if let Some(send) = self.sends.iter_mut().find(|s| s.target_bus_id == bus_id) {
+            send.gain = gain;
+            send.is_pre_fader = is_pre_fader;
+        } else {
+            self.sends.push(AuxSend {
+                target_bus_id: bus_id.to_string(),
+                gain,
+                is_pre_fader,
+                is_muted: false,
+            });
+        }
+    }
+
+    pub fn remove_aux_send(&mut self, bus_id: &str) {
+        self.sends.retain(|s| s.target_bus_id != bus_id);
     }
 
     pub fn set_sample_rate(&mut self, rate: f32) {

@@ -139,6 +139,64 @@ pub enum IpcCommand {
         track_id: String,
         insert_index: usize,
     },
+    /// Add an insert effect plugin to the Master Bus
+    AddMasterInsert {
+        plugin_uri_or_path: String,
+        plugin_name: String,
+    },
+    /// Remove an insert effect plugin from the Master Bus
+    RemoveMasterInsert {
+        insert_index: usize,
+    },
+    /// Tweak a Master insert parameter
+    SetMasterInsertParam {
+        insert_index: usize,
+        param_name: String,
+        value: f32,
+    },
+    /// Set master pan
+    SetMasterPan {
+        pan: f32,
+    },
+    /// Create a new Aux Bus
+    AddAuxBus {
+        id: String,
+        name: String,
+    },
+    /// Remove an Aux Bus
+    RemoveAuxBus {
+        bus_id: String,
+    },
+    /// Add an insert effect plugin to an Aux Bus
+    AddAuxInsert {
+        bus_id: String,
+        plugin_uri_or_path: String,
+        plugin_name: String,
+    },
+    /// Remove an insert effect plugin from an Aux Bus
+    RemoveAuxInsert {
+        bus_id: String,
+        insert_index: usize,
+    },
+    /// Tweak an Aux insert parameter
+    SetAuxInsertParam {
+        bus_id: String,
+        insert_index: usize,
+        param_name: String,
+        value: f32,
+    },
+    /// Configure a track's aux send level and pre/post-fader switch
+    SetTrackAuxSend {
+        track_id: String,
+        bus_id: String,
+        gain: f32,
+        is_pre_fader: bool,
+    },
+    /// Remove a track's aux send
+    RemoveTrackAuxSend {
+        track_id: String,
+        bus_id: String,
+    },
     /// Rescan system for newly installed LV2 and CLAP plugins
     RescanPlugins,
 }
@@ -159,6 +217,26 @@ pub struct TrackParamStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuxSendStatus {
+    pub target_bus_id: String,
+    pub gain: f32,
+    pub is_pre_fader: bool,
+    pub is_muted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuxBusStatus {
+    pub id: String,
+    pub name: String,
+    pub volume: f32,
+    pub pan: f32,
+    pub muted: bool,
+    pub solo: bool,
+    pub peak_level: f32,
+    pub inserts: Vec<TrackInsertStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackStatus {
     pub id: String,
     pub name: String,
@@ -169,6 +247,7 @@ pub struct TrackStatus {
     pub peak_level: f32,
     pub params: Vec<TrackParamStatus>,
     pub inserts: Vec<TrackInsertStatus>,
+    pub sends: Vec<AuxSendStatus>,
     pub current_plugin: Option<String>,
 }
 
@@ -183,6 +262,8 @@ pub struct IpcStatusResponse {
     pub bpm: f64,
     pub master_volume: f32,
     pub master_peak: f32,
+    pub master_inserts: Vec<TrackInsertStatus>,
+    pub aux_buses: Vec<AuxBusStatus>,
     pub is_recording: bool,
     pub mic_peak: f32,
     pub active_section_id: Option<String>,
@@ -336,7 +417,9 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             build_status_response(&h)
         }
         IpcCommand::SetMasterVolume { volume } => {
-            h.master_gain = volume.clamp(0.0, 2.0);
+            let v = volume.clamp(0.0, 2.0);
+            h.master_gain = v;
+            h.master_bus.volume = v;
             build_status_response(&h)
         }
         IpcCommand::StartRecording { out_path } => {
@@ -454,6 +537,57 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             h.remove_track_insert(&track_id, insert_index);
             build_status_response(&h)
         }
+        IpcCommand::AddMasterInsert { plugin_uri_or_path, plugin_name } => {
+            h.add_master_insert(&plugin_uri_or_path, &plugin_name);
+            build_status_response(&h)
+        }
+        IpcCommand::RemoveMasterInsert { insert_index } => {
+            h.remove_master_insert(insert_index);
+            build_status_response(&h)
+        }
+        IpcCommand::SetMasterInsertParam { insert_index, param_name, value } => {
+            if insert_index < h.master_bus.inserts.len() {
+                h.master_bus.inserts[insert_index].set_parameter(&param_name, value);
+            }
+            build_status_response(&h)
+        }
+        IpcCommand::SetMasterPan { pan } => {
+            h.master_bus.pan = pan;
+            build_status_response(&h)
+        }
+        IpcCommand::AddAuxBus { id, name } => {
+            h.add_aux_bus(&id, &name);
+            build_status_response(&h)
+        }
+        IpcCommand::RemoveAuxBus { bus_id } => {
+            h.remove_aux_bus(&bus_id);
+            build_status_response(&h)
+        }
+        IpcCommand::AddAuxInsert { bus_id, plugin_uri_or_path, plugin_name } => {
+            h.add_aux_insert(&bus_id, &plugin_uri_or_path, &plugin_name);
+            build_status_response(&h)
+        }
+        IpcCommand::RemoveAuxInsert { bus_id, insert_index } => {
+            h.remove_aux_insert(&bus_id, insert_index);
+            build_status_response(&h)
+        }
+        IpcCommand::SetAuxInsertParam { bus_id, insert_index, param_name, value } => {
+            if let Some(&idx) = h.aux_map.get(&bus_id) {
+                let bus = &mut h.aux_buses[idx];
+                if insert_index < bus.inserts.len() {
+                    bus.inserts[insert_index].set_parameter(&param_name, value);
+                }
+            }
+            build_status_response(&h)
+        }
+        IpcCommand::SetTrackAuxSend { track_id, bus_id, gain, is_pre_fader } => {
+            h.set_track_aux_send(&track_id, &bus_id, gain, is_pre_fader);
+            build_status_response(&h)
+        }
+        IpcCommand::RemoveTrackAuxSend { track_id, bus_id } => {
+            h.remove_track_aux_send(&track_id, &bus_id);
+            build_status_response(&h)
+        }
         IpcCommand::DeleteTrack { track_id } => {
             h.delete_track(&track_id);
             build_status_response(&h)
@@ -504,6 +638,17 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 })
                 .collect();
 
+            let sends = t
+                .sends
+                .iter()
+                .map(|s| AuxSendStatus {
+                    target_bus_id: s.target_bus_id.clone(),
+                    gain: s.gain,
+                    is_pre_fader: s.is_pre_fader,
+                    is_muted: s.is_muted,
+                })
+                .collect();
+
             TrackStatus {
                 id: t.id.clone(),
                 name: t.name.clone(),
@@ -514,7 +659,53 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 peak_level: t.peak_level,
                 params,
                 inserts,
+                sends,
                 current_plugin: t.current_plugin.clone(),
+            }
+        })
+        .collect();
+
+    let master_inserts = h
+        .master_bus
+        .inserts
+        .iter()
+        .map(|ins| TrackInsertStatus {
+            name: ins.name().to_string(),
+            uri: ins.uri().to_string(),
+            params: ins
+                .get_parameters()
+                .into_iter()
+                .map(|(name, value, min, max)| TrackParamStatus { name, value, min, max })
+                .collect(),
+        })
+        .collect();
+
+    let aux_buses = h
+        .aux_buses
+        .iter()
+        .map(|bus| {
+            let inserts = bus
+                .inserts
+                .iter()
+                .map(|ins| TrackInsertStatus {
+                    name: ins.name().to_string(),
+                    uri: ins.uri().to_string(),
+                    params: ins
+                        .get_parameters()
+                        .into_iter()
+                        .map(|(name, value, min, max)| TrackParamStatus { name, value, min, max })
+                        .collect(),
+                })
+                .collect();
+            AuxBusStatus {
+                id: bus.id.clone(),
+                name: bus.name.clone(),
+                volume: bus.volume,
+                pan: bus.pan,
+                muted: bus.muted,
+                solo: bus.solo,
+                peak_level: bus.peak_level,
+                inserts,
             }
         })
         .collect();
@@ -531,6 +722,8 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
         bpm: h.timeline.bpm,
         master_volume: h.master_gain,
         master_peak: h.master_peak,
+        master_inserts,
+        aux_buses,
         is_recording: h.recorder.is_recording(),
         mic_peak: h.recorder.get_peak_input(),
         active_section_id: active_section,
