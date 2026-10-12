@@ -407,3 +407,55 @@ fn test_jamsynth_clap_track_lifecycle_and_presets() {
 
     let _ = std::fs::remove_file(temp_preset);
 }
+
+#[test]
+fn test_robust_jamseq_features_suite() {
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    host.add_custom_track("track_a", "Track A", "synth:sub808");
+    host.add_custom_track("track_b", "Track B", "synth:reese");
+    host.add_custom_track("track_c", "Track C", "audio");
+
+    assert_eq!(host.tracks.len(), 3);
+    assert_eq!(host.track_map.get("track_a"), Some(&0));
+    assert_eq!(host.track_map.get("track_b"), Some(&1));
+    assert_eq!(host.track_map.get("track_c"), Some(&2));
+
+    // Test Reordering tracks: move track_c (idx 2) to beginning (idx 0)
+    assert!(host.reorder_tracks(2, 0));
+    assert_eq!(host.tracks[0].id, "track_c");
+    assert_eq!(host.tracks[1].id, "track_a");
+    assert_eq!(host.tracks[2].id, "track_b");
+    assert_eq!(host.track_map.get("track_c"), Some(&0));
+    assert_eq!(host.track_map.get("track_a"), Some(&1));
+    assert_eq!(host.track_map.get("track_b"), Some(&2));
+
+    // Test Deleting a track
+    assert!(host.delete_track("track_a"));
+    assert_eq!(host.tracks.len(), 2);
+    assert!(host.track_map.get("track_a").is_none());
+    assert_eq!(host.track_map.get("track_c"), Some(&0));
+    assert_eq!(host.track_map.get("track_b"), Some(&1));
+
+    // Test AutomationPoint dispatching on timeline
+    host.timeline.add_event(jamseq::ScheduledEvent::new(
+        999,
+        0,
+        "track_b",
+        jamseq::ScheduledAction::SetParam {
+            param_name: "cutoff".to_string(),
+            value: 800.0,
+        },
+    ));
+
+    host.play();
+    let mut out_l = vec![0.0f32; 256];
+    let mut out_r = vec![0.0f32; 256];
+    host.process_block(&mut out_l, &mut out_r);
+
+    // Verify time signature calculation
+    let sig_3_4 = jamseq::TimeSignature { numerator: 3, denominator: 4 };
+    assert_eq!(sig_3_4.ticks_per_bar(), 3 * jamseq::PPQ);
+
+    let sig_7_8 = jamseq::TimeSignature { numerator: 7, denominator: 8 };
+    assert_eq!(sig_7_8.ticks_per_bar(), (7 * jamseq::PPQ * 4) / 8);
+}

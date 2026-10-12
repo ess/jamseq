@@ -198,6 +198,39 @@ impl JamSeqHost {
         }
     }
 
+    /// Delete a track and clean up track mapping and associated timeline events
+    pub fn delete_track(&mut self, track_id: &str) -> bool {
+        if let Some(&idx) = self.track_map.get(track_id) {
+            self.tracks.remove(idx);
+            // Rebuild track_map indices
+            self.track_map.clear();
+            for (i, t) in self.tracks.iter().enumerate() {
+                self.track_map.insert(t.id.clone(), i);
+            }
+            // Retain timeline events for remaining tracks
+            self.timeline.events.retain(|e| e.track_id != track_id);
+            self.timeline.seek_tick(self.timeline.current_tick);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Reorder a track from index `from` to `to`
+    pub fn reorder_tracks(&mut self, from: usize, to: usize) -> bool {
+        if from >= self.tracks.len() || to >= self.tracks.len() {
+            return false;
+        }
+        let track = self.tracks.remove(from);
+        self.tracks.insert(to, track);
+        // Rebuild track_map indices
+        self.track_map.clear();
+        for (i, t) in self.tracks.iter().enumerate() {
+            self.track_map.insert(t.id.clone(), i);
+        }
+        true
+    }
+
     /// Dynamically switch a track's instrument to an internal synth patch or plugin
     pub fn switch_track_instrument(&mut self, track_id: &str, uri_or_type: &str, display_name: &str) {
         if let Some(&idx) = self.track_map.get(track_id) {
@@ -299,6 +332,9 @@ impl JamSeqHost {
                     }
                     ScheduledAction::ControlChange { cc, value } => {
                         track.handle_cc(cc, value);
+                    }
+                    ScheduledAction::SetParam { param_name, value } => {
+                        track.set_parameter(&param_name, value);
                     }
                     ScheduledAction::LoadPatchJson { json } => {
                         match &mut track.instrument {

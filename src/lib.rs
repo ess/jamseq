@@ -10,12 +10,15 @@ pub mod sampler;
 pub mod timeline;
 pub mod track;
 
-pub use audio::AudioOutput;
+pub use audio::{AudioOutput, AudioSystem};
 pub use audio_clip::{AudioClip, AudioClipTrack};
 pub use engine::JamSeqHost;
 pub use ipc::{IpcCommand, IpcResponse, IpcServer, IpcStatusResponse, TrackStatus};
 pub use plugin_scanner::{DiscoveredPlugin, PluginScanner};
 pub use recorder::{AudioRecorder, RecordedClipInfo};
 pub use sampler::{SamplerConfig, SamplerInstrument};
-pub use timeline::{PPQ, TICKS_PER_16TH, ScheduledAction, ScheduledEvent, SongSection, Timeline, TimelineArrangement};
-pub use track::{Track, TrackInstrument};
+pub use timeline::{
+    AutomationPoint, ScheduledAction, ScheduledEvent, SongSection, TimeSignature, Timeline,
+    TimelineArrangement, PPQ, TICKS_PER_16TH,
+};
+pub use track::{InsertEffect, Track, TrackInstrument};

@@ -12,10 +12,16 @@ pub enum TrackInstrument {
     Lv2(Box<Lv2Track>),
 }
 
+pub enum InsertEffect {
+    Clap(Box<ClapTrack>),
+    Lv2(Box<Lv2Track>),
+}
+
 pub struct Track {
     pub id: String,
     pub name: String,
     pub instrument: TrackInstrument,
+    pub inserts: Vec<InsertEffect>,
     pub muted: bool,
     pub solo: bool,
     pub volume: f32, // Gain multiplier (0.0 to 2.0)
@@ -30,6 +36,7 @@ impl Track {
             id: id.to_string(),
             name: name.to_string(),
             instrument: TrackInstrument::Synth(engine),
+            inserts: Vec::new(),
             muted: false,
             solo: false,
             volume: 1.0,
@@ -44,6 +51,7 @@ impl Track {
             id: id.to_string(),
             name: name.to_string(),
             instrument: TrackInstrument::Clap(Box::new(clap)),
+            inserts: Vec::new(),
             muted: false,
             solo: false,
             volume: 1.0,
@@ -58,6 +66,7 @@ impl Track {
             id: id.to_string(),
             name: name.to_string(),
             instrument: TrackInstrument::Lv2(Box::new(lv2)),
+            inserts: Vec::new(),
             muted: false,
             solo: false,
             volume: 1.0,
@@ -72,6 +81,7 @@ impl Track {
             id: id.to_string(),
             name: name.to_string(),
             instrument: TrackInstrument::Sampler(sampler),
+            inserts: Vec::new(),
             muted: false,
             solo: false,
             volume: 1.0,
@@ -86,6 +96,7 @@ impl Track {
             id: id.to_string(),
             name: name.to_string(),
             instrument: TrackInstrument::AudioClips(clips),
+            inserts: Vec::new(),
             muted: false,
             solo: false,
             volume: 1.0,
@@ -309,6 +320,18 @@ impl Track {
             }
             TrackInstrument::Lv2(lv2) => {
                 lv2.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+            }
+        }
+
+        // Pass track signal through insert effects chain in series
+        for fx in &mut self.inserts {
+            match fx {
+                InsertEffect::Clap(clap) => {
+                    clap.process_effect_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                }
+                InsertEffect::Lv2(lv2) => {
+                    lv2.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                }
             }
         }
 

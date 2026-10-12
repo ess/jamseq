@@ -8,7 +8,37 @@ pub enum ScheduledAction {
     NoteOn { note: u8, velocity: f32 },
     NoteOff { note: u8 },
     ControlChange { cc: u8, value: u8 },
+    SetParam { param_name: String, value: f32 },
     LoadPatchJson { json: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AutomationPoint {
+    pub tick: u64,
+    pub param_name: String,
+    pub value: f32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct TimeSignature {
+    pub numerator: u32,
+    pub denominator: u32,
+}
+
+impl Default for TimeSignature {
+    fn default() -> Self {
+        Self {
+            numerator: 4,
+            denominator: 4,
+        }
+    }
+}
+
+impl TimeSignature {
+    pub fn ticks_per_bar(&self) -> u64 {
+        // numerator beats per bar, each beat is PPQ * 4 / denominator
+        (self.numerator as u64 * PPQ * 4) / self.denominator as u64
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +48,8 @@ pub struct SongSection {
     pub start_bar: u32,
     pub bars: u32,
     pub energy: u8,
+    #[serde(default)]
+    pub time_signature: TimeSignature,
 }
 
 impl SongSection {
@@ -28,15 +60,16 @@ impl SongSection {
             start_bar,
             bars,
             energy,
+            time_signature: TimeSignature::default(),
         }
     }
 
     pub fn start_tick(&self) -> u64 {
-        (self.start_bar as u64 - 1) * 4 * PPQ
+        (self.start_bar as u64 - 1) * self.time_signature.ticks_per_bar()
     }
 
     pub fn end_tick(&self) -> u64 {
-        (self.start_bar as u64 - 1 + self.bars as u64) * 4 * PPQ
+        (self.start_bar as u64 - 1 + self.bars as u64) * self.time_signature.ticks_per_bar()
     }
 }
 

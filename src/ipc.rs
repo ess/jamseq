@@ -111,6 +111,23 @@ pub enum IpcCommand {
         plugin_uri_or_type: String,
         plugin_name: String,
     },
+    /// Delete an existing track
+    DeleteTrack {
+        track_id: String,
+    },
+    /// Reorder a track from index to index
+    ReorderTrack {
+        from: usize,
+        to: usize,
+    },
+    /// Schedule an automation point on the timeline
+    AddAutomationPoint {
+        id: u64,
+        tick: u64,
+        track_id: String,
+        param_name: String,
+        value: f32,
+    },
     /// Rescan system for newly installed LV2 and CLAP plugins
     RescanPlugins,
 }
@@ -408,6 +425,23 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
         }
         IpcCommand::SwitchTrackPlugin { track_id, plugin_uri_or_type, plugin_name } => {
             h.switch_track_instrument(&track_id, &plugin_uri_or_type, &plugin_name);
+            build_status_response(&h)
+        }
+        IpcCommand::DeleteTrack { track_id } => {
+            h.delete_track(&track_id);
+            build_status_response(&h)
+        }
+        IpcCommand::ReorderTrack { from, to } => {
+            h.reorder_tracks(from, to);
+            build_status_response(&h)
+        }
+        IpcCommand::AddAutomationPoint { id, tick, track_id, param_name, value } => {
+            h.timeline.add_event(ScheduledEvent::new(
+                id,
+                tick,
+                &track_id,
+                crate::timeline::ScheduledAction::SetParam { param_name, value },
+            ));
             build_status_response(&h)
         }
         IpcCommand::RescanPlugins => {
