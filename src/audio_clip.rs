@@ -2,6 +2,7 @@ use crate::sampler::SampleBuffer;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+#[derive(Debug, Clone)]
 pub struct AudioClip {
     pub path: PathBuf,
     pub start_sample: u64,
@@ -15,6 +16,14 @@ impl AudioClip {
             path: path.to_path_buf(),
             start_sample,
             buffer,
+        }
+    }
+
+    pub fn from_buffer(path: PathBuf, start_sample: u64, buffer: SampleBuffer) -> Self {
+        Self {
+            path,
+            start_sample,
+            buffer: Some(buffer),
         }
     }
 

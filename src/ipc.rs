@@ -235,6 +235,10 @@ pub enum IpcCommand {
         track_id: String,
         new_track_name: String,
     },
+    /// Regenerate cached stems in memory for dirty tracks or a specific track
+    RegenerateStems {
+        track_id: Option<String>,
+    },
     /// Rescan system for newly installed LV2 and CLAP plugins
     RescanPlugins,
 }
@@ -290,6 +294,8 @@ pub struct TrackStatus {
     pub muted: bool,
     pub solo: bool,
     pub is_frozen: bool,
+    pub has_cached_stem: bool,
+    pub stem_dirty: bool,
     pub peak_level: f32,
     pub params: Vec<TrackParamStatus>,
     pub inserts: Vec<TrackInsertStatus>,
@@ -484,26 +490,36 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             build_status_response(&h)
         }
         IpcCommand::ReplaceSectionEvents { section_id, track_id, events } => {
+            h.mark_track_dirty(&track_id);
             h.timeline.replace_section_track_events(&section_id, &track_id, events);
             build_status_response(&h)
         }
         IpcCommand::AddNote { note_on_id, note_off_id, track_id, tick, duration_ticks, note, velocity } => {
+            h.mark_track_dirty(&track_id);
             h.timeline.add_note(note_on_id, note_off_id, &track_id, tick, duration_ticks, note, velocity);
             build_status_response(&h)
         }
         IpcCommand::DeleteNoteAt { track_id, tick, note } => {
+            h.mark_track_dirty(&track_id);
             h.timeline.delete_note_at(&track_id, tick, note);
             build_status_response(&h)
         }
         IpcCommand::MoveEvent { event_id, new_tick } => {
             h.timeline.move_event(event_id, new_tick);
+            for t in &mut h.tracks {
+                t.mark_stem_dirty();
+            }
             build_status_response(&h)
         }
         IpcCommand::RemoveEvent { event_id } => {
             h.timeline.remove_event(event_id);
+            for t in &mut h.tracks {
+                t.mark_stem_dirty();
+            }
             build_status_response(&h)
         }
         IpcCommand::HumanizeTrack { track_id, section_id, timing_drift_ticks, drag_bias_ticks, velocity_jitter } => {
+            h.mark_track_dirty(&track_id);
             h.timeline.humanize_track(&track_id, section_id.as_deref(), timing_drift_ticks, drag_bias_ticks, velocity_jitter);
             build_status_response(&h)
         }
@@ -540,6 +556,7 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             build_status_response(&h)
         }
         IpcCommand::SetTrackParam { track_id, param_name, value } => {
+            h.mark_track_dirty(&track_id);
             if let Some(&idx) = h.track_map.get(&track_id) {
                 h.tracks[idx].set_parameter(&param_name, value);
             }
@@ -558,6 +575,7 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             build_status_response(&h)
         }
         IpcCommand::LoadTrackPreset { track_id, preset_name } => {
+            h.mark_track_dirty(&track_id);
             let filename = if preset_name.ends_with(".json") {
                 preset_name.clone()
             } else {
@@ -575,14 +593,17 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             build_status_response(&h)
         }
         IpcCommand::SwitchTrackPlugin { track_id, plugin_uri_or_type, plugin_name } => {
+            h.mark_track_dirty(&track_id);
             h.switch_track_instrument(&track_id, &plugin_uri_or_type, &plugin_name);
             build_status_response(&h)
         }
         IpcCommand::AddTrackInsert { track_id, plugin_uri_or_path, plugin_name } => {
+            h.mark_track_dirty(&track_id);
             h.add_track_insert(&track_id, &plugin_uri_or_path, &plugin_name);
             build_status_response(&h)
         }
         IpcCommand::RemoveTrackInsert { track_id, insert_index } => {
+            h.mark_track_dirty(&track_id);
             h.remove_track_insert(&track_id, insert_index);
             build_status_response(&h)
         }
@@ -668,10 +689,12 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             build_status_response(&h)
         }
         IpcCommand::SetInsertSidechain { track_id, insert_index, source_track_id, gain } => {
+            h.mark_track_dirty(&track_id);
             h.set_insert_sidechain(&track_id, insert_index, &source_track_id, gain);
             build_status_response(&h)
         }
         IpcCommand::RemoveInsertSidechain { track_id, insert_index } => {
+            h.mark_track_dirty(&track_id);
             h.remove_insert_sidechain(&track_id, insert_index);
             build_status_response(&h)
         }
@@ -685,6 +708,25 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
         }
         IpcCommand::BounceTrack { track_id, new_track_name } => {
             let _ = h.bounce_track(&track_id, &new_track_name);
+            build_status_response(&h)
+        }
+        IpcCommand::RegenerateStems { track_id } => {
+            if let Some(id) = track_id {
+                let num_bars = ((h.timeline.total_ticks / (4 * crate::timeline::PPQ)) as u32).max(1);
+                if let Ok(buf) = h.render_track_to_buffer(&id, num_bars) {
+                    if let Some(&idx) = h.track_map.get(&id) {
+                        let clip = crate::audio_clip::AudioClip::from_buffer(
+                            std::path::PathBuf::from(format!("autostem_{}.wav", id)),
+                            0,
+                            buf,
+                        );
+                        h.tracks[idx].cached_stem = Some(clip);
+                        h.tracks[idx].stem_dirty = false;
+                    }
+                }
+            } else {
+                h.generate_stems_for_dirty_tracks();
+            }
             build_status_response(&h)
         }
         IpcCommand::RescanPlugins => {
@@ -749,6 +791,8 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 muted: t.muted,
                 solo: t.solo,
                 is_frozen: t.is_frozen,
+                has_cached_stem: t.cached_stem.is_some(),
+                stem_dirty: t.stem_dirty,
                 peak_level: t.peak_level,
                 params,
                 inserts,

@@ -118,6 +118,8 @@ pub struct Track {
     pub muted: bool,
     pub solo: bool,
     pub is_frozen: bool,
+    pub cached_stem: Option<crate::audio_clip::AudioClip>,
+    pub stem_dirty: bool,
     pub volume: f32, // Gain multiplier (0.0 to 2.0)
     pub pan: f32,    // -1.0 (hard left) to 1.0 (hard right)
     pub current_plugin: Option<String>,
@@ -136,6 +138,8 @@ impl Track {
             muted: false,
             solo: false,
             is_frozen: false,
+            cached_stem: None,
+            stem_dirty: true,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some("JamSynth (Built-in)".to_string()),
@@ -154,6 +158,8 @@ impl Track {
             muted: false,
             solo: false,
             is_frozen: false,
+            cached_stem: None,
+            stem_dirty: true,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some(plugin_name.to_string()),
@@ -172,6 +178,8 @@ impl Track {
             muted: false,
             solo: false,
             is_frozen: false,
+            cached_stem: None,
+            stem_dirty: true,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some(plugin_name.to_string()),
@@ -190,6 +198,8 @@ impl Track {
             muted: false,
             solo: false,
             is_frozen: false,
+            cached_stem: None,
+            stem_dirty: true,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some("Sampler".to_string()),
@@ -208,6 +218,8 @@ impl Track {
             muted: false,
             solo: false,
             is_frozen: false,
+            cached_stem: None,
+            stem_dirty: false,
             volume: 1.0,
             pan: 0.0,
             current_plugin: None,
@@ -247,6 +259,11 @@ impl Track {
 
     pub fn remove_sidechain(&mut self, target_track_id: &str, target_insert_index: usize) {
         self.sidechains.retain(|s| !(s.target_track_id == target_track_id && s.target_insert_index == target_insert_index));
+    }
+
+    pub fn mark_stem_dirty(&mut self) {
+        self.cached_stem = None;
+        self.stem_dirty = true;
     }
 
     pub fn set_sample_rate(&mut self, rate: f32) {
@@ -309,6 +326,7 @@ impl Track {
 
     /// Set a named DSP / engine parameter live
     pub fn set_parameter(&mut self, param_name: &str, value: f32) {
+        self.mark_stem_dirty();
         match &mut self.instrument {
             TrackInstrument::Synth(synth) => {
                 match param_name {
@@ -381,6 +399,7 @@ impl Track {
 
     /// Load a synth patch from a JSON preset file into this track
     pub fn load_patch_from_file(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
+        self.mark_stem_dirty();
         let content = std::fs::read_to_string(path)?;
         match &mut self.instrument {
             TrackInstrument::Clap(clap) => {
@@ -445,6 +464,7 @@ impl Track {
         scratch_left: &mut [f32],
         scratch_right: &mut [f32],
         sidechain_buffers: Option<&std::collections::HashMap<(String, usize), (Vec<f32>, Vec<f32>)>>,
+        bypass_cached_stem: bool,
     ) {
         if self.muted {
             return;
@@ -454,73 +474,101 @@ impl Track {
         scratch_left[..num_samples].fill(0.0);
         scratch_right[..num_samples].fill(0.0);
 
-        match &mut self.instrument {
-            TrackInstrument::Synth(synth) => {
-                synth.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
-            }
-            TrackInstrument::Sampler(sampler) => {
-                sampler.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
-            }
-            TrackInstrument::AudioClips(clips) => {
-                clips.process_block(
-                    current_timeline_sample,
-                    &mut scratch_left[..num_samples],
-                    &mut scratch_right[..num_samples],
-                );
-            }
-            TrackInstrument::Clap(clap) => {
-                clap.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
-            }
-            TrackInstrument::Lv2(lv2) => {
-                lv2.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+        // If a pre-rendered stem is available and not bypassed, stream directly from the cached stem!
+        let mut played_from_stem = false;
+        if !bypass_cached_stem && !self.is_frozen {
+            if let Some(ref stem) = self.cached_stem {
+                if let Some(ref buf) = stem.buffer {
+                    let clip_len = buf.samples_left.len() as u64;
+                    let clip_end = stem.start_sample + clip_len;
+                    let block_end = current_timeline_sample + num_samples as u64;
+
+                    if block_end > stem.start_sample && current_timeline_sample < clip_end {
+                        for i in 0..num_samples {
+                            let sample_pos = current_timeline_sample + i as u64;
+                            if sample_pos >= stem.start_sample && sample_pos < clip_end {
+                                let offset = (sample_pos - stem.start_sample) as usize;
+                                if offset < buf.samples_left.len() {
+                                    scratch_left[i] += buf.samples_left[offset];
+                                    scratch_right[i] += buf.samples_right[offset];
+                                }
+                            }
+                        }
+                    }
+                    played_from_stem = true;
+                }
             }
         }
 
-        // Pass track signal through insert effects chain in series
-        for (ins_idx, fx) in self.inserts.iter_mut().enumerate() {
-            match fx {
-                InsertEffect::Clap { track: clap, .. } => {
-                    clap.process_effect_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+        if !played_from_stem {
+            match &mut self.instrument {
+                TrackInstrument::Synth(synth) => {
+                    synth.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
                 }
-                InsertEffect::Lv2 { track: lv2, .. } => {
+                TrackInstrument::Sampler(sampler) => {
+                    sampler.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                }
+                TrackInstrument::AudioClips(clips) => {
+                    clips.process_block(
+                        current_timeline_sample,
+                        &mut scratch_left[..num_samples],
+                        &mut scratch_right[..num_samples],
+                    );
+                }
+                TrackInstrument::Clap(clap) => {
+                    clap.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                }
+                TrackInstrument::Lv2(lv2) => {
                     lv2.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
                 }
             }
 
-            // Apply dynamic sidechain ducking if this insert has an incoming sidechain feed
-            if let Some(sc_map) = sidechain_buffers {
-                if let Some((sc_l, sc_r)) = sc_map.get(&(self.id.clone(), ins_idx)) {
-                    let mut env = 0.0f32;
-                    for i in 0..num_samples {
-                        let sc_mag = sc_l[i].abs().max(sc_r[i].abs());
-                        if sc_mag > env {
-                            env = sc_mag;
-                        } else {
-                            env *= 0.999;
+            // Pass track signal through insert effects chain in series
+            for (ins_idx, fx) in self.inserts.iter_mut().enumerate() {
+                match fx {
+                    InsertEffect::Clap { track: clap, .. } => {
+                        clap.process_effect_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                    }
+                    InsertEffect::Lv2 { track: lv2, .. } => {
+                        lv2.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                    }
+                }
+
+                // Apply dynamic sidechain ducking if this insert has an incoming sidechain feed
+                if let Some(sc_map) = sidechain_buffers {
+                    if let Some((sc_l, sc_r)) = sc_map.get(&(self.id.clone(), ins_idx)) {
+                        let mut env = 0.0f32;
+                        for i in 0..num_samples {
+                            let sc_mag = sc_l[i].abs().max(sc_r[i].abs());
+                            if sc_mag > env {
+                                env = sc_mag;
+                            } else {
+                                env *= 0.999;
+                            }
+                            let duck = (1.0 - (env * 0.85)).clamp(0.05, 1.0);
+                            scratch_left[i] *= duck;
+                            scratch_right[i] *= duck;
                         }
-                        let duck = (1.0 - (env * 0.85)).clamp(0.05, 1.0);
-                        scratch_left[i] *= duck;
-                        scratch_right[i] *= duck;
                     }
                 }
             }
-        }
 
-        // Native track ducking on slot 0 if track has no external inserts
-        if self.inserts.is_empty() {
-            if let Some(sc_map) = sidechain_buffers {
-                if let Some((sc_l, sc_r)) = sc_map.get(&(self.id.clone(), 0)) {
-                    let mut env = 0.0f32;
-                    for i in 0..num_samples {
-                        let sc_mag = sc_l[i].abs().max(sc_r[i].abs());
-                        if sc_mag > env {
-                            env = sc_mag;
-                        } else {
-                            env *= 0.999;
+            // Native track ducking on slot 0 if track has no external inserts
+            if self.inserts.is_empty() {
+                if let Some(sc_map) = sidechain_buffers {
+                    if let Some((sc_l, sc_r)) = sc_map.get(&(self.id.clone(), 0)) {
+                        let mut env = 0.0f32;
+                        for i in 0..num_samples {
+                            let sc_mag = sc_l[i].abs().max(sc_r[i].abs());
+                            if sc_mag > env {
+                                env = sc_mag;
+                            } else {
+                                env *= 0.999;
+                            }
+                            let duck = (1.0 - (env * 0.85)).clamp(0.05, 1.0);
+                            scratch_left[i] *= duck;
+                            scratch_right[i] *= duck;
                         }
-                        let duck = (1.0 - (env * 0.85)).clamp(0.05, 1.0);
-                        scratch_left[i] *= duck;
-                        scratch_right[i] *= duck;
                     }
                 }
             }

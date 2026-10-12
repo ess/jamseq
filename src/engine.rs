@@ -600,6 +600,15 @@ impl JamSeqHost {
 
     pub fn load_arrangement(&mut self, arrangement: TimelineArrangement) {
         self.timeline.load_arrangement(arrangement);
+        for t in &mut self.tracks {
+            t.mark_stem_dirty();
+        }
+        self.generate_stems_for_dirty_tracks();
+    }
+
+    pub fn seek_tick(&mut self, tick: u64) {
+        self.timeline.seek_tick(tick);
+        self.generate_stems_for_dirty_tracks();
     }
 
     pub fn set_armed_track(&mut self, track_id: Option<String>) {
@@ -628,6 +637,7 @@ impl JamSeqHost {
         for t in &mut self.tracks {
             t.all_notes_off();
         }
+        self.generate_stems_for_dirty_tracks();
     }
 
     /// Render a block of stereo audio into master_left and master_right.
@@ -729,6 +739,7 @@ impl JamSeqHost {
             if any_solo && !track.solo {
                 continue;
             }
+            let is_armed = self.armed_track_id.as_deref() == Some(&track.id);
             track.process_block(
                 current_sample,
                 &mut master_left[..num_samples],
@@ -736,6 +747,7 @@ impl JamSeqHost {
                 &mut self.scratch_left[..num_samples],
                 &mut self.scratch_right[..num_samples],
                 Some(&self.sidechain_buffers),
+                is_armed,
             );
 
             // Tap sidechains: record pre-fader/post-synth audio into sidechain buffers
@@ -925,6 +937,9 @@ impl JamSeqHost {
         let total_ticks = num_bars as u64 * 4 * crate::timeline::PPQ;
         let total_samples = self.timeline.ticks_to_samples(total_ticks);
 
+        let target_idx = *self.track_map.get(track_id).ok_or_else(|| anyhow::anyhow!("Track not found: {}", track_id))?;
+        let orig_stem = self.tracks[target_idx].cached_stem.take();
+
         let orig_states: Vec<(bool, bool)> = self.tracks.iter().map(|t| (t.muted, t.solo)).collect();
         let orig_aux_mutes: Vec<bool> = self.aux_buses.iter().map(|b| b.muted).collect();
         let orig_pos = self.timeline.current_tick;
@@ -966,7 +981,8 @@ impl JamSeqHost {
         writer.finalize()?;
         self.timeline.pause();
 
-        // Restore track solo/mute and aux return states
+        // Restore target track stem and solo/mute states
+        self.tracks[target_idx].cached_stem = orig_stem;
         for (i, t) in self.tracks.iter_mut().enumerate() {
             if i < orig_states.len() {
                 t.muted = orig_states[i].0;
@@ -983,6 +999,138 @@ impl JamSeqHost {
         self.timeline.seek_tick(orig_pos);
 
         Ok(())
+    }
+
+    /// Offline render a single track directly to an in-memory SampleBuffer without disk I/O.
+    pub fn render_track_to_buffer(&mut self, track_id: &str, num_bars: u32) -> Result<crate::sampler::SampleBuffer> {
+        let target_idx = *self.track_map.get(track_id).ok_or_else(|| anyhow::anyhow!("Track not found: {}", track_id))?;
+        let orig_stem = self.tracks[target_idx].cached_stem.take();
+
+        let total_ticks = num_bars as u64 * 4 * crate::timeline::PPQ;
+        let total_samples = self.timeline.ticks_to_samples(total_ticks) as usize;
+
+        let orig_states: Vec<(bool, bool)> = self.tracks.iter().map(|t| (t.muted, t.solo)).collect();
+        let orig_aux_mutes: Vec<bool> = self.aux_buses.iter().map(|b| b.muted).collect();
+        let orig_pos = self.timeline.current_tick;
+        let orig_loop = self.timeline.loop_enabled;
+        let orig_master_inserts = std::mem::take(&mut self.master_bus.inserts);
+
+        // Solo target track and mute aux return buses to capture isolated track stem
+        for t in &mut self.tracks {
+            t.solo = t.id == track_id;
+            t.muted = false;
+        }
+        for b in &mut self.aux_buses {
+            b.muted = true;
+        }
+
+        self.timeline.seek_tick(0);
+        self.timeline.loop_enabled = false;
+        self.timeline.play();
+
+        let mut samples_left = Vec::with_capacity(total_samples);
+        let mut samples_right = Vec::with_capacity(total_samples);
+
+        let block_size = 512;
+        let mut left = vec![0.0f32; block_size];
+        let mut right = vec![0.0f32; block_size];
+        let mut rendered = 0;
+
+        while rendered < total_samples {
+            let current_block = (total_samples - rendered).min(block_size);
+            self.process_block(&mut left[..current_block], &mut right[..current_block]);
+
+            samples_left.extend_from_slice(&left[..current_block]);
+            samples_right.extend_from_slice(&right[..current_block]);
+
+            rendered += current_block;
+        }
+
+        self.timeline.pause();
+
+        // Restore target track stem and states
+        self.tracks[target_idx].cached_stem = orig_stem;
+        for (i, t) in self.tracks.iter_mut().enumerate() {
+            if i < orig_states.len() {
+                t.muted = orig_states[i].0;
+                t.solo = orig_states[i].1;
+            }
+        }
+        for (i, b) in self.aux_buses.iter_mut().enumerate() {
+            if i < orig_aux_mutes.len() {
+                b.muted = orig_aux_mutes[i];
+            }
+        }
+        self.master_bus.inserts = orig_master_inserts;
+        self.timeline.loop_enabled = orig_loop;
+        self.timeline.seek_tick(orig_pos);
+
+        Ok(crate::sampler::SampleBuffer {
+            channels: 2,
+            sample_rate: self.sample_rate as u32,
+            samples_left,
+            samples_right,
+        })
+    }
+
+    /// Mark a track and any dependent sidechained tracks dirty for stem regeneration
+    pub fn mark_track_dirty(&mut self, track_id: &str) {
+        if let Some(&idx) = self.track_map.get(track_id) {
+            self.tracks[idx].mark_stem_dirty();
+        }
+        let dep_tracks: Vec<String> = self.tracks.iter()
+            .flat_map(|t| {
+                if t.id == track_id {
+                    t.sidechains.iter().map(|s| s.target_track_id.clone()).collect()
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect();
+
+        for dep_id in dep_tracks {
+            if let Some(&idx) = self.track_map.get(&dep_id) {
+                self.tracks[idx].mark_stem_dirty();
+            }
+        }
+    }
+
+    /// Autogenerate stems in memory for all dirty tracks.
+    /// Returns the number of stems generated.
+    pub fn generate_stems_for_dirty_tracks(&mut self) -> usize {
+        let dirty_ids: Vec<String> = self.tracks.iter()
+            .filter(|t| !t.is_frozen && (t.stem_dirty || t.cached_stem.is_none()))
+            .map(|t| t.id.clone())
+            .collect();
+
+        if dirty_ids.is_empty() {
+            return 0;
+        }
+
+        let num_bars = ((self.timeline.total_ticks / (4 * crate::timeline::PPQ)) as u32).max(1);
+        let mut generated_count = 0;
+
+        for track_id in dirty_ids {
+            match self.render_track_to_buffer(&track_id, num_bars) {
+                Ok(buf) => {
+                    if let Some(&idx) = self.track_map.get(&track_id) {
+                        let clip = crate::audio_clip::AudioClip::from_buffer(
+                            std::path::PathBuf::from(format!("autostem_{}.wav", track_id)),
+                            0,
+                            buf,
+                        );
+                        self.tracks[idx].cached_stem = Some(clip);
+                        self.tracks[idx].stem_dirty = false;
+                        generated_count += 1;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[jamseq] Failed to generate autostem for track '{}': {}", track_id, e);
+                }
+            }
+        }
+
+        generated_count
     }
 
     /// Freeze a track by rendering it offline to audio and replacing instrument/inserts with a zero-CPU audio clip player

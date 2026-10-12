@@ -38,6 +38,7 @@ impl Default for SamplerConfig {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct SampleBuffer {
     pub channels: u16,
     pub sample_rate: u32,
