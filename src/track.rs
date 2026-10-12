@@ -2,6 +2,7 @@ use crate::audio_clip::AudioClipTrack;
 use crate::clap_host::ClapTrack;
 use crate::lv2_host::Lv2Track;
 use crate::sampler::SamplerInstrument;
+use crate::vst3_host::Vst3Track;
 use jamsynth::JamSynthEngine;
 
 pub enum TrackInstrument {
@@ -10,11 +11,13 @@ pub enum TrackInstrument {
     AudioClips(AudioClipTrack),
     Clap(Box<ClapTrack>),
     Lv2(Box<Lv2Track>),
+    Vst3(Box<Vst3Track>),
 }
 
 pub enum InsertEffect {
     Clap { name: String, uri: String, track: Box<ClapTrack> },
     Lv2 { name: String, uri: String, track: Box<Lv2Track> },
+    Vst3 { name: String, uri: String, track: Box<Vst3Track> },
 }
 
 impl InsertEffect {
@@ -22,6 +25,7 @@ impl InsertEffect {
         match self {
             InsertEffect::Clap { name, .. } => name,
             InsertEffect::Lv2 { name, .. } => name,
+            InsertEffect::Vst3 { name, .. } => name,
         }
     }
 
@@ -29,6 +33,7 @@ impl InsertEffect {
         match self {
             InsertEffect::Clap { uri, .. } => uri,
             InsertEffect::Lv2 { uri, .. } => uri,
+            InsertEffect::Vst3 { uri, .. } => uri,
         }
     }
 
@@ -36,6 +41,7 @@ impl InsertEffect {
         match self {
             InsertEffect::Clap { track, .. } => track.get_parameters(),
             InsertEffect::Lv2 { track, .. } => track.get_parameters(),
+            InsertEffect::Vst3 { track, .. } => track.get_parameters(),
         }
     }
 
@@ -43,6 +49,7 @@ impl InsertEffect {
         match self {
             InsertEffect::Clap { track, .. } => track.set_parameter(param_name, value),
             InsertEffect::Lv2 { track, .. } => track.set_parameter(param_name, value),
+            InsertEffect::Vst3 { track, .. } => track.set_parameter(param_name, value),
         }
     }
 }
@@ -227,6 +234,26 @@ impl Track {
         }
     }
 
+    pub fn new_vst3(id: &str, name: &str, vst3: Vst3Track, plugin_name: &str) -> Self {
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            instrument: TrackInstrument::Vst3(Box::new(vst3)),
+            inserts: Vec::new(),
+            sends: Vec::new(),
+            sidechains: Vec::new(),
+            muted: false,
+            solo: false,
+            is_frozen: false,
+            cached_stem: None,
+            stem_dirty: true,
+            volume: 1.0,
+            pan: 0.0,
+            current_plugin: Some(plugin_name.to_string()),
+            peak_level: 0.0,
+        }
+    }
+
     pub fn set_aux_send(&mut self, bus_id: &str, gain: f32, is_pre_fader: bool) {
         if let Some(send) = self.sends.iter_mut().find(|s| s.target_bus_id == bus_id) {
             send.gain = gain;
@@ -273,6 +300,7 @@ impl Track {
             TrackInstrument::AudioClips(_) => {}
             TrackInstrument::Clap(_) => {}
             TrackInstrument::Lv2(_) => {}
+            TrackInstrument::Vst3(vst3) => vst3.set_sample_rate(rate),
         }
     }
 
@@ -286,6 +314,7 @@ impl Track {
             TrackInstrument::AudioClips(_) => {}
             TrackInstrument::Clap(clap) => clap.note_on(note, velocity),
             TrackInstrument::Lv2(lv2) => lv2.note_on(note, velocity),
+            TrackInstrument::Vst3(vst3) => vst3.note_on(note, velocity),
         }
     }
 
@@ -299,6 +328,7 @@ impl Track {
             TrackInstrument::AudioClips(_) => {}
             TrackInstrument::Clap(clap) => clap.note_off(note),
             TrackInstrument::Lv2(lv2) => lv2.note_off(note),
+            TrackInstrument::Vst3(vst3) => vst3.note_off(note),
         }
     }
 
@@ -312,6 +342,7 @@ impl Track {
             TrackInstrument::AudioClips(_) => {}
             TrackInstrument::Clap(clap) => clap.all_notes_off(),
             TrackInstrument::Lv2(lv2) => lv2.all_notes_off(),
+            TrackInstrument::Vst3(vst3) => vst3.all_notes_off(),
         }
     }
 
@@ -319,8 +350,10 @@ impl Track {
         if self.is_frozen {
             return;
         }
-        if let TrackInstrument::Synth(synth) = &mut self.instrument {
-            synth.handle_cc(cc, value);
+        match &mut self.instrument {
+            TrackInstrument::Synth(synth) => synth.handle_cc(cc, value),
+            TrackInstrument::Vst3(vst3) => vst3.handle_cc(cc, value),
+            _ => {}
         }
     }
 
@@ -345,6 +378,7 @@ impl Track {
             TrackInstrument::AudioClips(_) => {}
             TrackInstrument::Clap(clap) => clap.set_parameter(param_name, value),
             TrackInstrument::Lv2(lv2) => lv2.set_parameter(param_name, value),
+            TrackInstrument::Vst3(vst3) => vst3.set_parameter(param_name, value),
         }
     }
 
@@ -367,6 +401,7 @@ impl Track {
             TrackInstrument::AudioClips(_) => Vec::new(),
             TrackInstrument::Clap(clap) => clap.get_parameters(),
             TrackInstrument::Lv2(lv2) => lv2.get_parameters(),
+            TrackInstrument::Vst3(vst3) => vst3.get_parameters(),
         }
     }
 
@@ -384,6 +419,12 @@ impl Track {
             }
             TrackInstrument::Lv2(lv2) => {
                 let params = lv2.get_parameters();
+                let json = serde_json::to_string_pretty(&params)?;
+                std::fs::write(path, json)?;
+                Ok(())
+            }
+            TrackInstrument::Vst3(vst3) => {
+                let params = vst3.get_parameters();
                 let json = serde_json::to_string_pretty(&params)?;
                 std::fs::write(path, json)?;
                 Ok(())
@@ -442,6 +483,21 @@ impl Track {
                 if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, f32>>(&content) {
                     for (name, val) in map {
                         lv2.set_parameter(&name, val);
+                    }
+                    return Ok(());
+                }
+                anyhow::bail!("Unrecognized preset format in {}", path.display());
+            }
+            TrackInstrument::Vst3(vst3) => {
+                if let Ok(params) = serde_json::from_str::<Vec<(String, f32, f32, f32)>>(&content) {
+                    for (name, val, _, _) in params {
+                        vst3.set_parameter(&name, val);
+                    }
+                    return Ok(());
+                }
+                if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, f32>>(&content) {
+                    for (name, val) in map {
+                        vst3.set_parameter(&name, val);
                     }
                     return Ok(());
                 }
@@ -522,6 +578,9 @@ impl Track {
                 TrackInstrument::Lv2(lv2) => {
                     lv2.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
                 }
+                TrackInstrument::Vst3(vst3) => {
+                    vst3.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                }
             }
 
             // Pass track signal through insert effects chain in series
@@ -532,6 +591,9 @@ impl Track {
                     }
                     InsertEffect::Lv2 { track: lv2, .. } => {
                         lv2.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                    }
+                    InsertEffect::Vst3 { track: vst3, .. } => {
+                        vst3.process_effect_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
                     }
                 }
 

@@ -77,7 +77,75 @@ impl PluginScanner {
             }
         }
 
-        // 3. Ensure bundled / detected JamSynth CLAP plugin is always available as a first-class plugin
+        // 3. Scan VST3 plugins in standard directories
+        let mut vst3_paths = vec![
+            PathBuf::from("/usr/lib/vst3"),
+            PathBuf::from("/usr/local/lib/vst3"),
+            dirs_fallback().join(".vst3"),
+            PathBuf::from("plugins"),
+        ];
+
+        if let Ok(vst3_env) = std::env::var("VST3_PATH") {
+            for p in std::env::split_paths(&vst3_env) {
+                vst3_paths.push(p);
+            }
+        }
+
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                vst3_paths.push(dir.join("plugins"));
+            }
+        }
+
+        for dir in &vst3_paths {
+            if dir.exists() {
+                if let Ok(entries) = fs::read_dir(dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        let check_path = |p: std::path::PathBuf, res: &mut Vec<DiscoveredPlugin>| {
+                            let is_vst3 = p.extension().and_then(|s| s.to_str()) == Some("vst3")
+                                || p.to_string_lossy().ends_with(".vst3");
+                            if is_vst3 {
+                                let file_stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("VST3 Plugin");
+                                let display_name = if file_stem.starts_with("lib") {
+                                    &file_stem[3..]
+                                } else {
+                                    file_stem
+                                };
+                                let uri_str = p.to_string_lossy().to_string();
+                                let lower = display_name.to_lowercase();
+                                let category = if lower.contains("effect") || lower.contains("fx") {
+                                    "AudioEffect".to_string()
+                                } else {
+                                    "Instrument".to_string()
+                                };
+                                if !res.iter().any(|r| r.uri_or_path == uri_str) {
+                                    res.push(DiscoveredPlugin {
+                                        name: display_name.to_string(),
+                                        uri_or_path: uri_str,
+                                        plugin_format: "VST3".to_string(),
+                                        category,
+                                    });
+                                }
+                            }
+                        };
+
+                        if path.is_dir() && path.extension().and_then(|s| s.to_str()) != Some("vst3") {
+                            // Scan one sub-level (e.g. /usr/lib/vst3/Vendor/Plugin.vst3)
+                            if let Ok(sub_entries) = fs::read_dir(&path) {
+                                for sub in sub_entries.flatten() {
+                                    check_path(sub.path(), &mut results);
+                                }
+                            }
+                        } else {
+                            check_path(path, &mut results);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Ensure bundled / detected JamSynth CLAP plugin is always available as a first-class plugin
         if let Some(jamsynth_path) = find_jamsynth_plugin() {
             let uri_str = jamsynth_path.to_string_lossy().to_string();
             if !results.iter().any(|r| r.name == "JamSynth" || r.name == "jamsynth" || r.uri_or_path == uri_str) {

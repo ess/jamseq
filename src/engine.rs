@@ -175,6 +175,16 @@ impl JamSeqHost {
             "audio" => {
                 Track::new_audio_clips(id, name, AudioClipTrack::new())
             }
+            _ if track_type.ends_with(".vst3") || track_type.starts_with("vst3:") => {
+                let path = track_type.strip_prefix("vst3:").unwrap_or(track_type);
+                match crate::vst3_host::Vst3Track::load(path, sr) {
+                    Ok(vst3_inst) => Track::new_vst3(id, name, vst3_inst, name),
+                    Err(e) => {
+                        eprintln!("[jamseq] Failed to load VST3 track '{}': {}", path, e);
+                        Track::new_synth(id, name, jamsynth::JamSynthEngine::new(sr))
+                    }
+                }
+            }
             _ => {
                 if let Some(jamsynth_path) = crate::plugin_scanner::find_jamsynth_plugin() {
                     match crate::clap_host::ClapTrack::load(&jamsynth_path.to_string_lossy(), sr) {
@@ -295,6 +305,17 @@ impl JamSeqHost {
                     engine.load_patch(jamsynth::JamSynthPatch::preset_808_sub());
                 }
                 track.instrument = TrackInstrument::Synth(engine);
+            } else if uri_or_type.ends_with(".vst3") || uri_or_type.starts_with("vst3:") {
+                let path = uri_or_type.strip_prefix("vst3:").unwrap_or(uri_or_type);
+                match crate::vst3_host::Vst3Track::load(path, sr) {
+                    Ok(vst3_inst) => {
+                        println!("[jamseq] ✓ Switched track '{}' to VST3 plugin: {}", track_id, display_name);
+                        track.instrument = TrackInstrument::Vst3(Box::new(vst3_inst));
+                    }
+                    Err(e) => {
+                        eprintln!("[jamseq] Failed to load VST3 plugin '{}': {}", uri_or_type, e);
+                    }
+                }
             } else if uri_or_type.ends_with(".clap") || uri_or_type.ends_with(".so") {
                 match crate::clap_host::ClapTrack::load(uri_or_type, sr) {
                     Ok(clap_inst) => {
@@ -327,7 +348,24 @@ impl JamSeqHost {
             let sr = self.sample_rate;
             let track = &mut self.tracks[idx];
 
-            if uri_or_path.ends_with(".clap") || uri_or_path.ends_with(".so") {
+            if uri_or_path.ends_with(".vst3") || uri_or_path.starts_with("vst3:") {
+                let path = uri_or_path.strip_prefix("vst3:").unwrap_or(uri_or_path);
+                match crate::vst3_host::Vst3Track::load(path, sr) {
+                    Ok(vst3_inst) => {
+                        println!("[jamseq] ✓ Added VST3 insert effect '{}' to track '{}'", display_name, track_id);
+                        track.inserts.push(crate::track::InsertEffect::Vst3 {
+                            name: display_name.to_string(),
+                            uri: uri_or_path.to_string(),
+                            track: Box::new(vst3_inst),
+                        });
+                        return true;
+                    }
+                    Err(e) => {
+                        eprintln!("[jamseq] Failed to load VST3 insert effect '{}': {}", uri_or_path, e);
+                        return false;
+                    }
+                }
+            } else if uri_or_path.ends_with(".clap") || uri_or_path.ends_with(".so") {
                 match crate::clap_host::ClapTrack::load(uri_or_path, sr) {
                     Ok(clap_inst) => {
                         println!("[jamseq] ✓ Added CLAP insert effect '{}' to track '{}'", display_name, track_id);
@@ -379,7 +417,24 @@ impl JamSeqHost {
     /// Add an insert effect to the Master Bus
     pub fn add_master_insert(&mut self, uri_or_path: &str, display_name: &str) -> bool {
         let sr = self.sample_rate;
-        if uri_or_path.ends_with(".clap") || uri_or_path.ends_with(".so") {
+        if uri_or_path.ends_with(".vst3") || uri_or_path.starts_with("vst3:") {
+            let path = uri_or_path.strip_prefix("vst3:").unwrap_or(uri_or_path);
+            match crate::vst3_host::Vst3Track::load(path, sr) {
+                Ok(vst3_inst) => {
+                    println!("[jamseq] ✓ Added VST3 Master insert '{}'", display_name);
+                    self.master_bus.inserts.push(crate::track::InsertEffect::Vst3 {
+                        name: display_name.to_string(),
+                        uri: uri_or_path.to_string(),
+                        track: Box::new(vst3_inst),
+                    });
+                    return true;
+                }
+                Err(e) => {
+                    eprintln!("[jamseq] Failed to load VST3 master insert '{}': {}", uri_or_path, e);
+                    return false;
+                }
+            }
+        } else if uri_or_path.ends_with(".clap") || uri_or_path.ends_with(".so") {
             match crate::clap_host::ClapTrack::load(uri_or_path, sr) {
                 Ok(clap_inst) => {
                     println!("[jamseq] ✓ Added CLAP Master insert '{}'", display_name);
@@ -458,7 +513,24 @@ impl JamSeqHost {
         if let Some(&idx) = self.aux_map.get(bus_id) {
             let sr = self.sample_rate;
             let bus = &mut self.aux_buses[idx];
-            if uri_or_path.ends_with(".clap") || uri_or_path.ends_with(".so") {
+            if uri_or_path.ends_with(".vst3") || uri_or_path.starts_with("vst3:") {
+                let path = uri_or_path.strip_prefix("vst3:").unwrap_or(uri_or_path);
+                match crate::vst3_host::Vst3Track::load(path, sr) {
+                    Ok(vst3_inst) => {
+                        println!("[jamseq] ✓ Added VST3 insert '{}' to Aux Bus '{}'", display_name, bus_id);
+                        bus.inserts.push(crate::track::InsertEffect::Vst3 {
+                            name: display_name.to_string(),
+                            uri: uri_or_path.to_string(),
+                            track: Box::new(vst3_inst),
+                        });
+                        return true;
+                    }
+                    Err(e) => {
+                        eprintln!("[jamseq] Failed to load VST3 aux insert '{}': {}", uri_or_path, e);
+                        return false;
+                    }
+                }
+            } else if uri_or_path.ends_with(".clap") || uri_or_path.ends_with(".so") {
                 match crate::clap_host::ClapTrack::load(uri_or_path, sr) {
                     Ok(clap_inst) => {
                         println!("[jamseq] ✓ Added CLAP insert '{}' to Aux Bus '{}'", display_name, bus_id);
@@ -815,6 +887,9 @@ impl JamSeqHost {
                     crate::track::InsertEffect::Lv2 { track: lv2, .. } => {
                         lv2.process_block(bus_l, bus_r);
                     }
+                    crate::track::InsertEffect::Vst3 { track: vst3, .. } => {
+                        vst3.process_effect_block(bus_l, bus_r);
+                    }
                 }
             }
 
@@ -850,6 +925,9 @@ impl JamSeqHost {
                     }
                     crate::track::InsertEffect::Lv2 { track: lv2, .. } => {
                         lv2.process_block(&mut master_left[..num_samples], &mut master_right[..num_samples]);
+                    }
+                    crate::track::InsertEffect::Vst3 { track: vst3, .. } => {
+                        vst3.process_effect_block(&mut master_left[..num_samples], &mut master_right[..num_samples]);
                     }
                 }
             }

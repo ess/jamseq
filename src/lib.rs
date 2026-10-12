@@ -10,6 +10,7 @@ pub mod recorder;
 pub mod sampler;
 pub mod timeline;
 pub mod track;
+pub mod vst3_host;
 
 pub use audio::{AudioOutput, AudioSystem};
 pub use audio_clip::{AudioClip, AudioClipTrack};
@@ -24,3 +25,4 @@ pub use timeline::{
     TimelineArrangement, PPQ, TICKS_PER_16TH,
 };
 pub use track::{InsertEffect, Track, TrackInstrument};
+pub use vst3_host::Vst3Track;

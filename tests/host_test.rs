@@ -903,4 +903,93 @@ fn test_server_playback_over_ipc() {
 
 
 
+#[test]
+fn test_vst3_scanner_discovery() {
+    let surge_path = "/usr/lib/vst3/Surge XT.vst3";
+    if !std::path::Path::new(surge_path).exists() {
+        println!("Skipping VST3 scanner test: {} not found", surge_path);
+        return;
+    }
+
+    let plugins = jamseq::plugin_scanner::PluginScanner::scan_all();
+    let found = plugins.iter().any(|p| p.plugin_format == "VST3" && p.name.contains("Surge XT"));
+    assert!(found, "PluginScanner failed to discover Surge XT VST3 plugin in /usr/lib/vst3");
+}
+
+#[test]
+fn test_vst3_track_in_engine_and_host() {
+    let surge_path = "/usr/lib/vst3/Surge XT.vst3";
+    if !std::path::Path::new(surge_path).exists() {
+        println!("Skipping VST3 engine test: {} not found", surge_path);
+        return;
+    }
+
+    let mut host = jamseq::JamSeqHost::new(120.0, 44100.0);
+    // Switch or add track
+    host.add_custom_track("vst_test", "Surge Track", surge_path);
+    assert_eq!(host.tracks.len(), 1);
+
+    let track_idx = *host.track_map.get("vst_test").expect("Track not found");
+    assert!(matches!(host.tracks[track_idx].instrument, jamseq::track::TrackInstrument::Vst3(_)));
+
+    // Send NoteOn
+    host.tracks[track_idx].note_on(60, 0.9);
+
+    let mut out_l = vec![0.0f32; 512];
+    let mut out_r = vec![0.0f32; 512];
+    host.process_block(&mut out_l, &mut out_r);
+
+    let peak: f32 = out_l.iter().chain(out_r.iter()).map(|s| s.abs()).fold(0.0, f32::max);
+    println!("VST3 Engine track output peak: {}", peak);
+    assert!(peak > 0.0001, "VST3 track did not produce audio in engine process_block");
+
+    // Test parameter retrieval and preset saving/loading
+    let params = host.tracks[track_idx].get_parameters();
+    assert!(!params.is_empty(), "VST3 track should report parameters");
+
+    let temp_preset = std::env::temp_dir().join("test_surge_preset.json");
+    host.tracks[track_idx].save_patch_to_file(&temp_preset).expect("Failed to save patch");
+    assert!(temp_preset.exists());
+
+    host.tracks[track_idx].load_patch_from_file(&temp_preset).expect("Failed to load patch");
+    let _ = std::fs::remove_file(temp_preset);
+}
+
+#[test]
+fn test_vst3_insert_effect_on_track() {
+    let surge_fx_path = "/usr/lib/vst3/Surge XT Effects.vst3";
+    if !std::path::Path::new(surge_fx_path).exists() {
+        println!("Skipping VST3 effect test: {} not found", surge_fx_path);
+        return;
+    }
+
+    let mut host = jamseq::JamSeqHost::new(120.0, 44100.0);
+    // Add a synth track first
+    let mut bass = jamsynth::JamSynthEngine::new(44100.0);
+    bass.load_patch(jamsynth::JamSynthPatch::preset_808_sub());
+    host.add_track(jamseq::track::Track::new_synth("track_0", "Sub Bass", bass));
+
+    // Add VST3 effect to track 0
+    let success = host.add_track_insert("track_0", surge_fx_path, "Surge FX Insert");
+    assert!(success, "Failed to add VST3 insert to track");
+
+    let track_0 = &host.tracks[0];
+    assert_eq!(track_0.inserts.len(), 1);
+
+    // Play note on track 0
+    host.tracks[0].note_on(60, 0.8);
+
+    let mut out_l = vec![0.0f32; 512];
+    let mut out_r = vec![0.0f32; 512];
+    host.process_block(&mut out_l, &mut out_r);
+
+    let peak: f32 = out_l.iter().chain(out_r.iter()).map(|s| s.abs()).fold(0.0, f32::max);
+    println!("Track with VST3 insert audio output peak: {}", peak);
+    assert!(peak > 0.0001, "Expected audio output from track through VST3 insert");
+}
+
+
+
+
+
 
