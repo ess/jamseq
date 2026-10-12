@@ -13,6 +13,7 @@ pub struct JamSeqHost {
     pub track_map: HashMap<String, usize>,
     pub sample_rate: f32,
     pub master_gain: f32,
+    pub master_peak: f32,
     pub recorder: AudioRecorder,
     pub project_path: Option<String>,
     pub available_plugins: Vec<crate::plugin_scanner::DiscoveredPlugin>,
@@ -31,6 +32,7 @@ impl JamSeqHost {
             track_map: HashMap::new(),
             sample_rate: sr,
             master_gain: 0.9,
+            master_peak: 0.0,
             recorder: AudioRecorder::new(),
             project_path: None,
             available_plugins,
@@ -220,13 +222,6 @@ impl JamSeqHost {
         }
     }
 
-    /// Open native X11 plugin GUI for a track
-    pub fn open_track_gui(&self, track_id: &str) {
-        if let Some(&idx) = self.track_map.get(track_id) {
-            self.tracks[idx].open_gui();
-        }
-    }
-
     pub fn load_arrangement(&mut self, arrangement: TimelineArrangement) {
         self.timeline.load_arrangement(arrangement);
     }
@@ -281,8 +276,13 @@ impl JamSeqHost {
 
         let current_sample = self.timeline.current_sample;
 
+        let any_solo = self.tracks.iter().any(|t| t.solo);
+
         // 3. Render all tracks into master bus
         for track in &mut self.tracks {
+            if any_solo && !track.solo {
+                continue;
+            }
             track.process_block(
                 current_sample,
                 &mut master_left[..num_samples],
@@ -293,11 +293,23 @@ impl JamSeqHost {
         }
 
         // 4. Master volume and soft limiter to prevent digital clipping
+        let mut block_peak = 0.0f32;
         for i in 0..num_samples {
-            let l = master_left[i] * self.master_gain;
-            let r = master_right[i] * self.master_gain;
-            master_left[i] = l.tanh();
-            master_right[i] = r.tanh();
+            let l = (master_left[i] * self.master_gain).tanh();
+            let r = (master_right[i] * self.master_gain).tanh();
+            master_left[i] = l;
+            master_right[i] = r;
+
+            let s_max = l.abs().max(r.abs());
+            if s_max > block_peak {
+                block_peak = s_max;
+            }
+        }
+
+        if block_peak >= self.master_peak {
+            self.master_peak = block_peak;
+        } else {
+            self.master_peak = (self.master_peak * 0.85).max(0.0);
         }
     }
 

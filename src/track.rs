@@ -21,6 +21,7 @@ pub struct Track {
     pub volume: f32, // Gain multiplier (0.0 to 2.0)
     pub pan: f32,    // -1.0 (hard left) to 1.0 (hard right)
     pub current_plugin: Option<String>,
+    pub peak_level: f32,
 }
 
 impl Track {
@@ -34,6 +35,7 @@ impl Track {
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some("JamSynth (Built-in)".to_string()),
+            peak_level: 0.0,
         }
     }
 
@@ -47,6 +49,7 @@ impl Track {
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some("Sampler".to_string()),
+            peak_level: 0.0,
         }
     }
 
@@ -60,6 +63,7 @@ impl Track {
             volume: 1.0,
             pan: 0.0,
             current_plugin: None,
+            peak_level: 0.0,
         }
     }
 
@@ -130,8 +134,8 @@ impl Track {
             }
             TrackInstrument::Sampler(_) => {}
             TrackInstrument::AudioClips(_) => {}
-            TrackInstrument::Clap(_) => {}
-            TrackInstrument::Lv2(_) => {}
+            TrackInstrument::Clap(clap) => clap.set_parameter(param_name, value),
+            TrackInstrument::Lv2(lv2) => lv2.set_parameter(param_name, value),
         }
     }
 
@@ -152,8 +156,8 @@ impl Track {
             }
             TrackInstrument::Sampler(_) => Vec::new(),
             TrackInstrument::AudioClips(_) => Vec::new(),
-            TrackInstrument::Clap(_) => Vec::new(),
-            TrackInstrument::Lv2(_) => Vec::new(),
+            TrackInstrument::Clap(clap) => clap.get_parameters(),
+            TrackInstrument::Lv2(lv2) => lv2.get_parameters(),
         }
     }
 
@@ -226,19 +230,24 @@ impl Track {
         let left_gain = self.volume * (1.0 - self.pan).clamp(0.0, 1.0);
         let right_gain = self.volume * (1.0 + self.pan).clamp(0.0, 1.0);
 
+        let mut block_peak = 0.0f32;
         for i in 0..num_samples {
-            master_left[i] += scratch_left[i] * left_gain;
-            master_right[i] += scratch_right[i] * right_gain;
-        }
-    }
+            let l = scratch_left[i] * left_gain;
+            let r = scratch_right[i] * right_gain;
+            master_left[i] += l;
+            master_right[i] += r;
 
-    pub fn open_gui(&self) {
-        match &self.instrument {
-            TrackInstrument::Clap(clap) => clap.open_gui(),
-            TrackInstrument::Lv2(lv2) => lv2.open_gui(),
-            _ => {
-                println!("[jamseq] Track '{}' does not have a pop-out GUI plugin", self.name);
+            let s_max = l.abs().max(r.abs());
+            if s_max > block_peak {
+                block_peak = s_max;
             }
+        }
+
+        // Instant attack, exponential decay (~0.85 per audio block)
+        if block_peak >= self.peak_level {
+            self.peak_level = block_peak;
+        } else {
+            self.peak_level = (self.peak_level * 0.85).max(0.0);
         }
     }
 }

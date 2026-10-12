@@ -21,6 +21,8 @@ pub enum IpcCommand {
     SetVolume { track_id: String, volume: f32 },
     SetPan { track_id: String, pan: f32 },
     SetMute { track_id: String, muted: bool },
+    SetSolo { track_id: String, solo: bool },
+    SetMasterVolume { volume: f32 },
     StartRecording { out_path: String },
     StopRecording,
     GetStatus,
@@ -93,10 +95,6 @@ pub enum IpcCommand {
         param_name: String,
         value: f32,
     },
-    /// Request opening the plugin's graphical user interface window
-    OpenPluginGui {
-        track_id: String,
-    },
     /// Save track's current synth patch to a preset JSON file
     SaveTrackPreset {
         track_id: String,
@@ -133,6 +131,7 @@ pub struct TrackStatus {
     pub pan: f32,
     pub muted: bool,
     pub solo: bool,
+    pub peak_level: f32,
     pub params: Vec<TrackParamStatus>,
     pub current_plugin: Option<String>,
 }
@@ -146,6 +145,8 @@ pub struct IpcStatusResponse {
     pub current_sample: u64,
     pub total_ticks: u64,
     pub bpm: f64,
+    pub master_volume: f32,
+    pub master_peak: f32,
     pub is_recording: bool,
     pub mic_peak: f32,
     pub active_section_id: Option<String>,
@@ -292,6 +293,16 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             }
             build_status_response(&h)
         }
+        IpcCommand::SetSolo { track_id, solo } => {
+            if let Some(&idx) = h.track_map.get(&track_id) {
+                h.tracks[idx].solo = solo;
+            }
+            build_status_response(&h)
+        }
+        IpcCommand::SetMasterVolume { volume } => {
+            h.master_gain = volume.clamp(0.0, 2.0);
+            build_status_response(&h)
+        }
         IpcCommand::StartRecording { out_path } => {
             let start_sample = h.timeline.current_sample;
             h.recorder.start_recording(start_sample, Path::new(&out_path));
@@ -366,11 +377,6 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             }
             build_status_response(&h)
         }
-        IpcCommand::OpenPluginGui { track_id } => {
-            println!("[jamseq] Requested open GUI for track: {}", track_id);
-            h.open_track_gui(&track_id);
-            build_status_response(&h)
-        }
         IpcCommand::SaveTrackPreset { track_id, preset_name } => {
             let filename = if preset_name.ends_with(".json") {
                 preset_name
@@ -430,6 +436,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 pan: t.pan,
                 muted: t.muted,
                 solo: t.solo,
+                peak_level: t.peak_level,
                 params,
                 current_plugin: t.current_plugin.clone(),
             }
@@ -446,6 +453,8 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
         current_sample: h.timeline.current_sample,
         total_ticks: h.timeline.total_ticks,
         bpm: h.timeline.bpm,
+        master_volume: h.master_gain,
+        master_peak: h.master_peak,
         is_recording: h.recorder.is_recording(),
         mic_peak: h.recorder.get_peak_input(),
         active_section_id: active_section,

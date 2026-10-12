@@ -2,67 +2,12 @@ use lilv::World;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::{Arc, Mutex};
-use x11rb::connection::Connection;
-use x11rb::protocol::xproto::*;
-use x11rb::wrapper::ConnectionExt as _;
-
-#[repr(C)]
-struct Lv2Feature {
-    uri: *const c_char,
-    data: *mut c_void,
-}
 
 #[repr(C)]
 struct Lv2UridMap {
     handle: *mut c_void,
     map: unsafe extern "C" fn(handle: *mut c_void, uri: *const c_char) -> u32,
 }
-
-#[repr(C)]
-struct Lv2UiResize {
-    handle: *mut c_void,
-    ui_resize: unsafe extern "C" fn(handle: *mut c_void, width: i32, height: i32) -> i32,
-}
-
-#[repr(C)]
-struct Lv2UiIdleInterface {
-    idle: unsafe extern "C" fn(ui: *mut c_void) -> i32,
-}
-
-#[repr(C)]
-struct Lv2UiDescriptor {
-    uri: *const c_char,
-    instantiate: unsafe extern "C" fn(
-        descriptor: *const Lv2UiDescriptor,
-        plugin_uri: *const c_char,
-        bundle_path: *const c_char,
-        write_function: Option<
-            unsafe extern "C" fn(
-                controller: *mut c_void,
-                port_index: u32,
-                buffer_size: u32,
-                port_protocol: u32,
-                buffer: *const c_void,
-            ),
-        >,
-        controller: *mut c_void,
-        widget: *mut *mut c_void,
-        features: *const *const Lv2Feature,
-    ) -> *mut c_void,
-    cleanup: unsafe extern "C" fn(ui: *mut c_void),
-    port_event: Option<
-        unsafe extern "C" fn(
-            ui: *mut c_void,
-            port_index: u32,
-            buffer_size: u32,
-            format: u32,
-            buffer: *const c_void,
-        ),
-    >,
-    extension_data: Option<unsafe extern "C" fn(uri: *const c_char) -> *const c_void>,
-}
-
-type Lv2UiDescriptorFn = unsafe extern "C" fn(index: u32) -> *const Lv2UiDescriptor;
 
 struct UridState {
     uris: Vec<String>,
@@ -82,58 +27,6 @@ unsafe extern "C" fn urid_map_fn(handle: *mut c_void, uri_ptr: *const c_char) ->
     id
 }
 
-struct ResizeState {
-    conn: Arc<x11rb::rust_connection::RustConnection>,
-    win_id: u32,
-}
-
-unsafe extern "C" fn host_resize_fn(handle: *mut c_void, width: i32, height: i32) -> i32 {
-    let state = unsafe { &*(handle as *const ResizeState) };
-    let _ = state.conn.configure_window(
-        state.win_id,
-        &ConfigureWindowAux::new()
-            .width(width as u32)
-            .height(height as u32),
-    );
-    let _ = state.conn.flush();
-    0
-}
-
-pub struct UiController {
-    pub pending_midi: Arc<Mutex<Vec<[u8; 3]>>>,
-}
-
-unsafe extern "C" fn ui_write_fn(
-    controller: *mut c_void,
-    _port_index: u32,
-    buffer_size: u32,
-    _port_protocol: u32,
-    buffer: *const c_void,
-) {
-    if controller.is_null() || buffer.is_null() || buffer_size == 0 {
-        return;
-    }
-    let ctrl = unsafe { &*(controller as *const UiController) };
-    let slice = unsafe { std::slice::from_raw_parts(buffer as *const u8, buffer_size as usize) };
-
-    if buffer_size == 3 && (slice[0] & 0x80) != 0 {
-        ctrl.pending_midi.lock().unwrap().push([slice[0], slice[1], slice[2]]);
-        return;
-    }
-
-    for i in 0..slice.len().saturating_sub(2) {
-        let status = slice[i];
-        if (0x80..=0xEF).contains(&status) {
-            let b1 = slice[i + 1];
-            let b2 = slice[i + 2];
-            if b1 < 128 && b2 < 128 {
-                ctrl.pending_midi.lock().unwrap().push([status, b1, b2]);
-                break;
-            }
-        }
-    }
-}
-
 #[repr(C, align(8))]
 struct AtomSequenceBuffer {
     // LV2_Atom
@@ -146,6 +39,16 @@ struct AtomSequenceBuffer {
     data: [u8; 1024],
 }
 
+#[derive(Clone, Debug)]
+pub struct Lv2ControlPort {
+    pub index: usize,
+    pub name: String,
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+    pub value: f32,
+}
+
 pub struct Lv2Track {
     pub uri: String,
     pub instance: Arc<Mutex<lilv::instance::ActiveInstance>>,
@@ -154,7 +57,8 @@ pub struct Lv2Track {
     pub out_l_port: usize,
     pub out_r_port: usize,
     pub pending_midi: Arc<Mutex<Vec<[u8; 3]>>>,
-    pub gui_open_tx: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
+    pub control_ports: Arc<Mutex<Vec<Lv2ControlPort>>>,
+    pub port_index_map: Arc<Mutex<HashMap<String, usize>>>,
     pub out_l: Vec<f32>,
     pub out_r: Vec<f32>,
     atom_buf: Box<AtomSequenceBuffer>,
@@ -162,29 +66,6 @@ pub struct Lv2Track {
     seq_urid: u32,
     midi_urid: u32,
 }
-
-impl Lv2Track {
-    pub fn load(plugin_uri: &str, sample_rate: f32) -> anyhow::Result<Self> {
-        println!("[jamseq:lv2] Loading LV2 plugin: {}", plugin_uri);
-
-        let world = Box::leak(Box::new(World::with_load_all()));
-        let uri_node = world.new_uri(plugin_uri);
-        let plugin = world
-            .plugins()
-            .into_iter()
-            .find(|p| p.uri() == uri_node)
-            .ok_or_else(|| anyhow::anyhow!("Plugin URI not found: {}", plugin_uri))?;
-
-        let plugin_name = plugin.name().as_str().unwrap_or("LV2 Plugin").to_string();
-
-        let urid_state = Box::leak(Box::new(Mutex::new(UridState {
-            uris: Vec::new(),
-            map: HashMap::new(),
-        })));
-        let urid_map_struct = Box::leak(Box::new(Lv2UridMap {
-            handle: (urid_state as *const Mutex<UridState>) as *mut c_void,
-            map: urid_map_fn,
-        }));
 
 #[repr(C)]
 struct Lv2WorkerSchedule {
@@ -243,6 +124,29 @@ unsafe extern "C" fn worker_schedule_fn(handle: *mut c_void, size: u32, data: *c
     0
 }
 
+impl Lv2Track {
+    pub fn load(plugin_uri: &str, sample_rate: f32) -> anyhow::Result<Self> {
+        println!("[jamseq:lv2] Loading LV2 plugin (headless DSP): {}", plugin_uri);
+
+        let world = Box::leak(Box::new(World::with_load_all()));
+        let uri_node = world.new_uri(plugin_uri);
+        let plugin = world
+            .plugins()
+            .into_iter()
+            .find(|p| p.uri() == uri_node)
+            .ok_or_else(|| anyhow::anyhow!("Plugin URI not found: {}", plugin_uri))?;
+
+        let plugin_name = plugin.name().as_str().unwrap_or("LV2 Plugin").to_string();
+
+        let urid_state = Box::leak(Box::new(Mutex::new(UridState {
+            uris: Vec::new(),
+            map: HashMap::new(),
+        })));
+        let urid_map_struct = Box::leak(Box::new(Lv2UridMap {
+            handle: (urid_state as *const Mutex<UridState>) as *mut c_void,
+            map: urid_map_fn,
+        }));
+
         let worker_state = Box::leak(Box::new(Mutex::new(WorkerState {
             instance_ptr: std::ptr::null_mut(),
             iface: None,
@@ -260,7 +164,70 @@ unsafe extern "C" fn worker_schedule_fn(handle: *mut c_void, size: u32, data: *c
             uri: CString::new("http://lv2plug.in/ns/ext/worker#schedule")?.into_raw(),
             data: (worker_sched_struct as *const Lv2WorkerSchedule) as *mut c_void,
         };
-        let features = [feat_urid_map, feat_worker];
+        let feat_buf_sz = lv2_raw::LV2Feature {
+            uri: CString::new("http://lv2plug.in/ns/ext/buf-size#boundedBlockLength")?.into_raw(),
+            data: std::ptr::null_mut(),
+        };
+
+        // Construct options array terminated by zeroed option
+        #[repr(C)]
+        struct Lv2Option {
+            context: i32,
+            subject: u32,
+            key: u32,
+            size: u32,
+            type_: u32,
+            value: *const c_void,
+        }
+
+        let max_block_sz = Box::leak(Box::new(4096u32));
+        let min_block_sz = Box::leak(Box::new(32u32));
+        let int_type_urid = {
+            let c = CString::new("http://lv2plug.in/ns/ext/atom#Int")?;
+            unsafe { urid_map_fn(urid_map_struct.handle, c.as_ptr()) }
+        };
+        let max_block_urid = {
+            let c = CString::new("http://lv2plug.in/ns/ext/buf-size#maxBlockLength")?;
+            unsafe { urid_map_fn(urid_map_struct.handle, c.as_ptr()) }
+        };
+        let min_block_urid = {
+            let c = CString::new("http://lv2plug.in/ns/ext/buf-size#minBlockLength")?;
+            unsafe { urid_map_fn(urid_map_struct.handle, c.as_ptr()) }
+        };
+
+        let options_array = Box::leak(Box::new([
+            Lv2Option {
+                context: 0, // LV2_OPTIONS_INSTANCE
+                subject: 0,
+                key: max_block_urid,
+                size: 4,
+                type_: int_type_urid,
+                value: (max_block_sz as *const u32) as *const c_void,
+            },
+            Lv2Option {
+                context: 0,
+                subject: 0,
+                key: min_block_urid,
+                size: 4,
+                type_: int_type_urid,
+                value: (min_block_sz as *const u32) as *const c_void,
+            },
+            Lv2Option {
+                context: 0,
+                subject: 0,
+                key: 0,
+                size: 0,
+                type_: 0,
+                value: std::ptr::null(),
+            },
+        ]));
+
+        let feat_options = lv2_raw::LV2Feature {
+            uri: CString::new("http://lv2plug.in/ns/ext/options#options")?.into_raw(),
+            data: (options_array.as_ptr()) as *mut c_void,
+        };
+
+        let features = [feat_urid_map, feat_worker, feat_buf_sz, feat_options];
 
         let instance = unsafe {
             plugin
@@ -277,11 +244,19 @@ unsafe extern "C" fn worker_schedule_fn(handle: *mut c_void, size: u32, data: *c
             guard.iface = Some(iface);
         }
 
-        // Determine audio and MIDI ports
+        // Determine audio, MIDI, and control ports
         let num_ports = plugin.ports_count();
         let mut midi_port = None;
         let mut notify_port = None;
         let mut audio_outs = Vec::new();
+        let mut control_ports = Vec::new();
+        let mut port_index_map = HashMap::new();
+
+        let input_class = world.new_uri("http://lv2plug.in/ns/lv2core#InputPort");
+        let output_class = world.new_uri("http://lv2plug.in/ns/lv2core#OutputPort");
+        let control_class = world.new_uri("http://lv2plug.in/ns/lv2core#ControlPort");
+        let audio_class = world.new_uri("http://lv2plug.in/ns/lv2core#AudioPort");
+        let atom_class = world.new_uri("http://lv2plug.in/ns/ext/atom#AtomPort");
 
         for i in 0..num_ports {
             if let Some(port) = plugin.port_by_index(i) {
@@ -290,16 +265,48 @@ unsafe extern "C" fn worker_schedule_fn(handle: *mut c_void, size: u32, data: *c
                     .as_ref()
                     .and_then(|s| s.as_str())
                     .unwrap_or("")
-                    .to_lowercase();
-                let _classes: Vec<String> = port.classes().into_iter().map(|c| c.as_str().unwrap_or("?").to_string()).collect();
-                if symbol == "control" || symbol.contains("midi") || symbol.contains("in") {
+                    .to_string();
+
+                let is_input = port.is_a(&input_class);
+                let is_output = port.is_a(&output_class);
+                let is_control = port.is_a(&control_class);
+                let is_audio = port.is_a(&audio_class);
+                let is_atom = port.is_a(&atom_class);
+
+                if is_input && (is_atom || symbol == "control" || symbol.contains("midi")) {
                     if midi_port.is_none() {
                         midi_port = Some(i);
                     }
-                } else if symbol == "notify" {
+                } else if is_output && (is_atom || symbol == "notify") {
                     notify_port = Some(i);
-                } else if symbol.contains("out") || symbol == "left" || symbol == "right" {
+                } else if is_output && is_audio {
                     audio_outs.push(i);
+                } else if is_input && is_control {
+                    let name = port.name()
+                        .and_then(|n| n.as_str().map(|s| s.to_string()))
+                        .unwrap_or_else(|| {
+                            if !symbol.is_empty() { symbol.clone() } else { format!("Param {}", i) }
+                        });
+                    let range = port.range();
+                    let def_val = range.default.as_ref().and_then(|n| n.as_float()).unwrap_or(0.0);
+                    let min_val = range.minimum.as_ref().and_then(|n| n.as_float()).unwrap_or(0.0);
+                    let max_val = range.maximum.as_ref().and_then(|n| n.as_float()).unwrap_or(1.0);
+
+                    let idx = control_ports.len();
+                    port_index_map.insert(name.clone(), idx);
+                    port_index_map.insert(name.to_lowercase(), idx);
+                    if !symbol.is_empty() {
+                        port_index_map.insert(symbol.clone(), idx);
+                    }
+
+                    control_ports.push(Lv2ControlPort {
+                        index: i,
+                        name,
+                        min: min_val,
+                        max: max_val,
+                        default: def_val,
+                        value: def_val,
+                    });
                 }
             }
         }
@@ -308,34 +315,33 @@ unsafe extern "C" fn worker_schedule_fn(handle: *mut c_void, size: u32, data: *c
         let out_r_port = if audio_outs.len() >= 2 { audio_outs[1] } else { 3.min(num_ports - 1) };
 
         println!(
-            "[jamseq:lv2] Configured ports: MIDI In: {:?}, Notify: {:?}, Out L: {}, Out R: {}",
-            midi_port, notify_port, out_l_port, out_r_port
+            "[jamseq:lv2] Configured ports: MIDI In: {:?}, Notify: {:?}, Out L: {}, Out R: {}, Control Ports: {}",
+            midi_port, notify_port, out_l_port, out_r_port, control_ports.len()
         );
 
         let active_instance = unsafe { instance.activate() };
         let active_arc = Arc::new(Mutex::new(active_instance));
 
         // Get URIDs for Atom Sequence and MIDI event
-        let seq_urid = {
+        let seq_urid = unsafe {
             let c = CString::new("http://lv2plug.in/ns/ext/atom#Sequence")?;
-            unsafe { urid_map_fn((&*urid_state as *const Mutex<UridState>) as *mut c_void, c.as_ptr()) }
+            urid_map_fn(urid_map_struct.handle, c.as_ptr())
         };
-        let midi_urid = {
+        let midi_urid = unsafe {
             let c = CString::new("http://lv2plug.in/ns/ext/midi#MidiEvent")?;
-            unsafe { urid_map_fn((&*urid_state as *const Mutex<UridState>) as *mut c_void, c.as_ptr()) }
+            urid_map_fn(urid_map_struct.handle, c.as_ptr())
         };
 
         let mut atom_buf = Box::new(AtomSequenceBuffer {
-            atom_size: 8,
+            atom_size: 0,
             atom_type: seq_urid,
             unit: 0,
             pad: 0,
             data: [0u8; 1024],
         });
-
         let mut notify_buf = Box::new(AtomSequenceBuffer {
-            atom_size: 1016,
-            atom_type: 0,
+            atom_size: 0,
+            atom_type: seq_urid,
             unit: 0,
             pad: 0,
             data: [0u8; 1024],
@@ -354,232 +360,7 @@ unsafe extern "C" fn worker_schedule_fn(handle: *mut c_void, size: u32, data: *c
             }
         }
 
-        let (gui_tx, gui_rx) = std::sync::mpsc::channel::<()>();
-        let gui_open_tx = Arc::new(Mutex::new(Some(gui_tx)));
-
-        // Locate UI if available
-        let mut ui_info = None;
-        if let Some(uis) = plugin.uis() {
-            for ui in uis.iter() {
-                if let Some(bin_node) = ui.binary_uri() {
-                    let bin_str = bin_node.as_str().unwrap_or("");
-                    let bin_path = if bin_str.starts_with("file://") {
-                        bin_str.trim_start_matches("file://")
-                    } else {
-                        bin_str
-                    };
-                    let bundle_node = ui.bundle_uri();
-                    let bundle_str = bundle_node.as_ref().and_then(|b| b.as_str()).unwrap_or("");
-                    let bundle_path = if bundle_str.starts_with("file://") {
-                        bundle_str.trim_start_matches("file://")
-                    } else {
-                        bundle_str
-                    };
-                    ui_info = Some((bin_path.to_string(), bundle_path.to_string()));
-                    break;
-                }
-            }
-        }
-
         let pending_midi = Arc::new(Mutex::new(Vec::new()));
-        let pending_midi_gui = pending_midi.clone();
-        let plugin_uri_owned = plugin_uri.to_string();
-
-        if let Some((bin_path, bundle_path)) = ui_info {
-            std::thread::Builder::new()
-                .name(format!("lv2-gui-{}", plugin_name))
-                .spawn(move || {
-                    let lib = match unsafe { libloading::Library::new(&bin_path) } {
-                        Ok(l) => l,
-                        Err(e) => {
-                            println!("[jamseq:lv2] Failed to load UI binary: {}", e);
-                            return;
-                        }
-                    };
-
-                    let desc_fn: libloading::Symbol<Lv2UiDescriptorFn> = match unsafe { lib.get(b"lv2ui_descriptor") } {
-                        Ok(f) => f,
-                        Err(e) => {
-                            println!("[jamseq:lv2] Failed to resolve lv2ui_descriptor: {}", e);
-                            return;
-                        }
-                    };
-
-                    let desc_ptr = unsafe { desc_fn(0) };
-                    if desc_ptr.is_null() {
-                        return;
-                    }
-                    let desc = unsafe { &*desc_ptr };
-
-                    while let Ok(()) = gui_rx.recv() {
-                        println!("[jamseq:lv2] Opening native X11 window on display :0...");
-                        if let Ok((conn, screen_num)) = x11rb::connect(None) {
-                            let conn = Arc::new(conn);
-                            let screen = &conn.setup().roots[screen_num];
-                            let win_id = match conn.generate_id() {
-                                Ok(id) => id,
-                                Err(_) => continue,
-                            };
-
-                            let _ = conn.create_window(
-                                x11rb::COPY_DEPTH_FROM_PARENT,
-                                win_id,
-                                screen.root,
-                                100, 100,
-                                800, 500,
-                                0,
-                                WindowClass::INPUT_OUTPUT,
-                                screen.root_visual,
-                                &CreateWindowAux::new()
-                                    .background_pixel(screen.black_pixel)
-                                    .event_mask(EventMask::EXPOSURE | EventMask::STRUCTURE_NOTIFY),
-                            );
-
-                            let window_title = format!("{} - Native LV2 GUI", plugin_name);
-                            let _ = conn.change_property8(
-                                PropMode::REPLACE,
-                                win_id,
-                                AtomEnum::WM_NAME,
-                                AtomEnum::STRING,
-                                window_title.as_bytes(),
-                            );
-
-                            let wm_protocols = conn.intern_atom(false, b"WM_PROTOCOLS").ok().and_then(|r| r.reply().ok()).map(|r| r.atom).unwrap_or(0);
-                            let wm_delete_window = conn.intern_atom(false, b"WM_DELETE_WINDOW").ok().and_then(|r| r.reply().ok()).map(|r| r.atom).unwrap_or(0);
-                            if wm_protocols != 0 && wm_delete_window != 0 {
-                                let _ = conn.change_property32(
-                                    PropMode::REPLACE,
-                                    win_id,
-                                    wm_protocols,
-                                    AtomEnum::ATOM,
-                                    &[wm_delete_window],
-                                );
-                            }
-
-                            let _ = conn.map_window(win_id);
-                            let _ = conn.flush();
-
-                            let urid_state = Box::new(Mutex::new(UridState {
-                                uris: Vec::new(),
-                                map: HashMap::new(),
-                            }));
-                            let urid_map_struct = Box::new(Lv2UridMap {
-                                handle: (&*urid_state as *const Mutex<UridState>) as *mut c_void,
-                                map: urid_map_fn,
-                            });
-
-                            let resize_state = Box::new(ResizeState {
-                                conn: conn.clone(),
-                                win_id,
-                            });
-                            let resize_struct = Box::new(Lv2UiResize {
-                                handle: (&*resize_state as *const ResizeState) as *mut c_void,
-                                ui_resize: host_resize_fn,
-                            });
-
-                            let parent_uri = CString::new("http://lv2plug.in/ns/extensions/ui#parent").unwrap();
-                            let urid_map_uri = CString::new("http://lv2plug.in/ns/ext/urid#map").unwrap();
-                            let resize_uri = CString::new("http://lv2plug.in/ns/extensions/ui#resize").unwrap();
-                            let idle_interface_uri = CString::new("http://lv2plug.in/ns/extensions/ui#idleInterface").unwrap();
-
-                            let feat_parent = Lv2Feature {
-                                uri: parent_uri.as_ptr(),
-                                data: win_id as usize as *mut c_void,
-                            };
-                            let feat_urid_map = Lv2Feature {
-                                uri: urid_map_uri.as_ptr(),
-                                data: (&*urid_map_struct as *const Lv2UridMap) as *mut c_void,
-                            };
-                            let feat_resize = Lv2Feature {
-                                uri: resize_uri.as_ptr(),
-                                data: (&*resize_struct as *const Lv2UiResize) as *mut c_void,
-                            };
-
-                            let features: [*const Lv2Feature; 4] = [
-                                &feat_parent,
-                                &feat_urid_map,
-                                &feat_resize,
-                                std::ptr::null(),
-                            ];
-
-                            let p_uri = CString::new(plugin_uri_owned.clone()).unwrap();
-                            let b_path = CString::new(bundle_path.clone()).unwrap();
-                            let mut widget_ptr: *mut c_void = std::ptr::null_mut();
-
-                            let ctrl_context = Box::new(UiController {
-                                pending_midi: pending_midi_gui.clone(),
-                            });
-
-                            let ui_handle = unsafe {
-                                (desc.instantiate)(
-                                    desc_ptr,
-                                    p_uri.as_ptr(),
-                                    b_path.as_ptr(),
-                                    Some(ui_write_fn),
-                                    (&*ctrl_context as *const UiController) as *mut c_void,
-                                    &mut widget_ptr,
-                                    features.as_ptr(),
-                                )
-                            };
-
-                            if ui_handle.is_null() {
-                                println!("[jamseq:lv2] Failed to instantiate UI handle");
-                                continue;
-                            }
-
-                            let child_win_id = widget_ptr as usize as u32;
-                            if child_win_id != 0 && child_win_id != win_id {
-                                let _ = conn.map_window(child_win_id);
-                                let _ = conn.flush();
-                            }
-
-                            let idle_interface: Option<&Lv2UiIdleInterface> = if let Some(ext_fn) = desc.extension_data {
-                                let ptr = unsafe { ext_fn(idle_interface_uri.as_ptr()) };
-                                if !ptr.is_null() {
-                                    Some(unsafe { &*(ptr as *const Lv2UiIdleInterface) })
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            };
-
-                            println!("[jamseq:lv2] Native LV2 GUI is displayed and active.");
-
-                            'event_loop: loop {
-                                while let Ok(Some(event)) = conn.poll_for_event() {
-                                    match event {
-                                        x11rb::protocol::Event::ClientMessage(msg) => {
-                                            if msg.data.as_data32()[0] == wm_delete_window {
-                                                println!("[jamseq:lv2] User closed plugin window.");
-                                                break 'event_loop;
-                                            }
-                                        }
-                                        x11rb::protocol::Event::DestroyNotify(_) => break 'event_loop,
-                                        _ => {}
-                                    }
-                                }
-
-                                if let Some(idle) = idle_interface {
-                                    let res = unsafe { (idle.idle)(ui_handle) };
-                                    if res != 0 {
-                                        break 'event_loop;
-                                    }
-                                }
-
-                                let _ = conn.flush();
-                                std::thread::sleep(std::time::Duration::from_millis(16));
-                            }
-
-                            unsafe {
-                                (desc.cleanup)(ui_handle);
-                            }
-                            let _ = conn.destroy_window(win_id);
-                            let _ = conn.flush();
-                        }
-                    }
-                })?;
-        }
 
         Ok(Self {
             uri: plugin_uri.to_string(),
@@ -589,7 +370,8 @@ unsafe extern "C" fn worker_schedule_fn(handle: *mut c_void, size: u32, data: *c
             out_l_port,
             out_r_port,
             pending_midi,
-            gui_open_tx,
+            control_ports: Arc::new(Mutex::new(control_ports)),
+            port_index_map: Arc::new(Mutex::new(port_index_map)),
             out_l: vec![0.0f32; 1024],
             out_r: vec![0.0f32; 1024],
             atom_buf,
@@ -612,9 +394,19 @@ unsafe extern "C" fn worker_schedule_fn(handle: *mut c_void, size: u32, data: *c
         self.pending_midi.lock().unwrap().push([0xB0, 123, 0]); // All notes off CC
     }
 
-    pub fn open_gui(&self) {
-        if let Some(tx) = self.gui_open_tx.lock().unwrap().as_ref() {
-            let _ = tx.send(());
+    pub fn get_parameters(&self) -> Vec<(String, f32, f32, f32)> {
+        let ports = self.control_ports.lock().unwrap();
+        ports.iter().map(|p| (p.name.clone(), p.value, p.min, p.max)).collect()
+    }
+
+    pub fn set_parameter(&self, name: &str, value: f32) {
+        let mut ports = self.control_ports.lock().unwrap();
+        let map = self.port_index_map.lock().unwrap();
+        let idx = map.get(name).or_else(|| map.get(&name.to_lowercase()));
+        if let Some(&i) = idx {
+            if let Some(port) = ports.get_mut(i) {
+                port.value = value.clamp(port.min, port.max);
+            }
         }
     }
 
@@ -676,6 +468,13 @@ unsafe extern "C" fn worker_schedule_fn(handle: *mut c_void, size: u32, data: *c
                 }
                 inst.instance_mut().connect_port_mut(self.out_l_port, self.out_l.as_mut_ptr());
                 inst.instance_mut().connect_port_mut(self.out_r_port, self.out_r.as_mut_ptr());
+
+                // Connect control ports to live values
+                if let Ok(mut ports) = self.control_ports.lock() {
+                    for port in ports.iter_mut() {
+                        inst.instance_mut().connect_port_mut(port.index, &mut port.value as *mut f32);
+                    }
+                }
 
                 inst.run(num_samples);
             }
