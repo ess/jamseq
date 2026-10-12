@@ -804,8 +804,14 @@ fn test_debug_playback_demo() {
 
     host.set_sample_rate(44100.0);
 
-    host.play();
+    // Verify that while stopped, there is ZERO audio output (zero hum)
     let mut out_l = vec![0.0f32; 512];
+    let mut out_r = vec![0.0f32; 512];
+    host.process_block(&mut out_l, &mut out_r);
+    let stopped_peak: f32 = out_l.iter().chain(out_r.iter()).map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(stopped_peak < 1e-6, "Stopped engine must produce zero hum or audible audio (got {})", stopped_peak);
+
+    host.play();
     let mut out_r = vec![0.0f32; 512];
     let mut total_peak = 0.0f32;
     for block in 0..30 {

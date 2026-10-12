@@ -465,6 +465,7 @@ impl Track {
         scratch_right: &mut [f32],
         sidechain_buffers: Option<&std::collections::HashMap<(String, usize), (Vec<f32>, Vec<f32>)>>,
         bypass_cached_stem: bool,
+        is_playing: bool,
     ) {
         if self.muted {
             return;
@@ -474,9 +475,9 @@ impl Track {
         scratch_left[..num_samples].fill(0.0);
         scratch_right[..num_samples].fill(0.0);
 
-        // If a pre-rendered stem is available and not bypassed, stream directly from the cached stem!
+        // If a pre-rendered stem is available and not bypassed, stream directly from the cached stem (only while playing)!
         let mut played_from_stem = false;
-        if !bypass_cached_stem && !self.is_frozen {
+        if !bypass_cached_stem && !self.is_frozen && is_playing {
             if let Some(ref stem) = self.cached_stem {
                 if let Some(ref buf) = stem.buffer {
                     let clip_len = buf.samples_left.len() as u64;

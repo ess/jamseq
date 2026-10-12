@@ -752,6 +752,7 @@ impl JamSeqHost {
                 &mut self.scratch_right[..num_samples],
                 Some(&self.sidechain_buffers),
                 is_armed,
+                self.timeline.is_playing,
             );
 
             // Tap sidechains: record pre-fader/post-synth audio into sidechain buffers
@@ -984,6 +985,9 @@ impl JamSeqHost {
 
         writer.finalize()?;
         self.timeline.pause();
+        for t in &mut self.tracks {
+            t.all_notes_off();
+        }
 
         // Restore target track stem and solo/mute states
         self.tracks[target_idx].cached_stem = orig_stem;
@@ -1061,6 +1065,9 @@ impl JamSeqHost {
         }
 
         self.timeline.pause();
+        for t in &mut self.tracks {
+            t.all_notes_off();
+        }
 
         // Restore target track stem, faders, and states
         self.tracks[target_idx].cached_stem = orig_stem;
