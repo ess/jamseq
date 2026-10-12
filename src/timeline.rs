@@ -45,7 +45,13 @@ impl TimeSignature {
 pub struct SongSection {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub start_tick: u64,
+    #[serde(default)]
+    pub length_ticks: u64,
+    #[serde(default)]
     pub start_bar: u32,
+    #[serde(default)]
     pub bars: u32,
     pub energy: u8,
     #[serde(default)]
@@ -54,22 +60,96 @@ pub struct SongSection {
 
 impl SongSection {
     pub fn new(id: &str, name: &str, start_bar: u32, bars: u32, energy: u8) -> Self {
+        let ts = TimeSignature::default();
+        let tpb = ts.ticks_per_bar();
+        let start_tick = if start_bar > 0 { (start_bar as u64 - 1) * tpb } else { 0 };
+        let length_ticks = bars as u64 * tpb;
         Self {
             id: id.to_string(),
             name: name.to_string(),
+            start_tick,
+            length_ticks,
             start_bar,
             bars,
             energy,
-            time_signature: TimeSignature::default(),
+            time_signature: ts,
+        }
+    }
+
+    pub fn from_ticks(id: &str, name: &str, start_tick: u64, length_ticks: u64, energy: u8) -> Self {
+        let ts = TimeSignature::default();
+        let tpb = ts.ticks_per_bar().max(1);
+        let start_bar = (start_tick / tpb) as u32 + 1;
+        let bars = (length_ticks as f64 / tpb as f64).ceil() as u32;
+        Self {
+            id: id.to_string(),
+            name: name.to_string(),
+            start_tick,
+            length_ticks,
+            start_bar,
+            bars,
+            energy,
+            time_signature: ts,
         }
     }
 
     pub fn start_tick(&self) -> u64 {
-        (self.start_bar as u64 - 1) * self.time_signature.ticks_per_bar()
+        if self.start_tick > 0 || self.length_ticks > 0 {
+            self.start_tick
+        } else if self.start_bar > 0 {
+            (self.start_bar as u64 - 1) * self.time_signature.ticks_per_bar()
+        } else {
+            0
+        }
+    }
+
+    pub fn length_ticks(&self) -> u64 {
+        if self.length_ticks > 0 {
+            self.length_ticks
+        } else if self.bars > 0 {
+            self.bars as u64 * self.time_signature.ticks_per_bar()
+        } else {
+            self.time_signature.ticks_per_bar()
+        }
     }
 
     pub fn end_tick(&self) -> u64 {
-        (self.start_bar as u64 - 1 + self.bars as u64) * self.time_signature.ticks_per_bar()
+        self.start_tick() + self.length_ticks()
+    }
+
+    /// Calculate (1-indexed bar, 1-indexed beat within bar)
+    pub fn start_bar_beat(&self) -> (u32, f32) {
+        let tpb = self.time_signature.ticks_per_bar().max(1);
+        let ticks = self.start_tick();
+        let bar = (ticks / tpb) as u32 + 1;
+        let rem_ticks = ticks % tpb;
+        let ticks_per_beat = (PPQ * 4) / self.time_signature.denominator as u64;
+        let beat = (rem_ticks as f32 / ticks_per_beat as f32) + 1.0;
+        (bar, beat)
+    }
+
+    /// Snap boundaries to nearest quarter-note beat (PPQ = 480 ticks)
+    pub fn normalize_to_beat(&mut self) {
+        let ticks_per_beat = PPQ;
+        self.start_tick = ((self.start_tick() + ticks_per_beat / 2) / ticks_per_beat) * ticks_per_beat;
+        let len = self.length_ticks();
+        self.length_ticks = (((len + ticks_per_beat / 2) / ticks_per_beat).max(1)) * ticks_per_beat;
+        self.recompute_bars();
+    }
+
+    /// Snap boundaries to full bar
+    pub fn normalize_to_bar(&mut self) {
+        let tpb = self.time_signature.ticks_per_bar().max(1);
+        self.start_tick = ((self.start_tick() + tpb / 2) / tpb) * tpb;
+        let len = self.length_ticks();
+        self.length_ticks = (((len + tpb / 2) / tpb).max(1)) * tpb;
+        self.recompute_bars();
+    }
+
+    fn recompute_bars(&mut self) {
+        let tpb = self.time_signature.ticks_per_bar().max(1);
+        self.start_bar = (self.start_tick / tpb) as u32 + 1;
+        self.bars = (self.length_ticks as f64 / tpb as f64).ceil() as u32;
     }
 }
 
@@ -145,7 +225,7 @@ impl Timeline {
             loop_start_tick: 0,
             loop_end_tick: 4 * 4 * PPQ,
             is_playing: false,
-            sections: vec![SongSection::new("intro", "Intro", 1, 4, 2)],
+            sections: Vec::new(),
             events: Vec::new(),
             event_cursor: 0,
         }
@@ -337,6 +417,38 @@ impl Timeline {
 
     pub fn get_section_at_tick(&self, tick: u64) -> Option<&SongSection> {
         self.sections.iter().find(|s| tick >= s.start_tick() && tick < s.end_tick())
+    }
+
+    pub fn add_section(&mut self, section: SongSection) {
+        let sec_end = section.end_tick();
+        if sec_end > self.total_ticks {
+            self.total_ticks = sec_end;
+            self.loop_end_tick = sec_end;
+        }
+        self.sections.retain(|s| s.id != section.id);
+        self.sections.push(section);
+        self.sections.sort_by_key(|s| s.start_tick());
+    }
+
+    pub fn remove_section(&mut self, section_id: &str) -> bool {
+        let orig_len = self.sections.len();
+        self.sections.retain(|s| s.id != section_id);
+        self.sections.len() < orig_len
+    }
+
+    pub fn update_section(&mut self, section: SongSection) -> bool {
+        if let Some(pos) = self.sections.iter().position(|s| s.id == section.id) {
+            let sec_end = section.end_tick();
+            if sec_end > self.total_ticks {
+                self.total_ticks = sec_end;
+                self.loop_end_tick = sec_end;
+            }
+            self.sections[pos] = section;
+            self.sections.sort_by_key(|s| s.start_tick());
+            true
+        } else {
+            false
+        }
     }
 
     pub fn play(&mut self) {

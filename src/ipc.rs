@@ -241,6 +241,22 @@ pub enum IpcCommand {
     },
     /// Rescan system for newly installed LV2 and CLAP plugins
     RescanPlugins,
+    /// Add or append a song section with tick precision
+    AddSection {
+        id: String,
+        name: String,
+        start_tick: u64,
+        length_ticks: u64,
+        energy: u8,
+    },
+    /// Remove a song section by id
+    RemoveSection {
+        section_id: String,
+    },
+    /// Update an existing song section in place
+    UpdateSection {
+        section: SongSection,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -731,6 +747,19 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
         }
         IpcCommand::RescanPlugins => {
             h.rescan_plugins();
+            build_status_response(&h)
+        }
+        IpcCommand::AddSection { id, name, start_tick, length_ticks, energy } => {
+            let section = crate::timeline::SongSection::from_ticks(&id, &name, start_tick, length_ticks, energy);
+            h.add_section(section);
+            build_status_response(&h)
+        }
+        IpcCommand::RemoveSection { section_id } => {
+            let _ = h.remove_section(&section_id);
+            build_status_response(&h)
+        }
+        IpcCommand::UpdateSection { section } => {
+            let _ = h.update_section(section);
             build_status_response(&h)
         }
         IpcCommand::GetStatus => build_status_response(&h),

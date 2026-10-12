@@ -202,7 +202,17 @@ fn test_ipc_socket_server() {
     let resp: jamseq::ipc::IpcResponse = serde_json::from_str(&resp_line).unwrap();
     assert_eq!(resp.status.unwrap().tracks[0].volume, 0.75);
 
-    // 4. Send ReplaceSectionEvents (Section-scoped edit)
+    // 4. Send AddSection and ReplaceSectionEvents (Section-scoped edit)
+    writeln!(
+        stream,
+        "{{\"cmd\":\"AddSection\",\"args\":{{\"id\":\"intro\",\"name\":\"Intro\",\"start_tick\":0,\"length_ticks\":7680,\"energy\":2}}}}"
+    ).unwrap();
+    resp_line.clear();
+    reader.read_line(&mut resp_line).unwrap();
+    let resp: jamseq::ipc::IpcResponse = serde_json::from_str(&resp_line).unwrap();
+    assert!(resp.ok);
+    assert_eq!(resp.status.unwrap().sections.len(), 1);
+
     writeln!(
         stream,
         "{{\"cmd\":\"ReplaceSectionEvents\",\"args\":{{\"section_id\":\"intro\",\"track_id\":\"vox\",\"events\":[{{\"id\":10,\"tick\":0,\"track_id\":\"vox\",\"action\":{{\"NoteOn\":{{\"note\":60,\"velocity\":0.8}}}}}}]}}}}"
@@ -986,6 +996,60 @@ fn test_vst3_insert_effect_on_track() {
     let peak: f32 = out_l.iter().chain(out_r.iter()).map(|s| s.abs()).fold(0.0, f32::max);
     println!("Track with VST3 insert audio output peak: {}", peak);
     assert!(peak > 0.0001, "Expected audio output from track through VST3 insert");
+}
+
+#[test]
+fn test_blank_slate_and_section_management() {
+    let mut host = jamseq::JamSeqHost::new(120.0, 44100.0);
+    assert_eq!(host.tracks.len(), 0, "Blank slate should start with 0 tracks");
+    assert!(host.project_path.is_none(), "Blank slate should have no project path");
+    assert_eq!(host.timeline.title, "Untitled");
+
+    // Add a sub-bar section (e.g. 2-beat pickup = 960 ticks)
+    let pickup = jamseq::timeline::SongSection::from_ticks("pickup", "Pickup", 0, 960, 2);
+    assert_eq!(pickup.start_tick(), 0);
+    assert_eq!(pickup.length_ticks(), 960);
+    assert_eq!(pickup.end_tick(), 960);
+
+    host.add_section(pickup);
+    assert_eq!(host.timeline.sections.len(), 1);
+
+    // Add a 4-bar section starting at 960 ticks (4 bars * 3840 ticks/bar)
+    let verse = jamseq::timeline::SongSection::from_ticks("verse", "Verse 1", 960, 7680, 3);
+    host.add_section(verse);
+    assert_eq!(host.timeline.sections.len(), 2);
+    assert_eq!(host.timeline.total_ticks, 15360); // default 4-bar timeline is 15360 ticks
+
+    // Add a section extending past 15360
+    let outro = jamseq::timeline::SongSection::from_ticks("outro", "Outro", 15360, 5000, 1);
+    host.add_section(outro);
+    assert_eq!(host.timeline.total_ticks, 15360 + 5000);
+
+    // Test bar/beat normalization
+    let mut custom = jamseq::timeline::SongSection::from_ticks("custom", "Bridge", 123, 456, 4);
+    custom.normalize_to_beat();
+    assert_eq!(custom.start_tick() % jamseq::timeline::PPQ, 0);
+    assert_eq!(custom.length_ticks() % jamseq::timeline::PPQ, 0);
+
+    custom.normalize_to_bar();
+    let tpb = custom.time_signature.ticks_per_bar();
+    assert_eq!(custom.start_tick() % tpb, 0);
+    assert_eq!(custom.length_ticks() % tpb, 0);
+
+    // Test removing a section
+    let removed = host.remove_section("pickup");
+    assert!(removed);
+    assert_eq!(host.timeline.sections.len(), 2);
+
+    // Test new_project clears tracks
+    let synth = jamsynth::JamSynthEngine::new(44100.0);
+    host.add_track(jamseq::track::Track::new_synth("t1", "Synth", synth));
+    assert_eq!(host.tracks.len(), 1);
+
+    host.new_project("Fresh Song", 130.0);
+    assert_eq!(host.tracks.len(), 0, "new_project must clear tracks to blank slate");
+    assert_eq!(host.timeline.title, "Fresh Song");
+    assert_eq!(host.timeline.bpm, 130.0);
 }
 
 

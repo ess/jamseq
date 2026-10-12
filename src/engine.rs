@@ -107,8 +107,29 @@ impl JamSeqHost {
             crate::timeline::SongSection::new("verse_1", "Verse 1", 5, 4, 3),
         ];
         arrangement.events = Vec::new();
+        self.tracks.clear();
+        self.track_map.clear();
+        self.aux_buses.clear();
+        self.aux_map.clear();
+        self.aux_left.clear();
+        self.aux_right.clear();
+        self.master_bus.inserts.clear();
+        self.frozen_tracks.clear();
+        self.sidechain_buffers.clear();
         self.load_arrangement(arrangement);
         self.project_path = None;
+    }
+
+    pub fn add_section(&mut self, section: crate::timeline::SongSection) {
+        self.timeline.add_section(section);
+    }
+
+    pub fn remove_section(&mut self, section_id: &str) -> bool {
+        self.timeline.remove_section(section_id)
+    }
+
+    pub fn update_section(&mut self, section: crate::timeline::SongSection) -> bool {
+        self.timeline.update_section(section)
     }
 
     pub fn set_sample_rate(&mut self, rate: f32) {

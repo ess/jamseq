@@ -24,7 +24,8 @@ fn main() -> Result<()> {
         "demo" => run_demo()?,
         "server" => {
             let socket_path = args.get(2).map(|s| s.as_str()).unwrap_or("/tmp/jamseq.sock");
-            run_server(socket_path)?;
+            let project_path = args.get(3).map(|s| s.as_str());
+            run_server(socket_path, project_path)?;
         }
         "render-demo" => {
             let wav_path = args.get(2).map(|s| s.as_str()).unwrap_or("export/the_white_flame_preview.wav");
@@ -46,7 +47,7 @@ fn main() -> Result<()> {
         }
         _ => {
             println!("Usage:");
-            println!("  jamseq server [socket_path]  Run headless audio host with Unix socket IPC server");
+            println!("  jamseq server [socket] [song] Run headless audio host with Unix socket IPC server");
             println!("  jamseq demo                  Run a live demo of The White Flame groove (PipeWire/ALSA)");
             println!("  jamseq play <song.json>      Play an arrangement in real time");
             println!("  jamseq render <in> <out> [N] Offline render N bars to a 24-bit WAV file");
@@ -56,9 +57,16 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_server(socket_path: &str) -> Result<()> {
+fn run_server(socket_path: &str, project_path: Option<&str>) -> Result<()> {
     println!("[jamseq:server] Starting JamSeq audio engine and IPC server on {}", socket_path);
-    let host = Arc::new(Mutex::new(build_white_flame_demo_host()?));
+    let mut host_instance = JamSeqHost::new(120.0, 48000.0);
+    if let Some(path) = project_path {
+        println!("[jamseq:server] Loading project file: {}", path);
+        if let Err(e) = host_instance.load_project_from_file(path) {
+            eprintln!("[jamseq:server] Failed to load project file '{}': {}", path, e);
+        }
+    }
+    let host = Arc::new(Mutex::new(host_instance));
 
     let audio = AudioOutput::start(Arc::clone(&host))?;
     println!("[jamseq:server] ✓ Audio engine active (PipeWire / ALSA)");
