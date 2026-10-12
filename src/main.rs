@@ -110,6 +110,18 @@ fn build_white_flame_demo_host() -> Result<JamSeqHost> {
         host.add_track(Track::new_synth("pad", "Cold Pad (D-Minor 9th)", pad_engine));
     }
 
+    // Track 1: Drums (Black Pearl Drumkit LV2)
+    let avl_uri = "http://gareus.org/oss/lv2/avldrums#BlackPearl";
+    match jamseq::lv2_host::Lv2Track::load(avl_uri, sr) {
+        Ok(drums_lv2) => {
+            println!("[jamseq] ✓ Loaded Black Pearl Drumkit (LV2) for drums track");
+            host.add_track(Track::new_lv2("drums", "Drums (Black Pearl)", drums_lv2, "Black Pearl Drumkit"));
+        }
+        Err(e) => {
+            eprintln!("[jamseq] Note: Black Pearl Drumkit not loaded: {}", e);
+        }
+    }
+
     // Schedule 4 bars of The White Flame Verse 1
     let mut events = Vec::new();
     let mut next_id = 1u64;
@@ -170,6 +182,62 @@ fn build_white_flame_demo_host() -> Result<JamSeqHost> {
         add_ev(&mut events, 64 * TICKS_PER_16TH, "pad", ScheduledAction::NoteOff { note: n });
     }
 
+    // --- DRUMS: BLACK PEARL (Kick 36, Snare 38 with +18ms drag, Closed Hat 42) ---
+    let kick_pattern =
+        "X.......g.x...x.".to_string() +
+        "X.......x......." +
+        "X.......g.x...x." +
+        "X...x.....x...x.";
+
+    let snare_pattern =
+        "......g.X.....g.".to_string() +
+        "........X......." +
+        "......g.X.....g." +
+        "....g.g.X...g.g.";
+
+    let hat_pattern =
+        "X.g.x.g.X.g.x.x.".to_string() +
+        "X.g.x.g.X.g.x.g." +
+        "X.g.x.g.X.g.x.x." +
+        "X.g.X.g.X.x.x.x.";
+
+    for (step, ch) in kick_pattern.chars().enumerate() {
+        let vel = match ch {
+            'X' => 1.0,
+            'x' => 0.85,
+            'g' => 0.50,
+            _ => continue,
+        };
+        let tick = (step as u64) * TICKS_PER_16TH;
+        add_ev(&mut events, tick, "drums", ScheduledAction::NoteOn { note: 36, velocity: vel });
+        add_ev(&mut events, tick + TICKS_PER_16TH / 2, "drums", ScheduledAction::NoteOff { note: 36 });
+    }
+
+    for (step, ch) in snare_pattern.chars().enumerate() {
+        let vel = match ch {
+            'X' => 1.0,
+            'x' => 0.80,
+            'g' => 0.45,
+            _ => continue,
+        };
+        // Apply 90s R&B snare drag pocket (+20 ticks ≈ +18ms at 68 BPM)
+        let tick = (step as u64) * TICKS_PER_16TH + 20;
+        add_ev(&mut events, tick, "drums", ScheduledAction::NoteOn { note: 38, velocity: vel });
+        add_ev(&mut events, tick + TICKS_PER_16TH / 2, "drums", ScheduledAction::NoteOff { note: 38 });
+    }
+
+    for (step, ch) in hat_pattern.chars().enumerate() {
+        let vel = match ch {
+            'X' => 0.85,
+            'x' => 0.65,
+            'g' => 0.40,
+            _ => continue,
+        };
+        let tick = (step as u64) * TICKS_PER_16TH;
+        add_ev(&mut events, tick, "drums", ScheduledAction::NoteOn { note: 42, velocity: vel });
+        add_ev(&mut events, tick + TICKS_PER_16TH / 2, "drums", ScheduledAction::NoteOff { note: 42 });
+    }
+
     let arrangement = TimelineArrangement {
         title: "The White Flame (Verse 1 Demo)".to_string(),
         bpm: 68.0,
@@ -197,8 +265,9 @@ fn run_demo() -> Result<()> {
     }
 
     println!("[jamseq] ▶ PLAYING: 'The White Flame' (Verse 1 Demo @ 68 BPM)");
-    println!("         • Track 1: Sub 808 (JamSynth CLAP with Drake slide D3 -> D4)");
-    println!("         • Track 2: Cold Gothic Pad (JamSynth CLAP polyphonic Dm9)");
+    println!("         • Track 1: Drums (Black Pearl Drumkit LV2 with +18ms snare drag)");
+    println!("         • Track 2: Sub 808 (JamSynth CLAP with Drake slide D3 -> D4)");
+    println!("         • Track 3: Cold Gothic Pad (JamSynth CLAP polyphonic Dm9)");
     println!("         • Engine: Zero DAW, real-time PipeWire audio output");
     println!("         (Playing 1 loop iteration for 14 seconds...)");
 
