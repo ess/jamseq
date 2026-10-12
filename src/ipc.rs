@@ -21,6 +21,8 @@ pub enum IpcCommand {
     SetVolume { track_id: String, volume: f32 },
     SetPan { track_id: String, pan: f32 },
     SetMute { track_id: String, muted: bool },
+    SetSolo { track_id: String, solo: bool },
+    SetMasterVolume { volume: f32 },
     StartRecording { out_path: String },
     StopRecording,
     GetStatus,
@@ -142,6 +144,7 @@ pub struct IpcStatusResponse {
     pub current_sample: u64,
     pub total_ticks: u64,
     pub bpm: f64,
+    pub master_volume: f32,
     pub is_recording: bool,
     pub mic_peak: f32,
     pub active_section_id: Option<String>,
@@ -286,6 +289,16 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             if let Some(&idx) = h.track_map.get(&track_id) {
                 h.tracks[idx].muted = muted;
             }
+            build_status_response(&h)
+        }
+        IpcCommand::SetSolo { track_id, solo } => {
+            if let Some(&idx) = h.track_map.get(&track_id) {
+                h.tracks[idx].solo = solo;
+            }
+            build_status_response(&h)
+        }
+        IpcCommand::SetMasterVolume { volume } => {
+            h.master_gain = volume.clamp(0.0, 2.0);
             build_status_response(&h)
         }
         IpcCommand::StartRecording { out_path } => {
@@ -437,6 +450,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
         current_sample: h.timeline.current_sample,
         total_ticks: h.timeline.total_ticks,
         bpm: h.timeline.bpm,
+        master_volume: h.master_gain,
         is_recording: h.recorder.is_recording(),
         mic_peak: h.recorder.get_peak_input(),
         active_section_id: active_section,

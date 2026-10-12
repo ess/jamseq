@@ -274,8 +274,13 @@ impl JamSeqHost {
 
         let current_sample = self.timeline.current_sample;
 
+        let any_solo = self.tracks.iter().any(|t| t.solo);
+
         // 3. Render all tracks into master bus
         for track in &mut self.tracks {
+            if any_solo && !track.solo {
+                continue;
+            }
             track.process_block(
                 current_sample,
                 &mut master_left[..num_samples],
