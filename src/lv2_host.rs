@@ -57,11 +57,15 @@ pub struct Lv2Track {
     pub instance: Arc<Mutex<lilv::instance::ActiveInstance>>,
     pub midi_port: Option<usize>,
     pub notify_port: Option<usize>,
+    pub audio_ins: Vec<usize>,
     pub out_l_port: usize,
     pub out_r_port: usize,
     pub pending_midi: Arc<Mutex<Vec<[u8; 3]>>>,
     pub control_ports: Arc<Mutex<Vec<Lv2ControlPort>>>,
     pub port_index_map: Arc<Mutex<HashMap<String, usize>>>,
+    pub in_l: Vec<f32>,
+    pub in_r: Vec<f32>,
+    pub silent_input: Vec<f32>,
     pub out_l: Vec<f32>,
     pub out_r: Vec<f32>,
     atom_buf: Box<AtomSequenceBuffer>,
@@ -251,6 +255,7 @@ impl Lv2Track {
         let num_ports = plugin.ports_count();
         let mut midi_port = None;
         let mut notify_port = None;
+        let mut audio_ins = Vec::new();
         let mut audio_outs = Vec::new();
         let mut control_ports = Vec::new();
         let mut port_index_map = HashMap::new();
@@ -279,7 +284,9 @@ impl Lv2Track {
                 let is_audio = port.is_a(&audio_class);
                 let is_atom = port.is_a(&atom_class);
 
-                if is_input && (is_atom || symbol == "control" || symbol.contains("midi")) {
+                if is_input && is_audio {
+                    audio_ins.push(i);
+                } else if is_input && (is_atom || symbol == "control" || symbol.contains("midi")) {
                     if midi_port.is_none() {
                         midi_port = Some(i);
                     }
@@ -455,11 +462,15 @@ impl Lv2Track {
             instance: active_arc,
             midi_port,
             notify_port,
+            audio_ins,
             out_l_port,
             out_r_port,
             pending_midi,
             control_ports: Arc::new(Mutex::new(control_ports)),
             port_index_map: Arc::new(Mutex::new(port_index_map)),
+            in_l: vec![0.0f32; 1024],
+            in_r: vec![0.0f32; 1024],
+            silent_input: vec![0.0f32; 1024],
             out_l: vec![0.0f32; 1024],
             out_r: vec![0.0f32; 1024],
             atom_buf,
@@ -536,7 +547,11 @@ impl Lv2Track {
             self.out_l.resize(num_samples, 0.0);
             self.out_r.resize(num_samples, 0.0);
         }
+        if self.silent_input.len() < num_samples {
+            self.silent_input.resize(num_samples, 0.0);
+        }
 
+        self.silent_input[..num_samples].fill(0.0);
         self.out_l[..num_samples].fill(0.0);
         self.out_r[..num_samples].fill(0.0);
 
@@ -586,6 +601,10 @@ impl Lv2Track {
                 if let Some(p) = self.notify_port {
                     inst.instance_mut().connect_port_mut(p, &mut *self.notify_buf as *mut AtomSequenceBuffer);
                 }
+                // Connect all audio input ports to silent buffers for instrument mode
+                for &in_port in &self.audio_ins {
+                    inst.instance_mut().connect_port_mut(in_port, self.silent_input.as_mut_ptr());
+                }
                 inst.instance_mut().connect_port_mut(self.out_l_port, self.out_l.as_mut_ptr());
                 inst.instance_mut().connect_port_mut(self.out_r_port, self.out_r.as_mut_ptr());
 
@@ -604,5 +623,73 @@ impl Lv2Track {
             scratch_l[i] += self.out_l[i];
             scratch_r[i] += self.out_r[i];
         }
+    }
+
+    /// Process a block of audio as an insert effect: transforms in_l and in_r in-place.
+    pub fn process_effect_block(&mut self, buf_l: &mut [f32], buf_r: &mut [f32]) {
+        let num_samples = buf_l.len().min(buf_r.len());
+        if self.in_l.len() < num_samples {
+            self.in_l.resize(num_samples, 0.0);
+            self.in_r.resize(num_samples, 0.0);
+        }
+        if self.out_l.len() < num_samples {
+            self.out_l.resize(num_samples, 0.0);
+            self.out_r.resize(num_samples, 0.0);
+        }
+        if self.silent_input.len() < num_samples {
+            self.silent_input.resize(num_samples, 0.0);
+        }
+
+        self.in_l[..num_samples].copy_from_slice(&buf_l[..num_samples]);
+        self.in_r[..num_samples].copy_from_slice(&buf_r[..num_samples]);
+        self.silent_input[..num_samples].fill(0.0);
+        self.out_l[..num_samples].fill(0.0);
+        self.out_r[..num_samples].fill(0.0);
+
+        self.atom_buf.atom_size = 8;
+        self.atom_buf.atom_type = self.seq_urid;
+        self.atom_buf.unit = 0;
+        self.atom_buf.pad = 0;
+
+        self.notify_buf.atom_size = 1032;
+        self.notify_buf.atom_type = self.seq_urid;
+        self.notify_buf.unit = 0;
+        self.notify_buf.pad = 0;
+
+        if let Ok(mut inst) = self.instance.lock() {
+            unsafe {
+                if let Some(p) = self.midi_port {
+                    inst.instance_mut().connect_port_mut(p, &mut *self.atom_buf as *mut AtomSequenceBuffer);
+                }
+                if let Some(p) = self.notify_port {
+                    inst.instance_mut().connect_port_mut(p, &mut *self.notify_buf as *mut AtomSequenceBuffer);
+                }
+
+                // Connect audio inputs: port 0 = left in, port 1 = right in, others = silent (e.g. sidechain)
+                for (idx, &in_port) in self.audio_ins.iter().enumerate() {
+                    let ptr = match idx {
+                        0 => self.in_l.as_mut_ptr(),
+                        1 => self.in_r.as_mut_ptr(),
+                        _ => self.silent_input.as_mut_ptr(),
+                    };
+                    inst.instance_mut().connect_port_mut(in_port, ptr);
+                }
+
+                inst.instance_mut().connect_port_mut(self.out_l_port, self.out_l.as_mut_ptr());
+                inst.instance_mut().connect_port_mut(self.out_r_port, self.out_r.as_mut_ptr());
+
+                // Connect control ports to live values
+                if let Ok(mut ports) = self.control_ports.lock() {
+                    for port in ports.iter_mut() {
+                        inst.instance_mut().connect_port_mut(port.index, &mut port.value as *mut f32);
+                    }
+                }
+
+                inst.run(num_samples);
+            }
+        }
+
+        buf_l[..num_samples].copy_from_slice(&self.out_l[..num_samples]);
+        buf_r[..num_samples].copy_from_slice(&self.out_r[..num_samples]);
     }
 }

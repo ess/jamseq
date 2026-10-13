@@ -705,7 +705,7 @@ impl Track {
                         clap.process_effect_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
                     }
                     InsertEffect::Lv2 { track: lv2, .. } => {
-                        lv2.process_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
+                        lv2.process_effect_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);
                     }
                     InsertEffect::Vst3 { track: vst3, .. } => {
                         vst3.process_effect_block(&mut scratch_left[..num_samples], &mut scratch_right[..num_samples]);

@@ -1776,3 +1776,21 @@ fn test_surge_xt_effects_enum_type() {
         "Setting FX Type to 0.05 should update display_value to Reverb, got: {:?}", updated_fx_type.display_value);
 }
 
+#[test]
+fn test_surge_xt_effects_lv2_master_insert() {
+    let surge_lv2 = std::path::Path::new("/usr/lib/lv2/Surge XT Effects.lv2");
+    if !surge_lv2.exists() {
+        return;
+    }
+
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    let uri = "https://surge-synth-team.org//plugins/Surge_XT_Effects";
+    let added = host.add_master_insert(uri, "Surge XT Effects (LV2)");
+    assert!(added, "Must be able to add Surge XT Effects LV2 as master insert");
+
+    // Render a block to trigger audio processing through master inserts
+    let mut left = vec![0.0f32; 512];
+    let mut right = vec![0.0f32; 512];
+    host.process_block(&mut left, &mut right);
+}
+
