@@ -254,7 +254,7 @@ fn build_white_flame_demo_host() -> Result<JamSeqHost> {
         bpm: 68.0,
         total_bars: 4,
         loop_enabled: true,
-        sections: vec![jamseq::SongSection::new("verse_1", "Verse 1", 1, 4, 3)],
+        sections: vec![jamseq::SongSection::new("verse_1", "Verse 1", 1, 4)],
         events,
     };
 

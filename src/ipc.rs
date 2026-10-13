@@ -247,7 +247,6 @@ pub enum IpcCommand {
         name: String,
         start_tick: u64,
         length_ticks: u64,
-        energy: u8,
     },
     /// Remove a song section by id
     RemoveSection {
@@ -772,8 +771,8 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             h.rescan_plugins();
             build_status_response(&h)
         }
-        IpcCommand::AddSection { id, name, start_tick, length_ticks, energy } => {
-            let section = crate::timeline::SongSection::from_ticks(&id, &name, start_tick, length_ticks, energy);
+        IpcCommand::AddSection { id, name, start_tick, length_ticks } => {
+            let section = crate::timeline::SongSection::from_ticks(&id, &name, start_tick, length_ticks);
             h.add_section(section);
             build_status_response(&h)
         }

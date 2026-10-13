@@ -167,7 +167,6 @@ impl TrackBlock {
 pub struct SongSection {
     pub id: String,
     pub name: String,
-    pub energy: u8,
     #[serde(default)]
     pub time_signature: TimeSignature,
     #[serde(default)]
@@ -187,7 +186,7 @@ pub struct SongSection {
 }
 
 impl SongSection {
-    pub fn new(id: &str, name: &str, start_bar: u32, bars: u32, energy: u8) -> Self {
+    pub fn new(id: &str, name: &str, start_bar: u32, bars: u32) -> Self {
         let ts = TimeSignature::default();
         let tpb = ts.ticks_per_bar();
         let start_tick = if start_bar > 0 { (start_bar as u64 - 1) * tpb } else { 0 };
@@ -195,7 +194,6 @@ impl SongSection {
         Self {
             id: id.to_string(),
             name: name.to_string(),
-            energy,
             time_signature: ts,
             tempo: None,
             track_blocks: HashMap::new(),
@@ -206,11 +204,10 @@ impl SongSection {
         }
     }
 
-    pub fn new_empty(id: &str, name: &str, energy: u8) -> Self {
+    pub fn new_empty(id: &str, name: &str) -> Self {
         Self {
             id: id.to_string(),
             name: name.to_string(),
-            energy,
             time_signature: TimeSignature::default(),
             tempo: None,
             track_blocks: HashMap::new(),
@@ -221,7 +218,7 @@ impl SongSection {
         }
     }
 
-    pub fn from_ticks(id: &str, name: &str, start_tick: u64, length_ticks: u64, energy: u8) -> Self {
+    pub fn from_ticks(id: &str, name: &str, start_tick: u64, length_ticks: u64) -> Self {
         let ts = TimeSignature::default();
         let tpb = ts.ticks_per_bar().max(1);
         let start_bar = (start_tick / tpb) as u32 + 1;
@@ -229,7 +226,6 @@ impl SongSection {
         Self {
             id: id.to_string(),
             name: name.to_string(),
-            energy,
             time_signature: ts,
             tempo: None,
             track_blocks: HashMap::new(),

@@ -89,7 +89,7 @@ fn test_offline_render_to_wav() {
         bpm: 68.0,
         total_bars: 1,
         loop_enabled: false,
-        sections: vec![jamseq::SongSection::new("test_verse", "Test Verse", 1, 1, 2)],
+        sections: vec![jamseq::SongSection::new("test_verse", "Test Verse", 1, 1)],
         events,
     };
 
@@ -205,7 +205,7 @@ fn test_ipc_socket_server() {
     // 4. Send AddSection and ReplaceSectionEvents (Section-scoped edit)
     writeln!(
         stream,
-        "{{\"cmd\":\"AddSection\",\"args\":{{\"id\":\"intro\",\"name\":\"Intro\",\"start_tick\":0,\"length_ticks\":7680,\"energy\":2}}}}"
+        "{{\"cmd\":\"AddSection\",\"args\":{{\"id\":\"intro\",\"name\":\"Intro\",\"start_tick\":0,\"length_ticks\":7680}}}}"
     ).unwrap();
     resp_line.clear();
     reader.read_line(&mut resp_line).unwrap();
@@ -796,7 +796,7 @@ fn test_debug_playback_demo() {
         bpm: 68.0,
         total_bars: 4,
         loop_enabled: true,
-        sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4, 1)],
+        sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4)],
         events,
     };
     host.load_arrangement(arr);
@@ -864,7 +864,7 @@ fn test_server_playback_over_ipc() {
         bpm: 68.0,
         total_bars: 4,
         loop_enabled: true,
-        sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4, 1)],
+        sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4)],
         events,
     };
     host.load_arrangement(arr);
@@ -1006,7 +1006,7 @@ fn test_blank_slate_and_section_management() {
     assert_eq!(host.timeline.title, "Untitled");
 
     // Add a sub-bar section (e.g. 2-beat pickup = 960 ticks)
-    let pickup = jamseq::timeline::SongSection::from_ticks("pickup", "Pickup", 0, 960, 2);
+    let pickup = jamseq::timeline::SongSection::from_ticks("pickup", "Pickup", 0, 960);
     assert_eq!(pickup.start_tick(), 0);
     assert_eq!(pickup.length_ticks(), 960);
     assert_eq!(pickup.end_tick(), 960);
@@ -1015,19 +1015,19 @@ fn test_blank_slate_and_section_management() {
     assert_eq!(host.timeline.sections.len(), 1);
 
     // Add a 4-bar section starting at 960 ticks (4 bars * 1920 ticks = 7680 ticks)
-    let verse = jamseq::timeline::SongSection::from_ticks("verse", "Verse 1", 960, 7680, 3);
+    let verse = jamseq::timeline::SongSection::from_ticks("verse", "Verse 1", 960, 7680);
     host.add_section(verse);
     assert_eq!(host.timeline.sections.len(), 2);
     // Derived total_ticks is the sum of pickup (960) and verse (7680) = 8640 ticks!
     assert_eq!(host.timeline.total_ticks, 8640);
 
     // Add an outro section of length 5000
-    let outro = jamseq::timeline::SongSection::from_ticks("outro", "Outro", 8640, 5000, 1);
+    let outro = jamseq::timeline::SongSection::from_ticks("outro", "Outro", 8640, 5000);
     host.add_section(outro);
     assert_eq!(host.timeline.total_ticks, 8640 + 5000);
 
     // Test bar/beat normalization
-    let mut custom = jamseq::timeline::SongSection::from_ticks("custom", "Bridge", 123, 456, 4);
+    let mut custom = jamseq::timeline::SongSection::from_ticks("custom", "Bridge", 123, 456);
     custom.normalize_to_beat();
     assert_eq!(custom.start_tick() % jamseq::timeline::PPQ, 0);
     assert_eq!(custom.length_ticks() % jamseq::timeline::PPQ, 0);
@@ -1061,7 +1061,7 @@ fn test_block_hierarchy_and_tempo_inheritance() {
     use jamseq::timeline::{SongSection, TrackBlock, TempoOverride};
 
     // 1. An empty section has length 0 and no stored length
-    let mut sec = SongSection::new_empty("v1", "Verse 1", 5);
+    let mut sec = SongSection::new_empty("v1", "Verse 1");
     assert_eq!(sec.length_ticks(), 0);
 
     // 2. Add a 4-bar drum beat (start offset 0, length 3840 ticks)
@@ -1107,21 +1107,21 @@ fn test_block_hierarchy_and_tempo_inheritance() {
     assert_eq!(timeline.total_ticks, 0);
 
     // Section 1: Intro (8 bars = 7680 ticks via synth)
-    let mut intro = SongSection::new_empty("intro", "Intro", 2);
+    let mut intro = SongSection::new_empty("intro", "Intro");
     intro.set_block(TrackBlock::new("b1", "synth", 7680));
     timeline.add_section(intro);
     assert_eq!(timeline.section_start_tick(0), 0);
     assert_eq!(timeline.total_ticks, 7680);
 
     // Section 2: Verse 1 (4 bars = 3840 ticks via drums)
-    let mut verse = SongSection::new_empty("verse", "Verse", 4);
+    let mut verse = SongSection::new_empty("verse", "Verse");
     verse.set_block(TrackBlock::new("b2", "drums", 3840));
     timeline.add_section(verse);
     assert_eq!(timeline.section_start_tick(1), 7680);
     assert_eq!(timeline.total_ticks, 7680 + 3840);
 
     // Section 3: Chorus 1 (8 bars = 7680 ticks)
-    let mut chorus = SongSection::new_empty("chorus", "Chorus", 8);
+    let mut chorus = SongSection::new_empty("chorus", "Chorus");
     chorus.set_block(TrackBlock::new("b3", "full", 7680));
     timeline.add_section(chorus);
     assert_eq!(timeline.section_start_tick(2), 7680 + 3840);
@@ -1142,7 +1142,7 @@ fn test_polytempo_block_playback_and_loop_modes() {
     let mut timeline = jamseq::Timeline::new(120.0, 48000.0);
 
     // Section A (starts at 0)
-    let mut sec_a = SongSection::new_empty("sec_a", "Section A", 4);
+    let mut sec_a = SongSection::new_empty("sec_a", "Section A");
 
     // Track 1: Synth (standard 120 BPM, repeats 2 times via FixedLoops)
     let mut synth_block = TrackBlock::new("tb_synth", "synth", 1920)
@@ -1222,7 +1222,7 @@ fn test_polytempo_block_playback_and_loop_modes() {
     engine.load_patch(JamSynthPatch::preset_reese_bass());
     host.add_track(Track::new_synth("poly_bass", "Poly Bass", engine));
 
-    let mut bass_sec = SongSection::new_empty("b_sec", "Bass Section", 2);
+    let mut bass_sec = SongSection::new_empty("b_sec", "Bass Section");
     let mut bass_block = TrackBlock::new("tb_bass", "poly_bass", 1920)
         .with_tempo(TempoOverride::Ratio(3, 2))
         .with_loop_mode(LoopMode::OneShot);
@@ -1295,14 +1295,14 @@ fn test_stem_cache_manager_and_granular_block_stems() {
     host.add_track(Track::new_synth("sub808", "Sub 808", bass));
 
     // Section 1: Intro (1 bar = 3840 ticks)
-    let mut sec_intro = SongSection::new_empty("sec_intro", "Intro", 1);
+    let mut sec_intro = SongSection::new_empty("sec_intro", "Intro");
     let mut b_intro = TrackBlock::new("tb_intro", "sub808", 3840);
     b_intro.add_note(10, 11, 0, 960, 36, 1.0);
     sec_intro.set_block(b_intro);
     host.add_section(sec_intro);
 
     // Section 2: Verse (1 bar = 3840 ticks)
-    let mut sec_verse = SongSection::new_empty("sec_verse", "Verse", 3);
+    let mut sec_verse = SongSection::new_empty("sec_verse", "Verse");
     let mut b_verse = TrackBlock::new("tb_verse", "sub808", 3840);
     b_verse.add_note(20, 21, 0, 960, 38, 1.0);
     sec_verse.set_block(b_verse);
