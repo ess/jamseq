@@ -87,6 +87,7 @@ fn test_offline_render_to_wav() {
     let arrangement = TimelineArrangement {
         title: "Test Render".into(),
         bpm: 68.0,
+        time_signature: jamseq::timeline::TimeSignature::default(),
         total_bars: 1,
         loop_enabled: false,
         tracks: Vec::new(),
@@ -797,6 +798,7 @@ fn test_debug_playback_demo() {
     let arr = jamseq::timeline::TimelineArrangement {
         title: "Test".to_string(),
         bpm: 68.0,
+        time_signature: jamseq::timeline::TimeSignature::default(),
         total_bars: 4,
         loop_enabled: true,
         tracks: Vec::new(),
@@ -868,6 +870,7 @@ fn test_server_playback_over_ipc() {
     let arr = jamseq::timeline::TimelineArrangement {
         title: "Test".to_string(),
         bpm: 68.0,
+        time_signature: jamseq::timeline::TimeSignature::default(),
         total_bars: 4,
         loop_enabled: true,
         tracks: Vec::new(),
@@ -1042,7 +1045,7 @@ fn test_blank_slate_and_section_management() {
     assert_eq!(custom.length_ticks() % jamseq::timeline::PPQ, 0);
 
     custom.normalize_to_bar();
-    let tpb = custom.time_signature.ticks_per_bar();
+    let tpb = custom.ticks_per_bar();
     assert_eq!(custom.start_tick() % tpb, 0);
     assert_eq!(custom.length_ticks() % tpb, 0);
 
@@ -1510,11 +1513,100 @@ fn test_project_track_persistence_and_auto_discovery() {
     let _ = fs::remove_file(&saved_file);
 }
 
+#[test]
+fn test_cascading_meter_and_polymeter_hierarchy() {
+    use jamseq::timeline::{SongSection, TimeSignature, TrackBlock, PPQ};
 
+    let mut host = JamSeqHost::new(120.0, 44100.0);
+    let synth1 = jamsynth::JamSynthEngine::new(44100.0);
+    let synth2 = jamsynth::JamSynthEngine::new(44100.0);
+    host.add_track(Track::new_synth("track_1", "Track 1", synth1));
+    host.add_track(Track::new_synth("track_2", "Track 2", synth2));
 
+    // 1. Initial State: Default Project Meter is 4/4
+    assert_eq!(host.timeline.time_signature, TimeSignature { numerator: 4, denominator: 4 });
+    assert_eq!(host.timeline.time_signature.ticks_per_bar(), 4 * PPQ);
+    assert_eq!(host.timeline.time_signature.ticks_per_beat(), PPQ);
 
+    // 2. Set Project Meter to 3/4
+    host.set_project_time_signature(TimeSignature::new(3, 4));
+    assert_eq!(host.timeline.time_signature, TimeSignature { numerator: 3, denominator: 4 });
+    assert_eq!(host.timeline.time_signature.ticks_per_bar(), 3 * PPQ);
+    assert_eq!(host.timeline.time_signature.ticks_per_beat(), PPQ);
 
+    // 3. Section 1: Inherits project meter (time_signature = None)
+    let sec1 = SongSection::from_ticks("sec_1", "Intro", 0, 3 * PPQ * 2); // 2 bars of 3/4
+    assert_eq!(sec1.time_signature, None);
+    assert_eq!(host.timeline.get_section_effective_time_signature(&sec1), TimeSignature { numerator: 3, denominator: 4 });
 
+    // TrackBlock on track_1 inheriting Section 1 (which inherits Project 3/4)
+    let blk1 = TrackBlock::new("blk_1", "track_1", 3 * PPQ * 2);
+    assert_eq!(blk1.time_signature, None);
+    assert_eq!(host.timeline.get_block_effective_time_signature(&sec1, "track_1"), TimeSignature { numerator: 3, denominator: 4 });
 
+    host.add_section(sec1.with_block(blk1));
 
+    // 4. Section 2: Overrides meter to 6/8
+    let sec2 = SongSection::from_ticks("sec_2", "Verse", 3 * PPQ * 2, 2880 * 2)
+        .with_time_signature(TimeSignature::new(6, 8));
+    assert_eq!(sec2.time_signature, Some(TimeSignature { numerator: 6, denominator: 8 }));
+    assert_eq!(host.timeline.get_section_effective_time_signature(&sec2), TimeSignature { numerator: 6, denominator: 8 });
+    assert_eq!(sec2.ticks_per_bar(), (6 * PPQ * 4) / 8); // 2880 ticks per bar
+    assert_eq!(sec2.time_signature().ticks_per_beat(), (PPQ * 4) / 8); // 480 ticks per beat
 
+    // Block on Track 1 inherits Section 2 (6/8)
+    let blk2_t1 = TrackBlock::new("blk_2_t1", "track_1", 2880 * 2);
+    assert_eq!(blk2_t1.time_signature, None);
+    assert_eq!(host.timeline.get_block_effective_time_signature(&sec2, "track_1"), TimeSignature { numerator: 6, denominator: 8 });
+
+    // Block on Track 2 defines a TRUE POLYMETER OVERRIDE: 5/4 against the 6/8 section!
+    let blk2_t2 = TrackBlock::new("blk_2_t2", "track_2", 4800)
+        .with_time_signature(TimeSignature::new(5, 4));
+    assert_eq!(blk2_t2.time_signature, Some(TimeSignature { numerator: 5, denominator: 4 }));
+    assert_eq!(blk2_t2.effective_time_signature(sec2.time_signature()), TimeSignature { numerator: 5, denominator: 4 });
+    assert_eq!(blk2_t2.time_signature.unwrap().ticks_per_bar(), 5 * PPQ); // 4800 ticks per bar
+    assert_eq!(blk2_t2.time_signature.unwrap().ticks_per_beat(), PPQ); // 960 ticks per beat
+
+    let sec2 = sec2.with_block(blk2_t1).with_block(blk2_t2);
+    host.add_section(sec2);
+
+    // 5. Query effective meter at different timeline positions
+    // In Section 1 (tick 100): Project 3/4
+    assert_eq!(host.timeline.get_time_signature_at_tick(100), TimeSignature { numerator: 3, denominator: 4 });
+    assert_eq!(host.timeline.get_track_effective_time_signature("track_1", 100), TimeSignature { numerator: 3, denominator: 4 });
+    assert_eq!(host.timeline.get_track_effective_time_signature("track_2", 100), TimeSignature { numerator: 3, denominator: 4 });
+
+    // In Section 2 (tick 7000): Track 1 is 6/8, Track 2 is polymetric 5/4!
+    let sec2_start = host.timeline.sections[0].length_ticks();
+    assert_eq!(host.timeline.get_time_signature_at_tick(sec2_start + 100), TimeSignature { numerator: 6, denominator: 8 });
+    assert_eq!(host.timeline.get_track_effective_time_signature("track_1", sec2_start + 100), TimeSignature { numerator: 6, denominator: 8 });
+    assert_eq!(host.timeline.get_track_effective_time_signature("track_2", sec2_start + 100), TimeSignature { numerator: 5, denominator: 4 });
+
+    // 6. Test serialization & persistence to file (.jam.json)
+    let temp_dir = std::env::temp_dir();
+    let meter_project_path = temp_dir.join("test_cascading_meter.jam.json");
+    host.save_project_to_file(&meter_project_path).expect("Failed to save project with meter");
+
+    // Inspect serialized JSON
+    let content = std::fs::read_to_string(&meter_project_path).expect("Failed to read file");
+    assert!(content.contains("\"numerator\": 3"), "Serialized arrangement must contain project numerator 3");
+    assert!(content.contains("\"numerator\": 6"), "Serialized arrangement must contain section numerator 6");
+    assert!(content.contains("\"numerator\": 5"), "Serialized arrangement must contain polymeter block numerator 5");
+
+    // 7. Reload into a fresh host
+    let mut reload_host = JamSeqHost::new(140.0, 44100.0);
+    reload_host.load_project_from_file(&meter_project_path).expect("Failed to reload project");
+
+    assert_eq!(reload_host.timeline.time_signature, TimeSignature { numerator: 3, denominator: 4 });
+    assert_eq!(reload_host.timeline.sections.len(), 2);
+    assert_eq!(reload_host.timeline.sections[0].time_signature, None); // Section 1 inherits 3/4
+    assert_eq!(reload_host.timeline.sections[1].time_signature, Some(TimeSignature { numerator: 6, denominator: 8 })); // Section 2 is 6/8
+
+    let reloaded_sec2 = &reload_host.timeline.sections[1];
+    let reloaded_t1_block = reloaded_sec2.track_blocks.get("track_1").unwrap();
+    let reloaded_t2_block = reloaded_sec2.track_blocks.get("track_2").unwrap();
+    assert_eq!(reloaded_t1_block.time_signature, None); // Inherits 6/8
+    assert_eq!(reloaded_t2_block.time_signature, Some(TimeSignature { numerator: 5, denominator: 4 })); // Polymeter 5/4 preserved!
+
+    let _ = std::fs::remove_file(&meter_project_path);
+}

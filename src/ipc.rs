@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::timeline::{ScheduledEvent, SongSection, TempoOverride, TrackBlock};
+use crate::timeline::{ScheduledEvent, SongSection, TempoOverride, TimeSignature, TrackBlock};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", content = "args")]
@@ -277,6 +277,22 @@ pub enum IpcCommand {
         track_id: String,
         tempo: Option<TempoOverride>,
     },
+    /// Set master project time signature
+    SetProjectTimeSignature {
+        numerator: u32,
+        denominator: u32,
+    },
+    /// Set a section's time signature override (None to inherit project meter)
+    SetSectionTimeSignature {
+        section_id: String,
+        time_signature: Option<TimeSignature>,
+    },
+    /// Set a track block's time signature override for polymeter (None to inherit section meter)
+    SetBlockTimeSignature {
+        section_id: String,
+        track_id: String,
+        time_signature: Option<TimeSignature>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -340,6 +356,8 @@ pub struct TrackStatus {
     pub current_plugin: Option<String>,
     #[serde(default)]
     pub current_bpm: f64,
+    #[serde(default)]
+    pub current_time_signature: TimeSignature,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -351,6 +369,8 @@ pub struct IpcStatusResponse {
     pub current_sample: u64,
     pub total_ticks: u64,
     pub bpm: f64,
+    #[serde(default)]
+    pub time_signature: TimeSignature,
     pub master_volume: f32,
     pub master_peak: f32,
     pub master_inserts: Vec<TrackInsertStatus>,
@@ -800,6 +820,18 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
             let _ = h.set_block_tempo(&section_id, &track_id, tempo);
             build_status_response(&h)
         }
+        IpcCommand::SetProjectTimeSignature { numerator, denominator } => {
+            h.set_project_time_signature(TimeSignature::new(numerator, denominator));
+            build_status_response(&h)
+        }
+        IpcCommand::SetSectionTimeSignature { section_id, time_signature } => {
+            let _ = h.set_section_time_signature(&section_id, time_signature);
+            build_status_response(&h)
+        }
+        IpcCommand::SetBlockTimeSignature { section_id, track_id, time_signature } => {
+            let _ = h.set_block_time_signature(&section_id, &track_id, time_signature);
+            build_status_response(&h)
+        }
         IpcCommand::GetStatus => build_status_response(&h),
     }
 }
@@ -850,6 +882,8 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 })
                 .collect();
 
+            let cur_ts = h.timeline.get_track_effective_time_signature(&t.id, h.timeline.current_tick);
+
             TrackStatus {
                 id: t.id.clone(),
                 name: t.name.clone(),
@@ -867,6 +901,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 sidechains,
                 current_plugin: t.current_plugin.clone(),
                 current_bpm: t.current_bpm,
+                current_time_signature: cur_ts,
             }
         })
         .collect();
@@ -926,6 +961,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
         current_sample: h.timeline.current_sample,
         total_ticks: h.timeline.total_ticks,
         bpm: h.timeline.bpm,
+        time_signature: h.timeline.time_signature,
         master_volume: h.master_gain,
         master_peak: h.master_peak,
         master_inserts,

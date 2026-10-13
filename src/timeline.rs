@@ -36,9 +36,20 @@ impl Default for TimeSignature {
 }
 
 impl TimeSignature {
+    pub fn new(numerator: u32, denominator: u32) -> Self {
+        Self {
+            numerator: numerator.max(1),
+            denominator: denominator.max(1),
+        }
+    }
+
     pub fn ticks_per_bar(&self) -> u64 {
         // numerator beats per bar, each beat is PPQ * 4 / denominator
-        (self.numerator as u64 * PPQ * 4) / self.denominator as u64
+        (self.numerator as u64 * PPQ * 4) / self.denominator.max(1) as u64
+    }
+
+    pub fn ticks_per_beat(&self) -> u64 {
+        (PPQ * 4) / self.denominator.max(1) as u64
     }
 }
 
@@ -92,6 +103,8 @@ pub struct TrackBlock {
     #[serde(default)]
     pub tempo: Option<TempoOverride>,
     #[serde(default)]
+    pub time_signature: Option<TimeSignature>,
+    #[serde(default)]
     pub events: Vec<ScheduledEvent>,
     #[serde(default)]
     pub audio_file: Option<String>,
@@ -106,6 +119,7 @@ impl TrackBlock {
             base_length_ticks: length_ticks,
             loop_mode: LoopMode::OneShot,
             tempo: None,
+            time_signature: None,
             events: Vec::new(),
             audio_file: None,
         }
@@ -121,6 +135,11 @@ impl TrackBlock {
         self
     }
 
+    pub fn with_time_signature(mut self, ts: TimeSignature) -> Self {
+        self.time_signature = Some(ts);
+        self
+    }
+
     pub fn with_loop_mode(mut self, loop_mode: LoopMode) -> Self {
         self.loop_mode = loop_mode;
         self
@@ -131,6 +150,10 @@ impl TrackBlock {
             Some(t) => t.compute(section_bpm),
             None => section_bpm,
         }
+    }
+
+    pub fn effective_time_signature(&self, section_ts: TimeSignature) -> TimeSignature {
+        self.time_signature.unwrap_or(section_ts)
     }
 
     pub fn effective_length_ticks(&self) -> u64 {
@@ -168,7 +191,7 @@ pub struct SongSection {
     pub id: String,
     pub name: String,
     #[serde(default)]
-    pub time_signature: TimeSignature,
+    pub time_signature: Option<TimeSignature>,
     #[serde(default)]
     pub tempo: Option<TempoOverride>,
     #[serde(default)]
@@ -194,7 +217,7 @@ impl SongSection {
         Self {
             id: id.to_string(),
             name: name.to_string(),
-            time_signature: ts,
+            time_signature: None,
             tempo: None,
             track_blocks: HashMap::new(),
             start_tick,
@@ -208,7 +231,7 @@ impl SongSection {
         Self {
             id: id.to_string(),
             name: name.to_string(),
-            time_signature: TimeSignature::default(),
+            time_signature: None,
             tempo: None,
             track_blocks: HashMap::new(),
             start_tick: 0,
@@ -226,7 +249,7 @@ impl SongSection {
         Self {
             id: id.to_string(),
             name: name.to_string(),
-            time_signature: ts,
+            time_signature: None,
             tempo: None,
             track_blocks: HashMap::new(),
             start_tick,
@@ -239,6 +262,23 @@ impl SongSection {
     pub fn with_tempo(mut self, tempo: TempoOverride) -> Self {
         self.tempo = Some(tempo);
         self
+    }
+
+    pub fn with_time_signature(mut self, ts: TimeSignature) -> Self {
+        self.time_signature = Some(ts);
+        self
+    }
+
+    pub fn time_signature(&self) -> TimeSignature {
+        self.time_signature.unwrap_or_default()
+    }
+
+    pub fn effective_time_signature(&self, project_ts: TimeSignature) -> TimeSignature {
+        self.time_signature.unwrap_or(project_ts)
+    }
+
+    pub fn ticks_per_bar(&self) -> u64 {
+        self.time_signature().ticks_per_bar()
     }
 
     pub fn with_block(mut self, block: TrackBlock) -> Self {
@@ -265,7 +305,7 @@ impl SongSection {
         if self.start_tick > 0 || self.length_ticks > 0 {
             self.start_tick
         } else if self.start_bar > 0 {
-            (self.start_bar as u64 - 1) * self.time_signature.ticks_per_bar()
+            (self.start_bar as u64 - 1) * self.ticks_per_bar()
         } else {
             0
         }
@@ -283,7 +323,7 @@ impl SongSection {
         } else if self.length_ticks > 0 {
             self.length_ticks
         } else if self.bars > 0 {
-            self.bars as u64 * self.time_signature.ticks_per_bar()
+            self.bars as u64 * self.ticks_per_bar()
         } else {
             0
         }
@@ -295,11 +335,23 @@ impl SongSection {
 
     /// Calculate (1-indexed bar, 1-indexed beat within bar)
     pub fn start_bar_beat(&self) -> (u32, f32) {
-        let tpb = self.time_signature.ticks_per_bar().max(1);
+        let ts = self.time_signature();
+        let tpb = ts.ticks_per_bar().max(1);
         let ticks = self.start_tick();
         let bar = (ticks / tpb) as u32 + 1;
         let rem_ticks = ticks % tpb;
-        let ticks_per_beat = (PPQ * 4) / self.time_signature.denominator as u64;
+        let ticks_per_beat = ts.ticks_per_beat().max(1);
+        let beat = (rem_ticks as f32 / ticks_per_beat as f32) + 1.0;
+        (bar, beat)
+    }
+
+    pub fn start_bar_beat_with_project_ts(&self, project_ts: TimeSignature) -> (u32, f32) {
+        let ts = self.effective_time_signature(project_ts);
+        let tpb = ts.ticks_per_bar().max(1);
+        let ticks = self.start_tick();
+        let bar = (ticks / tpb) as u32 + 1;
+        let rem_ticks = ticks % tpb;
+        let ticks_per_beat = ts.ticks_per_beat().max(1);
         let beat = (rem_ticks as f32 / ticks_per_beat as f32) + 1.0;
         (bar, beat)
     }
@@ -315,7 +367,7 @@ impl SongSection {
 
     /// Snap boundaries to full bar
     pub fn normalize_to_bar(&mut self) {
-        let tpb = self.time_signature.ticks_per_bar().max(1);
+        let tpb = self.ticks_per_bar().max(1);
         self.start_tick = ((self.start_tick() + tpb / 2) / tpb) * tpb;
         let len = self.length_ticks();
         self.length_ticks = (((len + tpb / 2) / tpb).max(1)) * tpb;
@@ -323,7 +375,7 @@ impl SongSection {
     }
 
     fn recompute_bars(&mut self) {
-        let tpb = self.time_signature.ticks_per_bar().max(1);
+        let tpb = self.ticks_per_bar().max(1);
         let len = self.length_ticks();
         self.start_bar = (self.start_tick / tpb) as u32 + 1;
         self.bars = (len as f64 / tpb as f64).ceil() as u32;
@@ -440,6 +492,8 @@ fn default_volume() -> f32 {
 pub struct TimelineArrangement {
     pub title: String,
     pub bpm: f64,
+    #[serde(default)]
+    pub time_signature: TimeSignature,
     pub total_bars: u32,
     pub loop_enabled: bool,
     #[serde(default)]
@@ -457,6 +511,7 @@ impl Default for TimelineArrangement {
         Self {
             title: "Untitled".to_string(),
             bpm: 120.0,
+            time_signature: TimeSignature::default(),
             total_bars: 0,
             loop_enabled: true,
             tracks: Vec::new(),
@@ -548,6 +603,7 @@ impl TrackPlaybackCursor {
 pub struct Timeline {
     pub title: String,
     pub bpm: f64,
+    pub time_signature: TimeSignature,
     pub sample_rate: f64,
     pub current_sample: u64,
     pub current_tick: u64,
@@ -570,6 +626,7 @@ impl Timeline {
         let mut t = Self {
             title: "Untitled".to_string(),
             bpm: if bpm > 10.0 { bpm } else { 120.0 },
+            time_signature: TimeSignature::default(),
             sample_rate: if sample_rate > 0.0 { sample_rate } else { 44100.0 },
             current_sample: 0,
             current_tick: 0,
@@ -604,6 +661,7 @@ impl Timeline {
     pub fn load_arrangement(&mut self, arrangement: TimelineArrangement) {
         self.title = arrangement.title;
         self.bpm = arrangement.bpm;
+        self.time_signature = arrangement.time_signature;
         self.sections = arrangement.sections;
         let computed = self.computed_total_ticks();
         self.total_ticks = if computed > 0 {
@@ -628,7 +686,7 @@ impl Timeline {
                 let sec_len = if sec.length_ticks > 0 {
                     sec.length_ticks
                 } else if sec.bars > 0 {
-                    sec.bars as u64 * sec.time_signature.ticks_per_bar()
+                    sec.bars as u64 * sec.ticks_per_bar()
                 } else if sec.length_ticks() > 0 {
                     sec.length_ticks()
                 } else {
@@ -688,6 +746,7 @@ impl Timeline {
         TimelineArrangement {
             title: self.title.clone(),
             bpm: self.bpm,
+            time_signature: self.time_signature,
             total_bars,
             loop_enabled: self.loop_enabled,
             tracks: Vec::new(),
@@ -955,6 +1014,68 @@ impl Timeline {
             }
         }
         false
+    }
+
+    /// Set master project time signature
+    pub fn set_project_time_signature(&mut self, ts: TimeSignature) {
+        self.time_signature = ts;
+        self.refresh_boundaries();
+    }
+
+    /// Set time signature override on a section (None to inherit project meter)
+    pub fn set_section_time_signature(&mut self, section_id: &str, ts: Option<TimeSignature>) -> bool {
+        if let Some(sec) = self.sections.iter_mut().find(|s| s.id == section_id) {
+            sec.time_signature = ts;
+            self.rebuild_active_events();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Set time signature override on a track block for polymeter (None to inherit section meter)
+    pub fn set_block_time_signature(&mut self, section_id: &str, track_id: &str, ts: Option<TimeSignature>) -> bool {
+        if let Some(sec) = self.sections.iter_mut().find(|s| s.id == section_id) {
+            if let Some(block) = sec.track_blocks.get_mut(track_id) {
+                block.time_signature = ts;
+                self.rebuild_active_events();
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Get effective time signature for a given section
+    pub fn get_section_effective_time_signature(&self, section: &SongSection) -> TimeSignature {
+        section.effective_time_signature(self.time_signature)
+    }
+
+    /// Get effective time signature for a specific track block in a section
+    pub fn get_block_effective_time_signature(&self, section: &SongSection, track_id: &str) -> TimeSignature {
+        let sec_ts = self.get_section_effective_time_signature(section);
+        if let Some(block) = section.track_blocks.get(track_id) {
+            block.effective_time_signature(sec_ts)
+        } else {
+            sec_ts
+        }
+    }
+
+    /// Get effective time signature at a given tick
+    pub fn get_time_signature_at_tick(&self, tick: u64) -> TimeSignature {
+        if let Some(sec) = self.get_section_at_tick(tick) {
+            self.get_section_effective_time_signature(sec)
+        } else {
+            self.time_signature
+        }
+    }
+
+    /// Get effective time signature for a track at a given tick (taking polymeter into account)
+    pub fn get_track_effective_time_signature(&self, track_id: &str, tick: u64) -> TimeSignature {
+        if let Some(sec) = self.get_section_at_tick(tick) {
+            self.get_block_effective_time_signature(sec, track_id)
+        } else {
+            self.time_signature
+        }
     }
 
     /// Rebuild the materialized active events cache and refresh boundaries

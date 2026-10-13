@@ -3,7 +3,7 @@ use jamsynth::patch::JamSynthPatch;
 use jamsynth::JamSynthEngine;
 use jamseq::audio::AudioOutput;
 use jamseq::engine::JamSeqHost;
-use jamseq::timeline::{ScheduledAction, ScheduledEvent, TimelineArrangement, TICKS_PER_16TH};
+use jamseq::timeline::{ScheduledAction, ScheduledEvent, TimeSignature, TimelineArrangement, TICKS_PER_16TH};
 use jamseq::track::Track;
 use std::env;
 use std::fs;
@@ -252,6 +252,7 @@ fn build_white_flame_demo_host() -> Result<JamSeqHost> {
     let arrangement = TimelineArrangement {
         title: "The White Flame (Verse 1 Demo)".to_string(),
         bpm: 68.0,
+        time_signature: TimeSignature::default(),
         total_bars: 4,
         loop_enabled: true,
         tracks: Vec::new(),

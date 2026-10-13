@@ -298,6 +298,31 @@ impl JamSeqHost {
         res
     }
 
+    pub fn set_project_time_signature(&mut self, time_signature: crate::timeline::TimeSignature) {
+        self.timeline.set_project_time_signature(time_signature);
+        for t in &mut self.tracks {
+            t.mark_stem_dirty();
+        }
+    }
+
+    pub fn set_section_time_signature(&mut self, section_id: &str, time_signature: Option<crate::timeline::TimeSignature>) -> bool {
+        let res = self.timeline.set_section_time_signature(section_id, time_signature);
+        if res {
+            for t in &mut self.tracks {
+                t.mark_stem_dirty();
+            }
+        }
+        res
+    }
+
+    pub fn set_block_time_signature(&mut self, section_id: &str, track_id: &str, time_signature: Option<crate::timeline::TimeSignature>) -> bool {
+        let res = self.timeline.set_block_time_signature(section_id, track_id, time_signature);
+        if res {
+            self.mark_track_dirty(track_id);
+        }
+        res
+    }
+
     pub fn set_sample_rate(&mut self, rate: f32) {
         if rate > 0.0 && (rate - self.sample_rate).abs() > 0.01 {
             self.sample_rate = rate;
