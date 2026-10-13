@@ -87,9 +87,13 @@ fn test_offline_render_to_wav() {
     let arrangement = TimelineArrangement {
         title: "Test Render".into(),
         bpm: 68.0,
+        time_signature: jamseq::timeline::TimeSignature::default(),
         total_bars: 1,
         loop_enabled: false,
-        sections: vec![jamseq::SongSection::new("test_verse", "Test Verse", 1, 1, 2)],
+        tracks: Vec::new(),
+        master_bus: None,
+        aux_buses: Vec::new(),
+        sections: vec![jamseq::SongSection::new("test_verse", "Test Verse", 1, 1)],
         events,
     };
 
@@ -202,7 +206,17 @@ fn test_ipc_socket_server() {
     let resp: jamseq::ipc::IpcResponse = serde_json::from_str(&resp_line).unwrap();
     assert_eq!(resp.status.unwrap().tracks[0].volume, 0.75);
 
-    // 4. Send ReplaceSectionEvents (Section-scoped edit)
+    // 4. Send AddSection and ReplaceSectionEvents (Section-scoped edit)
+    writeln!(
+        stream,
+        "{{\"cmd\":\"AddSection\",\"args\":{{\"id\":\"intro\",\"name\":\"Intro\",\"start_tick\":0,\"length_ticks\":7680}}}}"
+    ).unwrap();
+    resp_line.clear();
+    reader.read_line(&mut resp_line).unwrap();
+    let resp: jamseq::ipc::IpcResponse = serde_json::from_str(&resp_line).unwrap();
+    assert!(resp.ok);
+    assert_eq!(resp.status.unwrap().sections.len(), 1);
+
     writeln!(
         stream,
         "{{\"cmd\":\"ReplaceSectionEvents\",\"args\":{{\"section_id\":\"intro\",\"track_id\":\"vox\",\"events\":[{{\"id\":10,\"tick\":0,\"track_id\":\"vox\",\"action\":{{\"NoteOn\":{{\"note\":60,\"velocity\":0.8}}}}}}]}}}}"
@@ -233,8 +247,8 @@ fn test_ipc_socket_server() {
     let resp: jamseq::ipc::IpcResponse = serde_json::from_str(&resp_line).unwrap();
     assert!(resp.ok);
 
-    // 7. Test SaveProject & LoadProject
-    let test_proj_path = temp_dir.join("test_saved_project.json");
+    // 7. Test SaveProject & LoadProject (.jam.json convention)
+    let test_proj_path = temp_dir.join("test_saved_project.jam.json");
     let test_proj_str = test_proj_path.to_str().unwrap().replace("\\", "/");
     writeln!(
         stream,
@@ -784,9 +798,13 @@ fn test_debug_playback_demo() {
     let arr = jamseq::timeline::TimelineArrangement {
         title: "Test".to_string(),
         bpm: 68.0,
+        time_signature: jamseq::timeline::TimeSignature::default(),
         total_bars: 4,
         loop_enabled: true,
-        sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4, 1)],
+        tracks: Vec::new(),
+        master_bus: None,
+        aux_buses: Vec::new(),
+        sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4)],
         events,
     };
     host.load_arrangement(arr);
@@ -852,9 +870,13 @@ fn test_server_playback_over_ipc() {
     let arr = jamseq::timeline::TimelineArrangement {
         title: "Test".to_string(),
         bpm: 68.0,
+        time_signature: jamseq::timeline::TimeSignature::default(),
         total_bars: 4,
         loop_enabled: true,
-        sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4, 1)],
+        tracks: Vec::new(),
+        master_bus: None,
+        aux_buses: Vec::new(),
+        sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4)],
         events,
     };
     host.load_arrangement(arr);
@@ -988,8 +1010,603 @@ fn test_vst3_insert_effect_on_track() {
     assert!(peak > 0.0001, "Expected audio output from track through VST3 insert");
 }
 
+#[test]
+fn test_blank_slate_and_section_management() {
+    let mut host = jamseq::JamSeqHost::new(120.0, 44100.0);
+    assert_eq!(host.tracks.len(), 0, "Blank slate should start with 0 tracks");
+    assert!(host.project_path.is_none(), "Blank slate should have no project path");
+    assert_eq!(host.timeline.title, "Untitled");
 
+    // Add a sub-bar section (e.g. 2-beat pickup = 960 ticks)
+    let pickup = jamseq::timeline::SongSection::from_ticks("pickup", "Pickup", 0, 960);
+    assert_eq!(pickup.start_tick(), 0);
+    assert_eq!(pickup.length_ticks(), 960);
+    assert_eq!(pickup.end_tick(), 960);
 
+    host.add_section(pickup);
+    assert_eq!(host.timeline.sections.len(), 1);
 
+    // Add a 4-bar section starting at 960 ticks (4 bars * 1920 ticks = 7680 ticks)
+    let verse = jamseq::timeline::SongSection::from_ticks("verse", "Verse 1", 960, 7680);
+    host.add_section(verse);
+    assert_eq!(host.timeline.sections.len(), 2);
+    // Derived total_ticks is the sum of pickup (960) and verse (7680) = 8640 ticks!
+    assert_eq!(host.timeline.total_ticks, 8640);
 
+    // Add an outro section of length 5000
+    let outro = jamseq::timeline::SongSection::from_ticks("outro", "Outro", 8640, 5000);
+    host.add_section(outro);
+    assert_eq!(host.timeline.total_ticks, 8640 + 5000);
 
+    // Test bar/beat normalization
+    let mut custom = jamseq::timeline::SongSection::from_ticks("custom", "Bridge", 123, 456);
+    custom.normalize_to_beat();
+    assert_eq!(custom.start_tick() % jamseq::timeline::PPQ, 0);
+    assert_eq!(custom.length_ticks() % jamseq::timeline::PPQ, 0);
+
+    custom.normalize_to_bar();
+    let tpb = custom.ticks_per_bar();
+    assert_eq!(custom.start_tick() % tpb, 0);
+    assert_eq!(custom.length_ticks() % tpb, 0);
+
+    // Test removing a section ripples the timeline derived length
+    let removed = host.remove_section("pickup");
+    assert!(removed);
+    assert_eq!(host.timeline.sections.len(), 2);
+    assert_eq!(host.timeline.total_ticks, 7680 + 5000);
+
+    // Test new_project clears tracks and sections to blank slate
+    let synth = jamsynth::JamSynthEngine::new(44100.0);
+    host.add_track(jamseq::track::Track::new_synth("t1", "Synth", synth));
+    assert_eq!(host.tracks.len(), 1);
+
+    host.new_project("Fresh Song", 130.0);
+    assert_eq!(host.tracks.len(), 0, "new_project must clear tracks to blank slate");
+    assert_eq!(host.timeline.sections.len(), 0, "new_project must start with 0 sections");
+    assert_eq!(host.timeline.total_ticks, 0, "new_project must start with 0 total_ticks");
+    assert_eq!(host.timeline.title, "Fresh Song");
+    assert_eq!(host.timeline.bpm, 130.0);
+}
+
+#[test]
+fn test_block_hierarchy_and_tempo_inheritance() {
+    use jamseq::timeline::{SongSection, TrackBlock, TempoOverride};
+
+    // 1. An empty section has length 0 and no stored length
+    let mut sec = SongSection::new_empty("v1", "Verse 1");
+    assert_eq!(sec.length_ticks(), 0);
+
+    // 2. Add a 4-bar drum beat (start offset 0, length 3840 ticks)
+    let drum_block = TrackBlock::new("tb_drums", "drums", 3840);
+    sec.set_block(drum_block);
+    assert_eq!(sec.length_ticks(), 3840);
+
+    // 3. Add an 8-bar synth block (start offset 0, length 7680 ticks) -> Section dynamically stretches!
+    let synth_block = TrackBlock::new("tb_synth", "synth", 7680);
+    sec.set_block(synth_block);
+    assert_eq!(sec.length_ticks(), 7680);
+
+    // 4. Add a lead guitar block starting at offset 4 bars (3840) with length 6 bars (5760)
+    // Furthest-reaching extent is 3840 + 5760 = 9600 ticks!
+    let lead_block = TrackBlock::new("tb_lead", "lead", 5760).with_offset(3840);
+    sec.set_block(lead_block);
+    assert_eq!(sec.length_ticks(), 9600);
+
+    // 5. Test Hierarchical Tempo Inheritance
+    let project_bpm = 120.0;
+    // Section without override inherits project BPM
+    assert_eq!(sec.effective_bpm(project_bpm), 120.0);
+
+    // Section with AbsoluteBpm override
+    sec.tempo = Some(TempoOverride::AbsoluteBpm(90.0));
+    assert_eq!(sec.effective_bpm(project_bpm), 90.0);
+
+    // Block with Ratio override (3:2 metric modulation)
+    let mut poly_block = TrackBlock::new("tb_poly", "poly", 1920)
+        .with_tempo(TempoOverride::Ratio(3, 2));
+    assert_eq!(poly_block.effective_bpm(sec.effective_bpm(project_bpm)), 135.0);
+
+    // Block with Ratio override (1:2 half-time)
+    poly_block.tempo = Some(TempoOverride::Ratio(1, 2));
+    assert_eq!(poly_block.effective_bpm(sec.effective_bpm(project_bpm)), 45.0);
+
+    // Block without override inherits section BPM
+    poly_block.tempo = None;
+    assert_eq!(poly_block.effective_bpm(sec.effective_bpm(project_bpm)), 90.0);
+
+    // 6. Test Timeline Derived Geometry and Dynamic Rippling
+    let mut timeline = jamseq::Timeline::new(120.0, 48000.0);
+    assert_eq!(timeline.total_ticks, 0);
+
+    // Section 1: Intro (8 bars = 7680 ticks via synth)
+    let mut intro = SongSection::new_empty("intro", "Intro");
+    intro.set_block(TrackBlock::new("b1", "synth", 7680));
+    timeline.add_section(intro);
+    assert_eq!(timeline.section_start_tick(0), 0);
+    assert_eq!(timeline.total_ticks, 7680);
+
+    // Section 2: Verse 1 (4 bars = 3840 ticks via drums)
+    let mut verse = SongSection::new_empty("verse", "Verse");
+    verse.set_block(TrackBlock::new("b2", "drums", 3840));
+    timeline.add_section(verse);
+    assert_eq!(timeline.section_start_tick(1), 7680);
+    assert_eq!(timeline.total_ticks, 7680 + 3840);
+
+    // Section 3: Chorus 1 (8 bars = 7680 ticks)
+    let mut chorus = SongSection::new_empty("chorus", "Chorus");
+    chorus.set_block(TrackBlock::new("b3", "full", 7680));
+    timeline.add_section(chorus);
+    assert_eq!(timeline.section_start_tick(2), 7680 + 3840);
+    assert_eq!(timeline.total_ticks, 7680 + 3840 + 7680);
+
+    // Dynamic Rippling: Extend Verse 1 by adding an 8-bar guitar track block (7680 ticks)
+    timeline.set_track_block("verse", TrackBlock::new("b4", "guitar", 7680));
+    // Verse 1 length expanded to 7680!
+    // Downstream Chorus 1 automatically ripples from 11520 to 15360!
+    assert_eq!(timeline.section_start_tick(2), 7680 + 7680);
+    assert_eq!(timeline.total_ticks, 7680 + 7680 + 7680);
+}
+
+#[test]
+fn test_polytempo_block_playback_and_loop_modes() {
+    use jamseq::timeline::{LoopMode, SongSection, TempoOverride, TrackBlock};
+
+    let mut timeline = jamseq::Timeline::new(120.0, 48000.0);
+
+    // Section A (starts at 0)
+    let mut sec_a = SongSection::new_empty("sec_a", "Section A");
+
+    // Track 1: Synth (standard 120 BPM, repeats 2 times via FixedLoops)
+    let mut synth_block = TrackBlock::new("tb_synth", "synth", 1920)
+        .with_loop_mode(LoopMode::FixedLoops(2));
+    synth_block.add_note(101, 102, 0, 480, 60, 0.8);
+    sec_a.set_block(synth_block);
+
+    // Track 2: Polytempo Lead (Ratio 3:2 = 180 BPM, starts at offset 960 ticks)
+    let mut lead_block = TrackBlock::new("tb_lead", "lead", 1920)
+        .with_offset(960)
+        .with_tempo(TempoOverride::Ratio(3, 2))
+        .with_loop_mode(LoopMode::OneShot);
+    // Note in lead local time: duration 480 ticks
+    lead_block.add_note(201, 202, 0, 480, 72, 0.9);
+    sec_a.set_block(lead_block);
+
+    // Track 3: Drum Loop (1 bar = 1920 ticks, LoopToSection to fill 3840 ticks)
+    let mut drum_block = TrackBlock::new("tb_drums", "drums", 1920)
+        .with_loop_mode(LoopMode::LoopToSection);
+    drum_block.add_note(301, 302, 0, 240, 36, 1.0);
+    sec_a.set_block(drum_block);
+
+    timeline.add_section(sec_a);
+
+    // Section extent: synth is 1920*2 = 3840 ticks. drums loop to 3840 ticks.
+    // lead is 960 + 1920 = 2880 ticks.
+    assert_eq!(timeline.total_ticks, 3840);
+
+    // Verify materialized active events
+    let events = timeline.materialize_all_events();
+
+    // Synth: Loop 0 (NoteOn @ 0, NoteOff @ 480), Loop 1 (NoteOn @ 1920, NoteOff @ 2400)
+    let synth_notes: Vec<&ScheduledEvent> = events.iter().filter(|e| e.track_id == "synth").collect();
+    assert_eq!(synth_notes.len(), 4);
+    assert_eq!(synth_notes[0].tick, 0);
+    assert_eq!(synth_notes[1].tick, 480);
+    assert_eq!(synth_notes[2].tick, 1920);
+    assert_eq!(synth_notes[3].tick, 2400);
+
+    // Lead (Ratio 3:2): NoteOn @ 960 (960 + 0).
+    // Note duration scaled by 120/180 = 2/3: 480 * 2/3 = 320 ticks!
+    // NoteOff @ 960 + 320 = 1280 ticks!
+    let lead_notes: Vec<&ScheduledEvent> = events.iter().filter(|e| e.track_id == "lead").collect();
+    assert_eq!(lead_notes.len(), 2);
+    assert_eq!(lead_notes[0].tick, 960);
+    assert_eq!(lead_notes[1].tick, 1280);
+
+    // Drums (LoopToSection over 3840 ticks with base 1920): 2 iterations (0 and 1920)
+    let drum_notes: Vec<&ScheduledEvent> = events.iter().filter(|e| e.track_id == "drums").collect();
+    assert_eq!(drum_notes.len(), 4);
+    assert_eq!(drum_notes[0].tick, 0);
+    assert_eq!(drum_notes[1].tick, 240);
+    assert_eq!(drum_notes[2].tick, 1920);
+    assert_eq!(drum_notes[3].tick, 2160);
+
+    // Test Audio Advance & Playback Cursors
+    timeline.seek_tick(0);
+    timeline.play();
+
+    // Advance 480 samples at 48000 Hz = 0.01 seconds
+    // At 120 BPM: 0.01 * 2 beats/sec * 960 PPQ = 19.2 ticks
+    // Synth cursor advances at 120 BPM (19.2 ticks)
+    // Lead cursor advances at 180 BPM = 0.01 * 3 beats/sec * 960 PPQ = 28.8 ticks
+    let due = timeline.advance_samples(480);
+    assert!(!due.is_empty(), "Events at tick 0 must fire on first advance");
+    assert_eq!(due[0].tick, 0);
+
+    let synth_cursor = timeline.track_cursors.get("synth").unwrap();
+    let lead_cursor = timeline.track_cursors.get("lead").unwrap();
+
+    assert!((synth_cursor.current_tick - 19.2).abs() < 0.1, "Synth cursor must advance at 120 BPM");
+    assert!((lead_cursor.current_tick - 28.8).abs() < 0.1, "Lead cursor must advance at 180 BPM polytempo");
+
+    // Test Host Integration with JamSeqHost audio block
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    let mut engine = JamSynthEngine::new(48000.0);
+    engine.load_patch(JamSynthPatch::preset_reese_bass());
+    host.add_track(Track::new_synth("poly_bass", "Poly Bass", engine));
+
+    let mut bass_sec = SongSection::new_empty("b_sec", "Bass Section");
+    let mut bass_block = TrackBlock::new("tb_bass", "poly_bass", 1920)
+        .with_tempo(TempoOverride::Ratio(3, 2))
+        .with_loop_mode(LoopMode::OneShot);
+    bass_block.add_note(401, 402, 0, 480, 48, 0.9);
+    bass_sec.set_block(bass_block);
+    host.add_section(bass_sec);
+
+    host.timeline.seek_tick(0);
+    host.play();
+
+    let mut left = vec![0.0f32; 512];
+    let mut right = vec![0.0f32; 512];
+    host.process_block(&mut left, &mut right);
+
+    let peak = left.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(peak > 0.001, "Polytempo block must produce audio in host process_block");
+}
+
+#[test]
+fn test_stem_cache_manager_and_granular_block_stems() {
+    use jamseq::stem_cache::StemCacheManager;
+    use jamseq::timeline::{LoopMode, SongSection, TempoOverride, TrackBlock};
+
+    let cache_dir = std::env::temp_dir().join("jamseq_test_stem_cache_dir");
+    let mut cache_mgr = StemCacheManager::new(&cache_dir).expect("Failed to create StemCacheManager");
+    cache_mgr.clear().expect("Failed to clear test cache dir");
+
+    // 1. Verify Content-Addressed Hash Stability & Invalidation
+    let mut block1 = TrackBlock::new("block_1", "bass_track", 1920)
+        .with_tempo(TempoOverride::AbsoluteBpm(120.0))
+        .with_loop_mode(LoopMode::OneShot);
+    block1.add_note(1, 2, 0, 480, 40, 1.0);
+
+    let key1 = cache_mgr.compute_block_key("bass_track", "verse", &block1, Some("patch_a"), 120.0);
+    let key1_repeat = cache_mgr.compute_block_key("bass_track", "verse", &block1, Some("patch_a"), 120.0);
+    assert_eq!(key1, key1_repeat, "Identical block parameters must produce identical content hash");
+
+    // Changing note pitch or velocity changes key
+    let mut block2 = block1.clone();
+    block2.events[0].action = jamseq::timeline::ScheduledAction::NoteOn { note: 41, velocity: 1.0 };
+    let key2 = cache_mgr.compute_block_key("bass_track", "verse", &block2, Some("patch_a"), 120.0);
+    assert_ne!(key1, key2, "Mutating a note must yield a distinct cache key");
+
+    // Changing tempo override changes key
+    let block3 = block1.clone().with_tempo(TempoOverride::Ratio(3, 2));
+    let key3 = cache_mgr.compute_block_key("bass_track", "verse", &block3, Some("patch_a"), 180.0);
+    assert_ne!(key1, key3, "Metric modulation tempo override must yield a distinct cache key");
+
+    // 2. Store and Load Chunks
+    let left_samples = vec![0.5f32; 512];
+    let right_samples = vec![-0.5f32; 512];
+    let stored_path = cache_mgr.store_chunk(&key1, &left_samples, &right_samples, 48000).expect("Store chunk failed");
+    assert!(stored_path.exists(), "Stored chunk WAV must exist on disk");
+    assert!(cache_mgr.get_cached_chunk(&key1).is_some());
+
+    let loaded = cache_mgr.load_chunk(&key1).expect("Load chunk failed");
+    assert_eq!(loaded.samples_left.len(), 512);
+    assert_eq!(loaded.samples_right.len(), 512);
+    assert!((loaded.samples_left[0] - 0.5).abs() < 0.01);
+    assert!((loaded.samples_right[0] - (-0.5)).abs() < 0.01);
+
+    // Invalidate track
+    cache_mgr.invalidate_track("bass_track");
+    assert!(cache_mgr.get_cached_chunk(&key1).is_none(), "Invalidated track chunks must be purged");
+
+    // 3. Engine Granular Block Stem Rendering & Stitching
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    let mut bass = JamSynthEngine::new(48000.0);
+    bass.load_patch(JamSynthPatch::preset_808_sub());
+    host.add_track(Track::new_synth("sub808", "Sub 808", bass));
+
+    // Section 1: Intro (1 bar = 3840 ticks)
+    let mut sec_intro = SongSection::new_empty("sec_intro", "Intro");
+    let mut b_intro = TrackBlock::new("tb_intro", "sub808", 3840);
+    b_intro.add_note(10, 11, 0, 960, 36, 1.0);
+    sec_intro.set_block(b_intro);
+    host.add_section(sec_intro);
+
+    // Section 2: Verse (1 bar = 3840 ticks)
+    let mut sec_verse = SongSection::new_empty("sec_verse", "Verse");
+    let mut b_verse = TrackBlock::new("tb_verse", "sub808", 3840);
+    b_verse.add_note(20, 21, 0, 960, 38, 1.0);
+    sec_verse.set_block(b_verse);
+    host.add_section(sec_verse);
+
+    // Initial stem generation for dirty tracks
+    let generated = host.generate_stems_for_dirty_tracks();
+    assert_eq!(generated, 1, "Must generate stem for sub808");
+
+    let track_idx = *host.track_map.get("sub808").unwrap();
+    assert!(!host.tracks[track_idx].stem_dirty, "Track stem must no longer be dirty");
+    assert!(host.tracks[track_idx].cached_stem.is_some(), "Track must have stitched cached stem");
+
+    // Stitched stem length should span both sections (Intro 3840 + Verse 3840 = 7680 ticks)
+    let expected_samples = host.timeline.ticks_to_samples(7680) as usize;
+    let actual_samples = host.tracks[track_idx].cached_stem.as_ref().unwrap().buffer.as_ref().unwrap().samples_left.len();
+    assert_eq!(actual_samples, expected_samples, "Stitched stem length must match total arrangement ticks");
+
+    // Calling again without modifications generates 0 stems
+    let generated_again = host.generate_stems_for_dirty_tracks();
+    assert_eq!(generated_again, 0, "Clean tracks must skip stem regeneration");
+
+    // Verify individual block chunks are cached on disk
+    let chunk_intro = host.render_track_block("sub808", "sec_intro").expect("Must load cached intro block");
+    assert!(!chunk_intro.samples_left.is_empty(), "Cached intro block chunk must not be empty");
+
+    let _ = std::fs::remove_dir_all(&cache_dir);
+}
+
+#[test]
+fn test_toast_json_block_ingestion() {
+    let toast_path = std::path::Path::new("/home/dwalters/toast.json");
+    if !toast_path.exists() {
+        return;
+    }
+
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    host.load_project_from_file(toast_path).expect("Failed to load toast.json");
+
+    assert_eq!(host.timeline.sections.len(), 3, "toast.json must have 3 sections");
+
+    let intro = host.timeline.sections.iter().find(|s| s.id == "intro").unwrap();
+    let verse = host.timeline.sections.iter().find(|s| s.id == "verse_1").unwrap();
+    let chorus = host.timeline.sections.iter().find(|s| s.id == "chorus_1").unwrap();
+
+    let intro_b = intro.track_blocks.get("track_1").expect("intro must have track_1 block");
+    let verse_b = verse.track_blocks.get("track_1").expect("verse must have track_1 block");
+    let chorus_b = chorus.track_blocks.get("track_1").expect("chorus must have track_1 block");
+
+    // Verify each block has its own distinct notes
+    assert!(!intro_b.events.is_empty(), "intro_b must have events migrated from toast.json");
+    assert!(!verse_b.events.is_empty(), "verse_b must have events migrated from toast.json");
+    assert!(!chorus_b.events.is_empty(), "chorus_b must have events migrated from toast.json");
+
+    // Intro has note 56
+    let intro_pitch = intro_b.events.iter().find_map(|e| match e.action {
+        jamseq::timeline::ScheduledAction::NoteOn { note, .. } => Some(note),
+        _ => None,
+    });
+    assert_eq!(intro_pitch, Some(56), "intro_b must contain pitch 56");
+
+    // Verse has note 64
+    let verse_pitch = verse_b.events.iter().find_map(|e| match e.action {
+        jamseq::timeline::ScheduledAction::NoteOn { note, .. } => Some(note),
+        _ => None,
+    });
+    assert_eq!(verse_pitch, Some(64), "verse_b must contain pitch 64");
+
+    // Chorus has note 55
+    let chorus_pitch = chorus_b.events.iter().find_map(|e| match e.action {
+        jamseq::timeline::ScheduledAction::NoteOn { note, .. } => Some(note),
+        _ => None,
+    });
+    assert_eq!(chorus_pitch, Some(55), "chorus_b must contain pitch 55");
+}
+
+#[test]
+fn test_project_track_persistence_and_auto_discovery() {
+    let temp_dir = std::env::temp_dir();
+    let proj_file = temp_dir.join("test_track_discovery.jam.json");
+    let _ = fs::remove_file(&proj_file);
+
+    // 1. Simulate untitled.jam.json: JSON without a "tracks" field, referencing track_1 and track_2
+    let raw_json = r#"{
+        "title": "Untracked Project",
+        "bpm": 120.0,
+        "total_bars": 4,
+        "loop_enabled": true,
+        "sections": [
+            {
+                "id": "sec_intro",
+                "name": "Intro",
+                "time_signature": { "numerator": 4, "denominator": 4 },
+                "tempo": null,
+                "track_blocks": {
+                    "track_1": {
+                        "id": "intro_track_1",
+                        "track_id": "track_1",
+                        "start_offset_ticks": 0,
+                        "base_length_ticks": 3840,
+                        "loop_mode": "OneShot",
+                        "tempo": null,
+                        "events": [],
+                        "audio_file": null
+                    }
+                },
+                "start_tick": 0,
+                "length_ticks": 3840,
+                "start_bar": 1,
+                "bars": 1
+            },
+            {
+                "id": "sec_verse",
+                "name": "Verse",
+                "time_signature": { "numerator": 4, "denominator": 4 },
+                "tempo": null,
+                "track_blocks": {
+                    "track_2": {
+                        "id": "verse_track_2",
+                        "track_id": "track_2",
+                        "start_offset_ticks": 0,
+                        "base_length_ticks": 3840,
+                        "loop_mode": "OneShot",
+                        "tempo": null,
+                        "events": [],
+                        "audio_file": null
+                    }
+                },
+                "start_tick": 3840,
+                "length_ticks": 3840,
+                "start_bar": 2,
+                "bars": 1
+            }
+        ],
+        "events": [
+            {
+                "id": 1,
+                "tick": 0,
+                "track_id": "track_1",
+                "action": { "NoteOn": { "note": 60, "velocity": 0.8 } }
+            }
+        ]
+    }"#;
+    fs::write(&proj_file, raw_json).expect("Failed to write test raw JSON");
+
+    // 2. Load the project into a host
+    let mut host = JamSeqHost::new(120.0, 44100.0);
+    // Ensure host starts with 0 tracks
+    host.tracks.clear();
+    host.track_map.clear();
+    assert_eq!(host.tracks.len(), 0);
+
+    host.load_project_from_file(&proj_file).expect("Failed to load project from file");
+
+    // Must have auto-discovered track_1 and track_2!
+    assert_eq!(host.tracks.len(), 2, "Must discover exactly 2 tracks");
+    assert!(host.track_map.contains_key("track_1"), "Must contain track_1");
+    assert!(host.track_map.contains_key("track_2"), "Must contain track_2");
+    assert_eq!(host.tracks[0].name, "MIDI Track 1");
+    assert_eq!(host.tracks[1].name, "MIDI Track 2");
+
+    // 3. Tweak parameters on track_1, master bus, and save
+    host.tracks[0].name = "Lead Synth".to_string();
+    host.tracks[0].volume = 0.75;
+    host.tracks[0].set_parameter("cutoff", 0.72);
+    host.tracks[0].set_parameter("resonance", 0.65);
+    host.master_bus.volume = 0.88;
+
+    let saved_file = temp_dir.join("test_track_saved.jam.json");
+    let _ = fs::remove_file(&saved_file);
+    host.save_project_to_file(&saved_file).expect("Failed to save project");
+
+    // Verify saved JSON contains the "tracks" array, parameter values, and master_bus
+    let saved_content = fs::read_to_string(&saved_file).expect("Failed to read saved file");
+    assert!(saved_content.contains(r#""tracks""#), "Saved project must contain 'tracks' array");
+    assert!(saved_content.contains("Lead Synth"), "Saved project must persist renamed track");
+    assert!(saved_content.contains("parameters"), "Saved project must persist parameters");
+    assert!(saved_content.contains("Cutoff") || saved_content.contains("cutoff"), "Saved project must persist cutoff parameter");
+    assert!(saved_content.contains("master_bus"), "Saved project must persist master_bus");
+
+    // 4. Reload into a new host and verify complete fidelity
+    let mut reload_host = JamSeqHost::new(120.0, 44100.0);
+    reload_host.load_project_from_file(&saved_file).expect("Failed to reload saved project");
+    assert_eq!(reload_host.tracks.len(), 2);
+    assert_eq!(reload_host.tracks[0].name, "Lead Synth");
+    assert!((reload_host.tracks[0].volume - 0.75).abs() < 1e-4);
+    assert!((reload_host.master_bus.volume - 0.88).abs() < 1e-4);
+
+    let params = reload_host.tracks[0].get_parameters();
+    let cutoff = params.iter().find(|(n, ..)| n == "Cutoff" || n == "cutoff").map(|(.., v, _, _)| *v).unwrap_or(0.0);
+    let resonance = params.iter().find(|(n, ..)| n == "Resonance" || n == "resonance").map(|(.., v, _, _)| *v).unwrap_or(0.0);
+    assert!((cutoff - 0.72).abs() < 1e-2, "Reloaded track must restore cutoff 0.72 (got {})", cutoff);
+    assert!((resonance - 0.65).abs() < 1e-2, "Reloaded track must restore resonance 0.65 (got {})", resonance);
+
+    let _ = fs::remove_file(&proj_file);
+    let _ = fs::remove_file(&saved_file);
+}
+
+#[test]
+fn test_cascading_meter_and_polymeter_hierarchy() {
+    use jamseq::timeline::{SongSection, TimeSignature, TrackBlock, PPQ};
+
+    let mut host = JamSeqHost::new(120.0, 44100.0);
+    let synth1 = jamsynth::JamSynthEngine::new(44100.0);
+    let synth2 = jamsynth::JamSynthEngine::new(44100.0);
+    host.add_track(Track::new_synth("track_1", "Track 1", synth1));
+    host.add_track(Track::new_synth("track_2", "Track 2", synth2));
+
+    // 1. Initial State: Default Project Meter is 4/4
+    assert_eq!(host.timeline.time_signature, TimeSignature { numerator: 4, denominator: 4 });
+    assert_eq!(host.timeline.time_signature.ticks_per_bar(), 4 * PPQ);
+    assert_eq!(host.timeline.time_signature.ticks_per_beat(), PPQ);
+
+    // 2. Set Project Meter to 3/4
+    host.set_project_time_signature(TimeSignature::new(3, 4));
+    assert_eq!(host.timeline.time_signature, TimeSignature { numerator: 3, denominator: 4 });
+    assert_eq!(host.timeline.time_signature.ticks_per_bar(), 3 * PPQ);
+    assert_eq!(host.timeline.time_signature.ticks_per_beat(), PPQ);
+
+    // 3. Section 1: Inherits project meter (time_signature = None)
+    let sec1 = SongSection::from_ticks("sec_1", "Intro", 0, 3 * PPQ * 2); // 2 bars of 3/4
+    assert_eq!(sec1.time_signature, None);
+    assert_eq!(host.timeline.get_section_effective_time_signature(&sec1), TimeSignature { numerator: 3, denominator: 4 });
+
+    // TrackBlock on track_1 inheriting Section 1 (which inherits Project 3/4)
+    let blk1 = TrackBlock::new("blk_1", "track_1", 3 * PPQ * 2);
+    assert_eq!(blk1.time_signature, None);
+    assert_eq!(host.timeline.get_block_effective_time_signature(&sec1, "track_1"), TimeSignature { numerator: 3, denominator: 4 });
+
+    host.add_section(sec1.with_block(blk1));
+
+    // 4. Section 2: Overrides meter to 6/8
+    let sec2 = SongSection::from_ticks("sec_2", "Verse", 3 * PPQ * 2, 2880 * 2)
+        .with_time_signature(TimeSignature::new(6, 8));
+    assert_eq!(sec2.time_signature, Some(TimeSignature { numerator: 6, denominator: 8 }));
+    assert_eq!(host.timeline.get_section_effective_time_signature(&sec2), TimeSignature { numerator: 6, denominator: 8 });
+    assert_eq!(sec2.ticks_per_bar(), (6 * PPQ * 4) / 8); // 2880 ticks per bar
+    assert_eq!(sec2.time_signature().ticks_per_beat(), (PPQ * 4) / 8); // 480 ticks per beat
+
+    // Block on Track 1 inherits Section 2 (6/8)
+    let blk2_t1 = TrackBlock::new("blk_2_t1", "track_1", 2880 * 2);
+    assert_eq!(blk2_t1.time_signature, None);
+    assert_eq!(host.timeline.get_block_effective_time_signature(&sec2, "track_1"), TimeSignature { numerator: 6, denominator: 8 });
+
+    // Block on Track 2 defines a TRUE POLYMETER OVERRIDE: 5/4 against the 6/8 section!
+    let blk2_t2 = TrackBlock::new("blk_2_t2", "track_2", 4800)
+        .with_time_signature(TimeSignature::new(5, 4));
+    assert_eq!(blk2_t2.time_signature, Some(TimeSignature { numerator: 5, denominator: 4 }));
+    assert_eq!(blk2_t2.effective_time_signature(sec2.time_signature()), TimeSignature { numerator: 5, denominator: 4 });
+    assert_eq!(blk2_t2.time_signature.unwrap().ticks_per_bar(), 5 * PPQ); // 4800 ticks per bar
+    assert_eq!(blk2_t2.time_signature.unwrap().ticks_per_beat(), PPQ); // 960 ticks per beat
+
+    let sec2 = sec2.with_block(blk2_t1).with_block(blk2_t2);
+    host.add_section(sec2);
+
+    // 5. Query effective meter at different timeline positions
+    // In Section 1 (tick 100): Project 3/4
+    assert_eq!(host.timeline.get_time_signature_at_tick(100), TimeSignature { numerator: 3, denominator: 4 });
+    assert_eq!(host.timeline.get_track_effective_time_signature("track_1", 100), TimeSignature { numerator: 3, denominator: 4 });
+    assert_eq!(host.timeline.get_track_effective_time_signature("track_2", 100), TimeSignature { numerator: 3, denominator: 4 });
+
+    // In Section 2 (tick 7000): Track 1 is 6/8, Track 2 is polymetric 5/4!
+    let sec2_start = host.timeline.sections[0].length_ticks();
+    assert_eq!(host.timeline.get_time_signature_at_tick(sec2_start + 100), TimeSignature { numerator: 6, denominator: 8 });
+    assert_eq!(host.timeline.get_track_effective_time_signature("track_1", sec2_start + 100), TimeSignature { numerator: 6, denominator: 8 });
+    assert_eq!(host.timeline.get_track_effective_time_signature("track_2", sec2_start + 100), TimeSignature { numerator: 5, denominator: 4 });
+
+    // 6. Test serialization & persistence to file (.jam.json)
+    let temp_dir = std::env::temp_dir();
+    let meter_project_path = temp_dir.join("test_cascading_meter.jam.json");
+    host.save_project_to_file(&meter_project_path).expect("Failed to save project with meter");
+
+    // Inspect serialized JSON
+    let content = std::fs::read_to_string(&meter_project_path).expect("Failed to read file");
+    assert!(content.contains("\"numerator\": 3"), "Serialized arrangement must contain project numerator 3");
+    assert!(content.contains("\"numerator\": 6"), "Serialized arrangement must contain section numerator 6");
+    assert!(content.contains("\"numerator\": 5"), "Serialized arrangement must contain polymeter block numerator 5");
+
+    // 7. Reload into a fresh host
+    let mut reload_host = JamSeqHost::new(140.0, 44100.0);
+    reload_host.load_project_from_file(&meter_project_path).expect("Failed to reload project");
+
+    assert_eq!(reload_host.timeline.time_signature, TimeSignature { numerator: 3, denominator: 4 });
+    assert_eq!(reload_host.timeline.sections.len(), 2);
+    assert_eq!(reload_host.timeline.sections[0].time_signature, None); // Section 1 inherits 3/4
+    assert_eq!(reload_host.timeline.sections[1].time_signature, Some(TimeSignature { numerator: 6, denominator: 8 })); // Section 2 is 6/8
+
+    let reloaded_sec2 = &reload_host.timeline.sections[1];
+    let reloaded_t1_block = reloaded_sec2.track_blocks.get("track_1").unwrap();
+    let reloaded_t2_block = reloaded_sec2.track_blocks.get("track_2").unwrap();
+    assert_eq!(reloaded_t1_block.time_signature, None); // Inherits 6/8
+    assert_eq!(reloaded_t2_block.time_signature, Some(TimeSignature { numerator: 5, denominator: 4 })); // Polymeter 5/4 preserved!
+
+    let _ = std::fs::remove_file(&meter_project_path);
+}

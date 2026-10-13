@@ -8,6 +8,7 @@ pub mod midi_input;
 pub mod plugin_scanner;
 pub mod recorder;
 pub mod sampler;
+pub mod stem_cache;
 pub mod timeline;
 pub mod track;
 pub mod vst3_host;
@@ -20,9 +21,10 @@ pub use midi_input::{MidiDeviceStatus, MidiInputManager};
 pub use plugin_scanner::{DiscoveredPlugin, PluginScanner};
 pub use recorder::{AudioRecorder, RecordedClipInfo};
 pub use sampler::{SamplerConfig, SamplerInstrument};
+pub use stem_cache::StemCacheManager;
 pub use timeline::{
-    AutomationPoint, ScheduledAction, ScheduledEvent, SongSection, TimeSignature, Timeline,
-    TimelineArrangement, PPQ, TICKS_PER_16TH,
+    AutomationPoint, LoopMode, ScheduledAction, ScheduledEvent, SongSection, TempoOverride,
+    TimeSignature, Timeline, TimelineArrangement, TrackBlock, PPQ, TICKS_PER_16TH,
 };
 pub use track::{InsertEffect, Track, TrackInstrument};
 pub use vst3_host::Vst3Track;

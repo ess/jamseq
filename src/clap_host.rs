@@ -1,8 +1,10 @@
 use clack_extensions::params::{ParamInfoBuffer, PluginParams};
 use clack_extensions::timer::{HostTimer, HostTimerImpl, PluginTimer, TimerId};
-use clack_host::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
+use clack_host::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent, TransportEvent, TransportFlags};
+use clack_host::events::EventFlags;
 use clack_host::host::HostError;
 use clack_host::prelude::*;
+use clack_host::utils::{BeatTime, SecondsTime};
 use std::collections::HashMap;
 use std::sync::{Arc as StdArc, Mutex};
 
@@ -55,6 +57,7 @@ pub struct ClapTrack {
     pub pending_params: StdArc<Mutex<Vec<(ClapId, f64)>>>,   // (param_id, value)
     pub params: StdArc<Mutex<Vec<ClapParam>>>,
     pub param_index: StdArc<Mutex<HashMap<String, usize>>>,
+    pub current_bpm: f64,
     pub out_l: Vec<f32>,
     pub out_r: Vec<f32>,
 }
@@ -226,9 +229,14 @@ impl ClapTrack {
             pending_params: StdArc::new(Mutex::new(Vec::new())),
             params: params_arc,
             param_index: param_index_arc,
+            current_bpm: 120.0,
             out_l: vec![0.0f32; 1024],
             out_r: vec![0.0f32; 1024],
         })
+    }
+
+    pub fn set_tempo(&mut self, bpm: f64) {
+        self.current_bpm = bpm;
     }
 
     pub fn note_on(&self, note: u8, velocity: f32) {
@@ -329,6 +337,23 @@ impl ClapTrack {
             ]),
         }]);
 
+        let transport = TransportEvent {
+            header: EventHeader::new_core(0, EventFlags::empty()),
+            flags: TransportFlags::HAS_TEMPO | TransportFlags::IS_PLAYING,
+            song_pos_beats: BeatTime::from_float(0.0),
+            song_pos_seconds: SecondsTime::from_float(0.0),
+            tempo: self.current_bpm,
+            tempo_inc: 0.0,
+            loop_start_beats: BeatTime::from_float(0.0),
+            loop_end_beats: BeatTime::from_float(0.0),
+            loop_start_seconds: SecondsTime::from_float(0.0),
+            loop_end_seconds: SecondsTime::from_float(0.0),
+            bar_start: BeatTime::from_float(0.0),
+            bar_number: 0,
+            time_signature_numerator: 4,
+            time_signature_denominator: 4,
+        };
+
         if let Ok(mut proc) = self.processor.lock() {
             let _ = proc.process(
                 &input_audio,
@@ -336,7 +361,7 @@ impl ClapTrack {
                 &input_events,
                 &mut output_events,
                 None,
-                None,
+                Some(&transport),
             );
         }
 
@@ -388,6 +413,23 @@ impl ClapTrack {
             ]),
         }]);
 
+        let transport = TransportEvent {
+            header: EventHeader::new_core(0, EventFlags::empty()),
+            flags: TransportFlags::HAS_TEMPO | TransportFlags::IS_PLAYING,
+            song_pos_beats: BeatTime::from_float(0.0),
+            song_pos_seconds: SecondsTime::from_float(0.0),
+            tempo: self.current_bpm,
+            tempo_inc: 0.0,
+            loop_start_beats: BeatTime::from_float(0.0),
+            loop_end_beats: BeatTime::from_float(0.0),
+            loop_start_seconds: SecondsTime::from_float(0.0),
+            loop_end_seconds: SecondsTime::from_float(0.0),
+            bar_start: BeatTime::from_float(0.0),
+            bar_number: 0,
+            time_signature_numerator: 4,
+            time_signature_denominator: 4,
+        };
+
         if let Ok(mut proc) = self.processor.lock() {
             let _ = proc.process(
                 &in_audio,
@@ -395,7 +437,7 @@ impl ClapTrack {
                 &input_events,
                 &mut output_events,
                 None,
-                None,
+                Some(&transport),
             );
         }
     }

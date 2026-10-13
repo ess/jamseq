@@ -35,12 +35,17 @@ pub struct JamSeqHost {
     pub aux_right: Vec<Vec<f32>>,
     scratch_left: Vec<f32>,
     scratch_right: Vec<f32>,
+    pub stem_cache: crate::stem_cache::StemCacheManager,
 }
 
 impl JamSeqHost {
     pub fn new(bpm: f64, sample_rate: f32) -> Self {
         let sr = if sample_rate > 0.0 { sample_rate } else { 44100.0 };
         let available_plugins = crate::plugin_scanner::PluginScanner::scan_all();
+        let stem_cache_dir = std::env::temp_dir().join("jamseq_stem_cache");
+        let stem_cache = crate::stem_cache::StemCacheManager::new(stem_cache_dir).unwrap_or_else(|_| {
+            crate::stem_cache::StemCacheManager::new("/tmp/jamseq_stem_cache").unwrap()
+        });
         Self {
             timeline: Timeline::new(bpm, sr as f64),
             tracks: Vec::new(),
@@ -62,6 +67,7 @@ impl JamSeqHost {
             aux_right: Vec::new(),
             scratch_left: vec![0.0; 2048],
             scratch_right: vec![0.0; 2048],
+            stem_cache,
         }
     }
 
@@ -74,8 +80,11 @@ impl JamSeqHost {
         let path_ref = path.as_ref();
         let content = std::fs::read_to_string(path_ref)
             .with_context(|| format!("Failed to read project file at {:?}", path_ref))?;
-        let arrangement: TimelineArrangement = serde_json::from_str(&content)
+        let mut arrangement: TimelineArrangement = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse project JSON at {:?}", path_ref))?;
+        if arrangement.tracks.is_empty() {
+            arrangement.discover_tracks_from_content();
+        }
         self.load_arrangement(arrangement);
         self.project_path = Some(path_ref.to_string_lossy().to_string());
         Ok(())
@@ -84,15 +93,125 @@ impl JamSeqHost {
     /// Save the current live arrangement to a project JSON on disk
     pub fn save_project_to_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let path_ref = path.as_ref();
-        let arrangement = self.timeline.to_arrangement();
+        let path_str = path_ref.to_string_lossy();
+        let final_path = if path_str.ends_with(".jam.json") || path_str.ends_with(".json") {
+            path_ref.to_path_buf()
+        } else {
+            std::path::PathBuf::from(format!("{}.jam.json", path_str))
+        };
+
+        let mut arrangement = self.timeline.to_arrangement();
+
+        // 1. Serialize Tracks with full DSP & parameter state
+        arrangement.tracks = self.tracks.iter().map(|t| {
+            let t_type = match &t.instrument {
+                crate::track::TrackInstrument::AudioClips(_) => "audio".to_string(),
+                crate::track::TrackInstrument::Sampler(_) => "sampler".to_string(),
+                crate::track::TrackInstrument::Vst3(v) => format!("vst3:{}", v.path),
+                crate::track::TrackInstrument::Lv2(l) => l.uri.clone(),
+                crate::track::TrackInstrument::Clap(c) => c.path.clone(),
+                _ => "synth".to_string(),
+            };
+
+            let parameters: std::collections::HashMap<String, f32> = t.get_parameters()
+                .into_iter()
+                .map(|(name, val, _, _)| (name, val))
+                .collect();
+
+            let inserts: Vec<crate::timeline::InsertConfig> = t.inserts.iter().map(|ins| {
+                let ins_params: std::collections::HashMap<String, f32> = ins.get_parameters()
+                    .into_iter()
+                    .map(|(name, val, _, _)| (name, val))
+                    .collect();
+                crate::timeline::InsertConfig {
+                    name: ins.name().to_string(),
+                    uri: ins.uri().to_string(),
+                    parameters: ins_params,
+                }
+            }).collect();
+
+            let sends = t.sends.iter().map(|s| crate::timeline::AuxSendConfig {
+                target_bus_id: s.target_bus_id.clone(),
+                gain: s.gain,
+                is_pre_fader: s.is_pre_fader,
+                is_muted: s.is_muted,
+            }).collect();
+
+            let sidechains = t.sidechains.iter().map(|s| crate::timeline::SidechainSendConfig {
+                target_track_id: s.target_track_id.clone(),
+                target_insert_index: s.target_insert_index,
+                gain: s.gain,
+            }).collect();
+
+            crate::timeline::TrackConfig {
+                id: t.id.clone(),
+                name: t.name.clone(),
+                track_type: t_type,
+                volume: t.volume,
+                pan: t.pan,
+                muted: t.muted,
+                solo: t.solo,
+                current_plugin: t.current_plugin.clone(),
+                parameters,
+                inserts,
+                sends,
+                sidechains,
+            }
+        }).collect();
+
+        // 2. Serialize Master Bus
+        let master_inserts: Vec<crate::timeline::InsertConfig> = self.master_bus.inserts.iter().map(|ins| {
+            let ins_params: std::collections::HashMap<String, f32> = ins.get_parameters()
+                .into_iter()
+                .map(|(name, val, _, _)| (name, val))
+                .collect();
+            crate::timeline::InsertConfig {
+                name: ins.name().to_string(),
+                uri: ins.uri().to_string(),
+                parameters: ins_params,
+            }
+        }).collect();
+
+        arrangement.master_bus = Some(crate::timeline::MasterBusConfig {
+            volume: self.master_bus.volume,
+            pan: self.master_bus.pan,
+            muted: self.master_bus.muted,
+            inserts: master_inserts,
+        });
+
+        // 3. Serialize Aux Buses
+        arrangement.aux_buses = self.aux_buses.iter().map(|b| {
+            let bus_inserts: Vec<crate::timeline::InsertConfig> = b.inserts.iter().map(|ins| {
+                let ins_params: std::collections::HashMap<String, f32> = ins.get_parameters()
+                    .into_iter()
+                    .map(|(name, val, _, _)| (name, val))
+                    .collect();
+                crate::timeline::InsertConfig {
+                    name: ins.name().to_string(),
+                    uri: ins.uri().to_string(),
+                    parameters: ins_params,
+                }
+            }).collect();
+
+            crate::timeline::AuxBusConfig {
+                id: b.id.clone(),
+                name: b.name.clone(),
+                volume: b.volume,
+                pan: b.pan,
+                muted: b.muted,
+                solo: b.solo,
+                inserts: bus_inserts,
+            }
+        }).collect();
+
         let json_data = serde_json::to_string_pretty(&arrangement)
             .context("Failed to serialize arrangement to JSON")?;
-        if let Some(parent) = path_ref.parent() {
+        if let Some(parent) = final_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        std::fs::write(path_ref, json_data)
-            .with_context(|| format!("Failed to write project file to {:?}", path_ref))?;
-        self.project_path = Some(path_ref.to_string_lossy().to_string());
+        std::fs::write(&final_path, json_data)
+            .with_context(|| format!("Failed to write project file to {:?}", final_path))?;
+        self.project_path = Some(final_path.to_string_lossy().to_string());
         Ok(())
     }
 
@@ -101,14 +220,107 @@ impl JamSeqHost {
         let mut arrangement = TimelineArrangement::default();
         arrangement.title = title.to_string();
         arrangement.bpm = if bpm > 10.0 { bpm } else { 120.0 };
-        arrangement.total_bars = 8;
-        arrangement.sections = vec![
-            crate::timeline::SongSection::new("intro", "Intro", 1, 4, 2),
-            crate::timeline::SongSection::new("verse_1", "Verse 1", 5, 4, 3),
-        ];
+        arrangement.total_bars = 0;
+        arrangement.sections = Vec::new();
         arrangement.events = Vec::new();
+        self.tracks.clear();
+        self.track_map.clear();
+        self.aux_buses.clear();
+        self.aux_map.clear();
+        self.aux_left.clear();
+        self.aux_right.clear();
+        self.master_bus.inserts.clear();
+        self.frozen_tracks.clear();
+        self.sidechain_buffers.clear();
         self.load_arrangement(arrangement);
         self.project_path = None;
+    }
+
+    pub fn add_section(&mut self, section: crate::timeline::SongSection) {
+        self.timeline.add_section(section);
+        for t in &mut self.tracks {
+            t.mark_stem_dirty();
+        }
+    }
+
+    pub fn remove_section(&mut self, section_id: &str) -> bool {
+        let res = self.timeline.remove_section(section_id);
+        if res {
+            for t in &mut self.tracks {
+                t.mark_stem_dirty();
+            }
+        }
+        res
+    }
+
+    pub fn update_section(&mut self, section: crate::timeline::SongSection) -> bool {
+        let res = self.timeline.update_section(section);
+        if res {
+            for t in &mut self.tracks {
+                t.mark_stem_dirty();
+            }
+        }
+        res
+    }
+
+    pub fn set_track_block(&mut self, section_id: &str, block: crate::timeline::TrackBlock) -> bool {
+        let track_id = block.track_id.clone();
+        let res = self.timeline.set_track_block(section_id, block);
+        if res {
+            self.mark_track_dirty(&track_id);
+        }
+        res
+    }
+
+    pub fn remove_track_block(&mut self, section_id: &str, track_id: &str) -> bool {
+        let res = self.timeline.remove_track_block(section_id, track_id);
+        if res {
+            self.mark_track_dirty(track_id);
+        }
+        res
+    }
+
+    pub fn set_section_tempo(&mut self, section_id: &str, tempo: Option<crate::timeline::TempoOverride>) -> bool {
+        let res = self.timeline.set_section_tempo(section_id, tempo);
+        if res {
+            for t in &mut self.tracks {
+                t.mark_stem_dirty();
+            }
+        }
+        res
+    }
+
+    pub fn set_block_tempo(&mut self, section_id: &str, track_id: &str, tempo: Option<crate::timeline::TempoOverride>) -> bool {
+        let res = self.timeline.set_block_tempo(section_id, track_id, tempo);
+        if res {
+            self.mark_track_dirty(track_id);
+        }
+        res
+    }
+
+    pub fn set_project_time_signature(&mut self, time_signature: crate::timeline::TimeSignature) {
+        self.timeline.set_project_time_signature(time_signature);
+        for t in &mut self.tracks {
+            t.mark_stem_dirty();
+        }
+    }
+
+    pub fn set_section_time_signature(&mut self, section_id: &str, time_signature: Option<crate::timeline::TimeSignature>) -> bool {
+        let res = self.timeline.set_section_time_signature(section_id, time_signature);
+        if res {
+            for t in &mut self.tracks {
+                t.mark_stem_dirty();
+            }
+        }
+        res
+    }
+
+    pub fn set_block_time_signature(&mut self, section_id: &str, track_id: &str, time_signature: Option<crate::timeline::TimeSignature>) -> bool {
+        let res = self.timeline.set_block_time_signature(section_id, track_id, time_signature);
+        if res {
+            self.mark_track_dirty(track_id);
+        }
+        res
     }
 
     pub fn set_sample_rate(&mut self, rate: f32) {
@@ -671,7 +883,127 @@ impl JamSeqHost {
         order
     }
 
-    pub fn load_arrangement(&mut self, arrangement: TimelineArrangement) {
+    pub fn load_arrangement(&mut self, mut arrangement: TimelineArrangement) {
+        // If the arrangement did not have tracks saved (e.g. legacy or minimal project) and host has no tracks, auto-discover
+        if arrangement.tracks.is_empty() && self.tracks.is_empty() {
+            arrangement.discover_tracks_from_content();
+        }
+
+        // 1. Restore Master Bus
+        if let Some(ref mb) = arrangement.master_bus {
+            self.master_bus.volume = mb.volume;
+            self.master_bus.pan = mb.pan;
+            self.master_bus.muted = mb.muted;
+            self.master_bus.inserts.clear();
+            for ins in &mb.inserts {
+                if self.add_master_insert(&ins.uri, &ins.name) {
+                    if let Some(inst) = self.master_bus.inserts.last_mut() {
+                        for (p_name, &p_val) in &ins.parameters {
+                            inst.set_parameter(p_name, p_val);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Restore Aux Buses
+        if !arrangement.aux_buses.is_empty() {
+            self.aux_buses.clear();
+            self.aux_map.clear();
+            self.aux_left.clear();
+            self.aux_right.clear();
+            for ab in &arrangement.aux_buses {
+                self.add_aux_bus(&ab.id, &ab.name);
+                if let Some(&idx) = self.aux_map.get(&ab.id) {
+                    self.aux_buses[idx].volume = ab.volume;
+                    self.aux_buses[idx].pan = ab.pan;
+                    self.aux_buses[idx].muted = ab.muted;
+                    self.aux_buses[idx].solo = ab.solo;
+                    for ins in &ab.inserts {
+                        if self.add_aux_insert(&ab.id, &ins.uri, &ins.name) {
+                            if let Some(inst) = self.aux_buses[idx].inserts.last_mut() {
+                                for (p_name, &p_val) in &ins.parameters {
+                                    inst.set_parameter(p_name, p_val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Restore Tracks & Plugins
+        if !arrangement.tracks.is_empty() {
+            self.tracks.clear();
+            self.track_map.clear();
+            for tc in &arrangement.tracks {
+                self.add_custom_track(&tc.id, &tc.name, &tc.track_type);
+                if let Some(&idx) = self.track_map.get(&tc.id) {
+                    self.tracks[idx].volume = tc.volume;
+                    self.tracks[idx].pan = tc.pan;
+                    self.tracks[idx].muted = tc.muted;
+                    self.tracks[idx].solo = tc.solo;
+                    if let Some(ref p) = tc.current_plugin {
+                        self.tracks[idx].current_plugin = Some(p.clone());
+                    }
+
+                    // Restore instrument parameters!
+                    for (p_name, &p_val) in &tc.parameters {
+                        self.tracks[idx].set_parameter(p_name, p_val);
+                    }
+
+                    // Restore inserts & their parameters!
+                    for ins in &tc.inserts {
+                        if self.add_track_insert(&tc.id, &ins.uri, &ins.name) {
+                            if let Some(inst) = self.tracks[idx].inserts.last_mut() {
+                                for (p_name, &p_val) in &ins.parameters {
+                                    inst.set_parameter(p_name, p_val);
+                                }
+                            }
+                        }
+                    }
+
+                    // Restore aux sends
+                    for s in &tc.sends {
+                        self.set_track_aux_send(&tc.id, &s.target_bus_id, s.gain, s.is_pre_fader);
+                    }
+
+                    // Restore sidechains
+                    for sc in &tc.sidechains {
+                        self.set_insert_sidechain(&tc.id, sc.target_insert_index, &sc.target_track_id, sc.gain);
+                    }
+                }
+            }
+        } else {
+            // If arrangement has no tracks specified, ensure any track IDs referenced in sections/events exist
+            let mut missing_ids = Vec::new();
+            for sec in &arrangement.sections {
+                for (t_id, _) in &sec.track_blocks {
+                    if !self.track_map.contains_key(t_id) && !missing_ids.contains(t_id) {
+                        missing_ids.push(t_id.clone());
+                    }
+                }
+            }
+            for ev in &arrangement.events {
+                if !self.track_map.contains_key(&ev.track_id) && !missing_ids.contains(&ev.track_id) {
+                    missing_ids.push(ev.track_id.clone());
+                }
+            }
+            for id in missing_ids {
+                let track_type = if id.starts_with("audio_") || id.starts_with("mic_") { "audio" } else { "synth" };
+                let name = if id.starts_with("track_") {
+                    let num = id.strip_prefix("track_").unwrap_or("1");
+                    format!("MIDI Track {}", num)
+                } else if id.starts_with("audio_") {
+                    let num = id.strip_prefix("audio_").unwrap_or("1");
+                    format!("Audio Track {}", num)
+                } else {
+                    id.clone()
+                };
+                self.add_custom_track(&id, &name, track_type);
+            }
+        }
+
         self.timeline.load_arrangement(arrangement);
         for t in &mut self.tracks {
             t.mark_stem_dirty();
@@ -809,12 +1141,16 @@ impl JamSeqHost {
         self.sidechain_buffers.clear();
         let track_order = self.get_track_processing_order();
 
+        let current_tick = self.timeline.current_tick;
+
         // Render all tracks into master bus and tap aux sends & sidechains
         for &track_idx in &track_order {
             let track = &mut self.tracks[track_idx];
             if any_solo && !track.solo {
                 continue;
             }
+            let effective_bpm = self.timeline.get_track_effective_bpm(&track.id, current_tick);
+            track.set_tempo(effective_bpm);
             let is_armed = self.armed_track_id.as_deref() == Some(&track.id);
             track.process_block(
                 current_sample,
@@ -1181,6 +1517,7 @@ impl JamSeqHost {
     pub fn mark_track_dirty(&mut self, track_id: &str) {
         if let Some(&idx) = self.track_map.get(track_id) {
             self.tracks[idx].mark_stem_dirty();
+            self.stem_cache.invalidate_track(track_id);
         }
         let dep_tracks: Vec<String> = self.tracks.iter()
             .flat_map(|t| {
@@ -1195,11 +1532,133 @@ impl JamSeqHost {
         for dep_id in dep_tracks {
             if let Some(&idx) = self.track_map.get(&dep_id) {
                 self.tracks[idx].mark_stem_dirty();
+                self.stem_cache.invalidate_track(&dep_id);
             }
         }
     }
 
+    /// Offline render a single track block for a given (track_id, section_id).
+    /// Uses StemCacheManager to bypass rendering if a matching content hash is already cached.
+    pub fn render_track_block(&mut self, track_id: &str, section_id: &str) -> Result<crate::sampler::SampleBuffer> {
+        let &target_idx = self.track_map.get(track_id).ok_or_else(|| anyhow::anyhow!("Track not found: {}", track_id))?;
+        let (section_idx, sec) = self.timeline.sections.iter().enumerate()
+            .find(|(_, s)| s.id == section_id)
+            .ok_or_else(|| anyhow::anyhow!("Section not found: {}", section_id))?;
+        
+        let block = match sec.track_blocks.get(track_id) {
+            Some(b) => b.clone(),
+            None => {
+                return Ok(crate::sampler::SampleBuffer {
+                    channels: 2,
+                    sample_rate: self.sample_rate as u32,
+                    samples_left: Vec::new(),
+                    samples_right: Vec::new(),
+                });
+            }
+        };
+
+        let eff_sec_bpm = sec.effective_bpm(self.timeline.bpm);
+        let eff_block_bpm = block.effective_bpm(eff_sec_bpm);
+        let patch_summary = format!("{:?}", self.tracks[target_idx].get_parameters());
+        let cache_key = self.stem_cache.compute_block_key(track_id, section_id, &block, Some(&patch_summary), eff_block_bpm);
+
+        // Check cache first!
+        if let Ok(buf) = self.stem_cache.load_chunk(&cache_key) {
+            return Ok(buf);
+        }
+
+        // Cache miss: render block audio
+        let orig_stem = self.tracks[target_idx].cached_stem.take();
+        let orig_states: Vec<(bool, bool)> = self.tracks.iter().map(|t| (t.muted, t.solo)).collect();
+        let orig_aux_mutes: Vec<bool> = self.aux_buses.iter().map(|b| b.muted).collect();
+        let orig_pos = self.timeline.current_tick;
+        let orig_loop = self.timeline.loop_enabled;
+        let orig_master_inserts = std::mem::take(&mut self.master_bus.inserts);
+        let orig_track_vol = self.tracks[target_idx].volume;
+        let orig_track_pan = self.tracks[target_idx].pan;
+        let orig_master_gain = self.master_gain;
+        let orig_master_vol = self.master_bus.volume;
+        let orig_master_pan = self.master_bus.pan;
+
+        // Solo target track at unity gain
+        for t in &mut self.tracks {
+            t.solo = t.id == track_id;
+            t.muted = false;
+        }
+        self.tracks[target_idx].volume = 1.0;
+        self.tracks[target_idx].pan = 0.0;
+        self.master_gain = 1.0;
+        self.master_bus.volume = 1.0;
+        self.master_bus.pan = 0.0;
+        for b in &mut self.aux_buses {
+            b.muted = true;
+        }
+
+        let section_start_tick = self.timeline.section_start_tick(section_idx);
+        let block_start_tick = section_start_tick + block.start_offset_ticks;
+        let block_dur_ticks = block.effective_length_ticks().max(crate::timeline::TICKS_PER_16TH);
+        let total_samples = self.timeline.ticks_to_samples(block_dur_ticks) as usize;
+
+        self.timeline.seek_tick(block_start_tick);
+        self.timeline.loop_enabled = false;
+        self.timeline.play();
+
+        let mut samples_left = Vec::with_capacity(total_samples);
+        let mut samples_right = Vec::with_capacity(total_samples);
+
+        let block_size = 512;
+        let mut left = vec![0.0f32; block_size];
+        let mut right = vec![0.0f32; block_size];
+        let mut rendered = 0;
+
+        while rendered < total_samples {
+            let current_block = (total_samples - rendered).min(block_size);
+            self.process_block(&mut left[..current_block], &mut right[..current_block]);
+            samples_left.extend_from_slice(&left[..current_block]);
+            samples_right.extend_from_slice(&right[..current_block]);
+            rendered += current_block;
+        }
+
+        self.timeline.pause();
+        for t in &mut self.tracks {
+            t.all_notes_off();
+        }
+
+        // Restore target track states
+        self.tracks[target_idx].cached_stem = orig_stem;
+        self.tracks[target_idx].volume = orig_track_vol;
+        self.tracks[target_idx].pan = orig_track_pan;
+        self.master_gain = orig_master_gain;
+        self.master_bus.volume = orig_master_vol;
+        self.master_bus.pan = orig_master_pan;
+        for (i, t) in self.tracks.iter_mut().enumerate() {
+            if i < orig_states.len() {
+                t.muted = orig_states[i].0;
+                t.solo = orig_states[i].1;
+            }
+        }
+        for (i, b) in self.aux_buses.iter_mut().enumerate() {
+            if i < orig_aux_mutes.len() {
+                b.muted = orig_aux_mutes[i];
+            }
+        }
+        self.master_bus.inserts = orig_master_inserts;
+        self.timeline.loop_enabled = orig_loop;
+        self.timeline.seek_tick(orig_pos);
+
+        // Store into cache
+        let _ = self.stem_cache.store_chunk(&cache_key, &samples_left, &samples_right, self.sample_rate as u32);
+
+        Ok(crate::sampler::SampleBuffer {
+            channels: 2,
+            sample_rate: self.sample_rate as u32,
+            samples_left,
+            samples_right,
+        })
+    }
+
     /// Autogenerate stems in memory for all dirty tracks.
+    /// If sections have track blocks, blocks are cached and stitched per (track, section).
     /// Returns the number of stems generated.
     pub fn generate_stems_for_dirty_tracks(&mut self) -> usize {
         let dirty_ids: Vec<String> = self.tracks.iter()
@@ -1211,10 +1670,65 @@ impl JamSeqHost {
             return 0;
         }
 
-        let num_bars = ((self.timeline.total_ticks / (4 * crate::timeline::PPQ)) as u32).max(1);
         let mut generated_count = 0;
 
         for track_id in dirty_ids {
+            let has_blocks = self.timeline.sections.iter().any(|s| s.track_blocks.contains_key(&track_id));
+
+            if has_blocks {
+                let total_ticks = self.timeline.sections.iter().map(|s| s.length_ticks()).sum::<u64>().max(4 * crate::timeline::PPQ);
+                let total_samples = self.timeline.ticks_to_samples(total_ticks) as usize;
+                let mut full_left = vec![0.0f32; total_samples];
+                let mut full_right = vec![0.0f32; total_samples];
+
+                let mut rendered_any = false;
+                let mut sec_accum_ticks = 0u64;
+                let section_ids: Vec<String> = self.timeline.sections.iter().map(|s| s.id.clone()).collect();
+                for sec_id in section_ids {
+                    let (sec_len, maybe_block) = {
+                        let sec = self.timeline.sections.iter().find(|s| s.id == sec_id).unwrap();
+                        (sec.length_ticks(), sec.track_blocks.get(&track_id).cloned())
+                    };
+
+                    if let Some(block) = maybe_block {
+                        if let Ok(buf) = self.render_track_block(&track_id, &sec_id) {
+                            let block_start_tick = sec_accum_ticks + block.start_offset_ticks;
+                            let start_sample = self.timeline.ticks_to_samples(block_start_tick) as usize;
+                            for i in 0..buf.samples_left.len() {
+                                if start_sample + i < total_samples {
+                                    full_left[start_sample + i] = buf.samples_left[i];
+                                    full_right[start_sample + i] = buf.samples_right[i];
+                                }
+                            }
+                            rendered_any = true;
+                        }
+                    }
+                    sec_accum_ticks += sec_len;
+                }
+
+                if rendered_any {
+                    if let Some(&idx) = self.track_map.get(&track_id) {
+                        let sample_buf = crate::sampler::SampleBuffer {
+                            channels: 2,
+                            sample_rate: self.sample_rate as u32,
+                            samples_left: full_left,
+                            samples_right: full_right,
+                        };
+                        let clip = crate::audio_clip::AudioClip::from_buffer(
+                            std::path::PathBuf::from(format!("autostem_{}.wav", track_id)),
+                            0,
+                            sample_buf,
+                        );
+                        self.tracks[idx].cached_stem = Some(clip);
+                        self.tracks[idx].stem_dirty = false;
+                        generated_count += 1;
+                        continue;
+                    }
+                }
+            }
+
+            // Fallback for flat legacy event timeline
+            let num_bars = ((self.timeline.total_ticks / (4 * crate::timeline::PPQ)) as u32).max(1);
             match self.render_track_to_buffer(&track_id, num_bars) {
                 Ok(buf) => {
                     if let Some(&idx) = self.track_map.get(&track_id) {
