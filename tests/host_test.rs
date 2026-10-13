@@ -1721,5 +1721,26 @@ fn test_param_grouping_and_typed_controls() {
     assert!(status_json.contains("\"group\":\"Filter\""));
     assert!(status_json.contains("\"group\":\"Amp Envelope\""));
     assert!(status_json.contains("\"param_type\":\"Float\""));
+
+    // Verify project persistence of parameters
+    let temp_path = std::env::temp_dir().join("test_param_persistence.jam.json");
+    let saved_val = {
+        let mut h = host.lock().unwrap();
+        // Modify a parameter value
+        h.tracks[0].set_parameter("cutoff", 880.0);
+        let val = h.tracks[0].get_parameters().iter().find(|(n, _, _, _)| n.to_lowercase() == "cutoff").unwrap().1;
+        h.save_project_to_file(&temp_path).expect("Failed to save project");
+        val
+    };
+
+    let mut reload_host = JamSeqHost::new(120.0, 48000.0);
+    reload_host.load_project_from_file(&temp_path).expect("Failed to load project");
+    assert_eq!(reload_host.tracks.len(), 1);
+
+    let reloaded_statuses = reload_host.tracks[0].get_param_statuses();
+    let reloaded_cutoff = reloaded_statuses.iter().find(|p| p.name.to_lowercase() == "cutoff").unwrap();
+    assert!((reloaded_cutoff.value - saved_val).abs() < 1e-4, "Cutoff value must be restored from project file");
+
+    let _ = std::fs::remove_file(&temp_path);
 }
 
