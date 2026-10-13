@@ -350,6 +350,31 @@ impl ScheduledEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InsertConfig {
+    pub name: String,
+    pub uri: String,
+    #[serde(default)]
+    pub parameters: HashMap<String, f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuxSendConfig {
+    pub target_bus_id: String,
+    pub gain: f32,
+    #[serde(default)]
+    pub is_pre_fader: bool,
+    #[serde(default)]
+    pub is_muted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SidechainSendConfig {
+    pub target_track_id: String,
+    pub target_insert_index: usize,
+    pub gain: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TrackConfig {
     pub id: String,
     pub name: String,
@@ -365,6 +390,42 @@ pub struct TrackConfig {
     pub solo: bool,
     #[serde(default)]
     pub current_plugin: Option<String>,
+    #[serde(default)]
+    pub parameters: HashMap<String, f32>,
+    #[serde(default)]
+    pub inserts: Vec<InsertConfig>,
+    #[serde(default)]
+    pub sends: Vec<AuxSendConfig>,
+    #[serde(default)]
+    pub sidechains: Vec<SidechainSendConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MasterBusConfig {
+    #[serde(default = "default_volume")]
+    pub volume: f32,
+    #[serde(default)]
+    pub pan: f32,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub inserts: Vec<InsertConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AuxBusConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_volume")]
+    pub volume: f32,
+    #[serde(default)]
+    pub pan: f32,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub solo: bool,
+    #[serde(default)]
+    pub inserts: Vec<InsertConfig>,
 }
 
 fn default_track_type() -> String {
@@ -383,6 +444,10 @@ pub struct TimelineArrangement {
     pub loop_enabled: bool,
     #[serde(default)]
     pub tracks: Vec<TrackConfig>,
+    #[serde(default)]
+    pub master_bus: Option<MasterBusConfig>,
+    #[serde(default)]
+    pub aux_buses: Vec<AuxBusConfig>,
     pub sections: Vec<SongSection>,
     pub events: Vec<ScheduledEvent>,
 }
@@ -395,6 +460,8 @@ impl Default for TimelineArrangement {
             total_bars: 0,
             loop_enabled: true,
             tracks: Vec::new(),
+            master_bus: None,
+            aux_buses: Vec::new(),
             sections: Vec::new(),
             events: Vec::new(),
         }
@@ -450,6 +517,10 @@ impl TimelineArrangement {
                 muted: false,
                 solo: false,
                 current_plugin: None,
+                parameters: HashMap::new(),
+                inserts: Vec::new(),
+                sends: Vec::new(),
+                sidechains: Vec::new(),
             });
         }
     }
@@ -620,6 +691,8 @@ impl Timeline {
             total_bars,
             loop_enabled: self.loop_enabled,
             tracks: Vec::new(),
+            master_bus: None,
+            aux_buses: Vec::new(),
             sections: self.sections.clone(),
             events: all_events,
         }

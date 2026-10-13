@@ -101,14 +101,48 @@ impl JamSeqHost {
         };
 
         let mut arrangement = self.timeline.to_arrangement();
+
+        // 1. Serialize Tracks with full DSP & parameter state
         arrangement.tracks = self.tracks.iter().map(|t| {
             let t_type = match &t.instrument {
                 crate::track::TrackInstrument::AudioClips(_) => "audio".to_string(),
                 crate::track::TrackInstrument::Sampler(_) => "sampler".to_string(),
-                crate::track::TrackInstrument::Vst3(_) => t.current_plugin.clone().unwrap_or_else(|| "vst3".to_string()),
-                crate::track::TrackInstrument::Lv2(_) => t.current_plugin.clone().unwrap_or_else(|| "lv2".to_string()),
+                crate::track::TrackInstrument::Vst3(v) => format!("vst3:{}", v.path),
+                crate::track::TrackInstrument::Lv2(l) => l.uri.clone(),
+                crate::track::TrackInstrument::Clap(c) => c.path.clone(),
                 _ => "synth".to_string(),
             };
+
+            let parameters: std::collections::HashMap<String, f32> = t.get_parameters()
+                .into_iter()
+                .map(|(name, val, _, _)| (name, val))
+                .collect();
+
+            let inserts: Vec<crate::timeline::InsertConfig> = t.inserts.iter().map(|ins| {
+                let ins_params: std::collections::HashMap<String, f32> = ins.get_parameters()
+                    .into_iter()
+                    .map(|(name, val, _, _)| (name, val))
+                    .collect();
+                crate::timeline::InsertConfig {
+                    name: ins.name().to_string(),
+                    uri: ins.uri().to_string(),
+                    parameters: ins_params,
+                }
+            }).collect();
+
+            let sends = t.sends.iter().map(|s| crate::timeline::AuxSendConfig {
+                target_bus_id: s.target_bus_id.clone(),
+                gain: s.gain,
+                is_pre_fader: s.is_pre_fader,
+                is_muted: s.is_muted,
+            }).collect();
+
+            let sidechains = t.sidechains.iter().map(|s| crate::timeline::SidechainSendConfig {
+                target_track_id: s.target_track_id.clone(),
+                target_insert_index: s.target_insert_index,
+                gain: s.gain,
+            }).collect();
+
             crate::timeline::TrackConfig {
                 id: t.id.clone(),
                 name: t.name.clone(),
@@ -118,6 +152,55 @@ impl JamSeqHost {
                 muted: t.muted,
                 solo: t.solo,
                 current_plugin: t.current_plugin.clone(),
+                parameters,
+                inserts,
+                sends,
+                sidechains,
+            }
+        }).collect();
+
+        // 2. Serialize Master Bus
+        let master_inserts: Vec<crate::timeline::InsertConfig> = self.master_bus.inserts.iter().map(|ins| {
+            let ins_params: std::collections::HashMap<String, f32> = ins.get_parameters()
+                .into_iter()
+                .map(|(name, val, _, _)| (name, val))
+                .collect();
+            crate::timeline::InsertConfig {
+                name: ins.name().to_string(),
+                uri: ins.uri().to_string(),
+                parameters: ins_params,
+            }
+        }).collect();
+
+        arrangement.master_bus = Some(crate::timeline::MasterBusConfig {
+            volume: self.master_bus.volume,
+            pan: self.master_bus.pan,
+            muted: self.master_bus.muted,
+            inserts: master_inserts,
+        });
+
+        // 3. Serialize Aux Buses
+        arrangement.aux_buses = self.aux_buses.iter().map(|b| {
+            let bus_inserts: Vec<crate::timeline::InsertConfig> = b.inserts.iter().map(|ins| {
+                let ins_params: std::collections::HashMap<String, f32> = ins.get_parameters()
+                    .into_iter()
+                    .map(|(name, val, _, _)| (name, val))
+                    .collect();
+                crate::timeline::InsertConfig {
+                    name: ins.name().to_string(),
+                    uri: ins.uri().to_string(),
+                    parameters: ins_params,
+                }
+            }).collect();
+
+            crate::timeline::AuxBusConfig {
+                id: b.id.clone(),
+                name: b.name.clone(),
+                volume: b.volume,
+                pan: b.pan,
+                muted: b.muted,
+                solo: b.solo,
+                inserts: bus_inserts,
             }
         }).collect();
 
@@ -781,6 +864,50 @@ impl JamSeqHost {
             arrangement.discover_tracks_from_content();
         }
 
+        // 1. Restore Master Bus
+        if let Some(ref mb) = arrangement.master_bus {
+            self.master_bus.volume = mb.volume;
+            self.master_bus.pan = mb.pan;
+            self.master_bus.muted = mb.muted;
+            self.master_bus.inserts.clear();
+            for ins in &mb.inserts {
+                if self.add_master_insert(&ins.uri, &ins.name) {
+                    if let Some(inst) = self.master_bus.inserts.last_mut() {
+                        for (p_name, &p_val) in &ins.parameters {
+                            inst.set_parameter(p_name, p_val);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Restore Aux Buses
+        if !arrangement.aux_buses.is_empty() {
+            self.aux_buses.clear();
+            self.aux_map.clear();
+            self.aux_left.clear();
+            self.aux_right.clear();
+            for ab in &arrangement.aux_buses {
+                self.add_aux_bus(&ab.id, &ab.name);
+                if let Some(&idx) = self.aux_map.get(&ab.id) {
+                    self.aux_buses[idx].volume = ab.volume;
+                    self.aux_buses[idx].pan = ab.pan;
+                    self.aux_buses[idx].muted = ab.muted;
+                    self.aux_buses[idx].solo = ab.solo;
+                    for ins in &ab.inserts {
+                        if self.add_aux_insert(&ab.id, &ins.uri, &ins.name) {
+                            if let Some(inst) = self.aux_buses[idx].inserts.last_mut() {
+                                for (p_name, &p_val) in &ins.parameters {
+                                    inst.set_parameter(p_name, p_val);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Restore Tracks & Plugins
         if !arrangement.tracks.is_empty() {
             self.tracks.clear();
             self.track_map.clear();
@@ -793,6 +920,32 @@ impl JamSeqHost {
                     self.tracks[idx].solo = tc.solo;
                     if let Some(ref p) = tc.current_plugin {
                         self.tracks[idx].current_plugin = Some(p.clone());
+                    }
+
+                    // Restore instrument parameters!
+                    for (p_name, &p_val) in &tc.parameters {
+                        self.tracks[idx].set_parameter(p_name, p_val);
+                    }
+
+                    // Restore inserts & their parameters!
+                    for ins in &tc.inserts {
+                        if self.add_track_insert(&tc.id, &ins.uri, &ins.name) {
+                            if let Some(inst) = self.tracks[idx].inserts.last_mut() {
+                                for (p_name, &p_val) in &ins.parameters {
+                                    inst.set_parameter(p_name, p_val);
+                                }
+                            }
+                        }
+                    }
+
+                    // Restore aux sends
+                    for s in &tc.sends {
+                        self.set_track_aux_send(&tc.id, &s.target_bus_id, s.gain, s.is_pre_fader);
+                    }
+
+                    // Restore sidechains
+                    for sc in &tc.sidechains {
+                        self.set_insert_sidechain(&tc.id, sc.target_insert_index, &sc.target_track_id, sc.gain);
                     }
                 }
             }

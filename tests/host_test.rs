@@ -90,6 +90,8 @@ fn test_offline_render_to_wav() {
         total_bars: 1,
         loop_enabled: false,
         tracks: Vec::new(),
+        master_bus: None,
+        aux_buses: Vec::new(),
         sections: vec![jamseq::SongSection::new("test_verse", "Test Verse", 1, 1)],
         events,
     };
@@ -798,6 +800,8 @@ fn test_debug_playback_demo() {
         total_bars: 4,
         loop_enabled: true,
         tracks: Vec::new(),
+        master_bus: None,
+        aux_buses: Vec::new(),
         sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4)],
         events,
     };
@@ -867,6 +871,8 @@ fn test_server_playback_over_ipc() {
         total_bars: 4,
         loop_enabled: true,
         tracks: Vec::new(),
+        master_bus: None,
+        aux_buses: Vec::new(),
         sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4)],
         events,
     };
@@ -1467,24 +1473,38 @@ fn test_project_track_persistence_and_auto_discovery() {
     assert_eq!(host.tracks[0].name, "MIDI Track 1");
     assert_eq!(host.tracks[1].name, "MIDI Track 2");
 
-    // 3. Rename track_1 and save
+    // 3. Tweak parameters on track_1, master bus, and save
     host.tracks[0].name = "Lead Synth".to_string();
     host.tracks[0].volume = 0.75;
+    host.tracks[0].set_parameter("cutoff", 0.72);
+    host.tracks[0].set_parameter("resonance", 0.65);
+    host.master_bus.volume = 0.88;
+
     let saved_file = temp_dir.join("test_track_saved.jam.json");
     let _ = fs::remove_file(&saved_file);
     host.save_project_to_file(&saved_file).expect("Failed to save project");
 
-    // Verify saved JSON contains the "tracks" array
+    // Verify saved JSON contains the "tracks" array, parameter values, and master_bus
     let saved_content = fs::read_to_string(&saved_file).expect("Failed to read saved file");
     assert!(saved_content.contains(r#""tracks""#), "Saved project must contain 'tracks' array");
     assert!(saved_content.contains("Lead Synth"), "Saved project must persist renamed track");
+    assert!(saved_content.contains("parameters"), "Saved project must persist parameters");
+    assert!(saved_content.contains("Cutoff") || saved_content.contains("cutoff"), "Saved project must persist cutoff parameter");
+    assert!(saved_content.contains("master_bus"), "Saved project must persist master_bus");
 
-    // 4. Reload into a new host and verify fidelity
+    // 4. Reload into a new host and verify complete fidelity
     let mut reload_host = JamSeqHost::new(120.0, 44100.0);
     reload_host.load_project_from_file(&saved_file).expect("Failed to reload saved project");
     assert_eq!(reload_host.tracks.len(), 2);
     assert_eq!(reload_host.tracks[0].name, "Lead Synth");
     assert!((reload_host.tracks[0].volume - 0.75).abs() < 1e-4);
+    assert!((reload_host.master_bus.volume - 0.88).abs() < 1e-4);
+
+    let params = reload_host.tracks[0].get_parameters();
+    let cutoff = params.iter().find(|(n, ..)| n == "Cutoff" || n == "cutoff").map(|(.., v, _, _)| *v).unwrap_or(0.0);
+    let resonance = params.iter().find(|(n, ..)| n == "Resonance" || n == "resonance").map(|(.., v, _, _)| *v).unwrap_or(0.0);
+    assert!((cutoff - 0.72).abs() < 1e-2, "Reloaded track must restore cutoff 0.72 (got {})", cutoff);
+    assert!((resonance - 0.65).abs() < 1e-2, "Reloaded track must restore resonance 0.65 (got {})", resonance);
 
     let _ = fs::remove_file(&proj_file);
     let _ = fs::remove_file(&saved_file);
