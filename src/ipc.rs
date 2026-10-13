@@ -339,6 +339,8 @@ pub struct TrackStatus {
     pub sends: Vec<AuxSendStatus>,
     pub sidechains: Vec<SidechainSendStatus>,
     pub current_plugin: Option<String>,
+    #[serde(default)]
+    pub current_bpm: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -865,6 +867,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 sends,
                 sidechains,
                 current_plugin: t.current_plugin.clone(),
+                current_bpm: t.current_bpm,
             }
         })
         .collect();
