@@ -101,11 +101,8 @@ impl JamSeqHost {
         let mut arrangement = TimelineArrangement::default();
         arrangement.title = title.to_string();
         arrangement.bpm = if bpm > 10.0 { bpm } else { 120.0 };
-        arrangement.total_bars = 8;
-        arrangement.sections = vec![
-            crate::timeline::SongSection::new("intro", "Intro", 1, 4, 2),
-            crate::timeline::SongSection::new("verse_1", "Verse 1", 5, 4, 3),
-        ];
+        arrangement.total_bars = 0;
+        arrangement.sections = Vec::new();
         arrangement.events = Vec::new();
         self.tracks.clear();
         self.track_map.clear();
@@ -130,6 +127,22 @@ impl JamSeqHost {
 
     pub fn update_section(&mut self, section: crate::timeline::SongSection) -> bool {
         self.timeline.update_section(section)
+    }
+
+    pub fn set_track_block(&mut self, section_id: &str, block: crate::timeline::TrackBlock) -> bool {
+        self.timeline.set_track_block(section_id, block)
+    }
+
+    pub fn remove_track_block(&mut self, section_id: &str, track_id: &str) -> bool {
+        self.timeline.remove_track_block(section_id, track_id)
+    }
+
+    pub fn set_section_tempo(&mut self, section_id: &str, tempo: Option<crate::timeline::TempoOverride>) -> bool {
+        self.timeline.set_section_tempo(section_id, tempo)
+    }
+
+    pub fn set_block_tempo(&mut self, section_id: &str, track_id: &str, tempo: Option<crate::timeline::TempoOverride>) -> bool {
+        self.timeline.set_block_tempo(section_id, track_id, tempo)
     }
 
     pub fn set_sample_rate(&mut self, rate: f32) {

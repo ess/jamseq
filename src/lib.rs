@@ -21,8 +21,8 @@ pub use plugin_scanner::{DiscoveredPlugin, PluginScanner};
 pub use recorder::{AudioRecorder, RecordedClipInfo};
 pub use sampler::{SamplerConfig, SamplerInstrument};
 pub use timeline::{
-    AutomationPoint, ScheduledAction, ScheduledEvent, SongSection, TimeSignature, Timeline,
-    TimelineArrangement, PPQ, TICKS_PER_16TH,
+    AutomationPoint, LoopMode, ScheduledAction, ScheduledEvent, SongSection, TempoOverride,
+    TimeSignature, Timeline, TimelineArrangement, TrackBlock, PPQ, TICKS_PER_16TH,
 };
 pub use track::{InsertEffect, Track, TrackInstrument};
 pub use vst3_host::Vst3Track;

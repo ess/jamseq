@@ -1014,16 +1014,17 @@ fn test_blank_slate_and_section_management() {
     host.add_section(pickup);
     assert_eq!(host.timeline.sections.len(), 1);
 
-    // Add a 4-bar section starting at 960 ticks (4 bars * 3840 ticks/bar)
+    // Add a 4-bar section starting at 960 ticks (4 bars * 1920 ticks = 7680 ticks)
     let verse = jamseq::timeline::SongSection::from_ticks("verse", "Verse 1", 960, 7680, 3);
     host.add_section(verse);
     assert_eq!(host.timeline.sections.len(), 2);
-    assert_eq!(host.timeline.total_ticks, 15360); // default 4-bar timeline is 15360 ticks
+    // Derived total_ticks is the sum of pickup (960) and verse (7680) = 8640 ticks!
+    assert_eq!(host.timeline.total_ticks, 8640);
 
-    // Add a section extending past 15360
-    let outro = jamseq::timeline::SongSection::from_ticks("outro", "Outro", 15360, 5000, 1);
+    // Add an outro section of length 5000
+    let outro = jamseq::timeline::SongSection::from_ticks("outro", "Outro", 8640, 5000, 1);
     host.add_section(outro);
-    assert_eq!(host.timeline.total_ticks, 15360 + 5000);
+    assert_eq!(host.timeline.total_ticks, 8640 + 5000);
 
     // Test bar/beat normalization
     let mut custom = jamseq::timeline::SongSection::from_ticks("custom", "Bridge", 123, 456, 4);
@@ -1036,20 +1037,102 @@ fn test_blank_slate_and_section_management() {
     assert_eq!(custom.start_tick() % tpb, 0);
     assert_eq!(custom.length_ticks() % tpb, 0);
 
-    // Test removing a section
+    // Test removing a section ripples the timeline derived length
     let removed = host.remove_section("pickup");
     assert!(removed);
     assert_eq!(host.timeline.sections.len(), 2);
+    assert_eq!(host.timeline.total_ticks, 7680 + 5000);
 
-    // Test new_project clears tracks
+    // Test new_project clears tracks and sections to blank slate
     let synth = jamsynth::JamSynthEngine::new(44100.0);
     host.add_track(jamseq::track::Track::new_synth("t1", "Synth", synth));
     assert_eq!(host.tracks.len(), 1);
 
     host.new_project("Fresh Song", 130.0);
     assert_eq!(host.tracks.len(), 0, "new_project must clear tracks to blank slate");
+    assert_eq!(host.timeline.sections.len(), 0, "new_project must start with 0 sections");
+    assert_eq!(host.timeline.total_ticks, 0, "new_project must start with 0 total_ticks");
     assert_eq!(host.timeline.title, "Fresh Song");
     assert_eq!(host.timeline.bpm, 130.0);
+}
+
+#[test]
+fn test_block_hierarchy_and_tempo_inheritance() {
+    use jamseq::timeline::{SongSection, TrackBlock, TempoOverride};
+
+    // 1. An empty section has length 0 and no stored length
+    let mut sec = SongSection::new_empty("v1", "Verse 1", 5);
+    assert_eq!(sec.length_ticks(), 0);
+
+    // 2. Add a 4-bar drum beat (start offset 0, length 3840 ticks)
+    let drum_block = TrackBlock::new("tb_drums", "drums", 3840);
+    sec.set_block(drum_block);
+    assert_eq!(sec.length_ticks(), 3840);
+
+    // 3. Add an 8-bar synth block (start offset 0, length 7680 ticks) -> Section dynamically stretches!
+    let synth_block = TrackBlock::new("tb_synth", "synth", 7680);
+    sec.set_block(synth_block);
+    assert_eq!(sec.length_ticks(), 7680);
+
+    // 4. Add a lead guitar block starting at offset 4 bars (3840) with length 6 bars (5760)
+    // Furthest-reaching extent is 3840 + 5760 = 9600 ticks!
+    let lead_block = TrackBlock::new("tb_lead", "lead", 5760).with_offset(3840);
+    sec.set_block(lead_block);
+    assert_eq!(sec.length_ticks(), 9600);
+
+    // 5. Test Hierarchical Tempo Inheritance
+    let project_bpm = 120.0;
+    // Section without override inherits project BPM
+    assert_eq!(sec.effective_bpm(project_bpm), 120.0);
+
+    // Section with AbsoluteBpm override
+    sec.tempo = Some(TempoOverride::AbsoluteBpm(90.0));
+    assert_eq!(sec.effective_bpm(project_bpm), 90.0);
+
+    // Block with Ratio override (3:2 metric modulation)
+    let mut poly_block = TrackBlock::new("tb_poly", "poly", 1920)
+        .with_tempo(TempoOverride::Ratio(3, 2));
+    assert_eq!(poly_block.effective_bpm(sec.effective_bpm(project_bpm)), 135.0);
+
+    // Block with Ratio override (1:2 half-time)
+    poly_block.tempo = Some(TempoOverride::Ratio(1, 2));
+    assert_eq!(poly_block.effective_bpm(sec.effective_bpm(project_bpm)), 45.0);
+
+    // Block without override inherits section BPM
+    poly_block.tempo = None;
+    assert_eq!(poly_block.effective_bpm(sec.effective_bpm(project_bpm)), 90.0);
+
+    // 6. Test Timeline Derived Geometry and Dynamic Rippling
+    let mut timeline = jamseq::Timeline::new(120.0, 48000.0);
+    assert_eq!(timeline.total_ticks, 0);
+
+    // Section 1: Intro (8 bars = 7680 ticks via synth)
+    let mut intro = SongSection::new_empty("intro", "Intro", 2);
+    intro.set_block(TrackBlock::new("b1", "synth", 7680));
+    timeline.add_section(intro);
+    assert_eq!(timeline.section_start_tick(0), 0);
+    assert_eq!(timeline.total_ticks, 7680);
+
+    // Section 2: Verse 1 (4 bars = 3840 ticks via drums)
+    let mut verse = SongSection::new_empty("verse", "Verse", 4);
+    verse.set_block(TrackBlock::new("b2", "drums", 3840));
+    timeline.add_section(verse);
+    assert_eq!(timeline.section_start_tick(1), 7680);
+    assert_eq!(timeline.total_ticks, 7680 + 3840);
+
+    // Section 3: Chorus 1 (8 bars = 7680 ticks)
+    let mut chorus = SongSection::new_empty("chorus", "Chorus", 8);
+    chorus.set_block(TrackBlock::new("b3", "full", 7680));
+    timeline.add_section(chorus);
+    assert_eq!(timeline.section_start_tick(2), 7680 + 3840);
+    assert_eq!(timeline.total_ticks, 7680 + 3840 + 7680);
+
+    // Dynamic Rippling: Extend Verse 1 by adding an 8-bar guitar track block (7680 ticks)
+    timeline.set_track_block("verse", TrackBlock::new("b4", "guitar", 7680));
+    // Verse 1 length expanded to 7680!
+    // Downstream Chorus 1 automatically ripples from 11520 to 15360!
+    assert_eq!(timeline.section_start_tick(2), 7680 + 7680);
+    assert_eq!(timeline.total_ticks, 7680 + 7680 + 7680);
 }
 
 

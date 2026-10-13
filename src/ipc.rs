@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::timeline::{ScheduledEvent, SongSection};
+use crate::timeline::{ScheduledEvent, SongSection, TempoOverride, TrackBlock};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", content = "args")]
@@ -256,6 +256,27 @@ pub enum IpcCommand {
     /// Update an existing song section in place
     UpdateSection {
         section: SongSection,
+    },
+    /// Add or update a TrackBlock in a section
+    SetTrackBlock {
+        section_id: String,
+        block: TrackBlock,
+    },
+    /// Remove a TrackBlock from a section
+    RemoveTrackBlock {
+        section_id: String,
+        track_id: String,
+    },
+    /// Set a section's tempo override
+    SetSectionTempo {
+        section_id: String,
+        tempo: Option<TempoOverride>,
+    },
+    /// Set a track block's tempo override
+    SetBlockTempo {
+        section_id: String,
+        track_id: String,
+        tempo: Option<TempoOverride>,
     },
 }
 
@@ -760,6 +781,22 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
         }
         IpcCommand::UpdateSection { section } => {
             let _ = h.update_section(section);
+            build_status_response(&h)
+        }
+        IpcCommand::SetTrackBlock { section_id, block } => {
+            let _ = h.set_track_block(&section_id, block);
+            build_status_response(&h)
+        }
+        IpcCommand::RemoveTrackBlock { section_id, track_id } => {
+            let _ = h.remove_track_block(&section_id, &track_id);
+            build_status_response(&h)
+        }
+        IpcCommand::SetSectionTempo { section_id, tempo } => {
+            let _ = h.set_section_tempo(&section_id, tempo);
+            build_status_response(&h)
+        }
+        IpcCommand::SetBlockTempo { section_id, track_id, tempo } => {
+            let _ = h.set_block_tempo(&section_id, &track_id, tempo);
             build_status_response(&h)
         }
         IpcCommand::GetStatus => build_status_response(&h),
