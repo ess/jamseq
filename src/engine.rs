@@ -90,15 +90,22 @@ impl JamSeqHost {
     /// Save the current live arrangement to a project JSON on disk
     pub fn save_project_to_file<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {
         let path_ref = path.as_ref();
+        let path_str = path_ref.to_string_lossy();
+        let final_path = if path_str.ends_with(".jam.json") || path_str.ends_with(".json") {
+            path_ref.to_path_buf()
+        } else {
+            std::path::PathBuf::from(format!("{}.jam.json", path_str))
+        };
+
         let arrangement = self.timeline.to_arrangement();
         let json_data = serde_json::to_string_pretty(&arrangement)
             .context("Failed to serialize arrangement to JSON")?;
-        if let Some(parent) = path_ref.parent() {
+        if let Some(parent) = final_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        std::fs::write(path_ref, json_data)
-            .with_context(|| format!("Failed to write project file to {:?}", path_ref))?;
-        self.project_path = Some(path_ref.to_string_lossy().to_string());
+        std::fs::write(&final_path, json_data)
+            .with_context(|| format!("Failed to write project file to {:?}", final_path))?;
+        self.project_path = Some(final_path.to_string_lossy().to_string());
         Ok(())
     }
 

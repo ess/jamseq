@@ -243,8 +243,8 @@ fn test_ipc_socket_server() {
     let resp: jamseq::ipc::IpcResponse = serde_json::from_str(&resp_line).unwrap();
     assert!(resp.ok);
 
-    // 7. Test SaveProject & LoadProject
-    let test_proj_path = temp_dir.join("test_saved_project.json");
+    // 7. Test SaveProject & LoadProject (.jam.json convention)
+    let test_proj_path = temp_dir.join("test_saved_project.jam.json");
     let test_proj_str = test_proj_path.to_str().unwrap().replace("\\", "/");
     writeln!(
         stream,
