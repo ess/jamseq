@@ -626,6 +626,20 @@ impl JamSeqHost {
         false
     }
 
+    /// Set a parameter on a track's insert effect
+    pub fn set_track_insert_param(&mut self, track_id: &str, insert_index: usize, param_name: &str, value: f32) -> bool {
+        self.mark_track_dirty(track_id);
+        if let Some(&idx) = self.track_map.get(track_id) {
+            let track = &mut self.tracks[idx];
+            if insert_index < track.inserts.len() {
+                track.inserts[insert_index].set_parameter(param_name, value);
+                return true;
+            }
+        }
+        false
+    }
+
+
     /// Add an insert effect to the Master Bus
     pub fn add_master_insert(&mut self, uri_or_path: &str, display_name: &str) -> bool {
         let sr = self.sample_rate;

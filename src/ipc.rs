@@ -140,6 +140,13 @@ pub enum IpcCommand {
         track_id: String,
         insert_index: usize,
     },
+    /// Tweak a track insert effect parameter
+    SetTrackInsertParam {
+        track_id: String,
+        insert_index: usize,
+        param_name: String,
+        value: f32,
+    },
     /// Add an insert effect plugin to the Master Bus
     AddMasterInsert {
         plugin_uri_or_path: String,
@@ -663,6 +670,10 @@ fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRespons
         IpcCommand::RemoveTrackInsert { track_id, insert_index } => {
             h.mark_track_dirty(&track_id);
             h.remove_track_insert(&track_id, insert_index);
+            build_status_response(&h)
+        }
+        IpcCommand::SetTrackInsertParam { track_id, insert_index, param_name, value } => {
+            h.set_track_insert_param(&track_id, insert_index, &param_name, value);
             build_status_response(&h)
         }
         IpcCommand::AddMasterInsert { plugin_uri_or_path, plugin_name } => {

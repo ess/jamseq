@@ -247,6 +247,35 @@ fn test_ipc_socket_server() {
     let resp: jamseq::ipc::IpcResponse = serde_json::from_str(&resp_line).unwrap();
     assert!(resp.ok);
 
+    // 6b. Test AddTrackInsert & SetTrackInsertParam over IPC
+    let jamsynth_path = if std::path::Path::new("target/debug/libjamsynth.so").exists() {
+        "target/debug/libjamsynth.so"
+    } else {
+        "../target/debug/libjamsynth.so"
+    };
+    writeln!(
+        stream,
+        "{{\"cmd\":\"AddTrackInsert\",\"args\":{{\"track_id\":\"vox\",\"plugin_uri_or_path\":\"{}\",\"plugin_name\":\"JamSynth Insert\"}}}}",
+        jamsynth_path
+    ).unwrap();
+    resp_line.clear();
+    reader.read_line(&mut resp_line).unwrap();
+    let resp: jamseq::ipc::IpcResponse = serde_json::from_str(&resp_line).unwrap();
+    assert!(resp.ok);
+    assert_eq!(resp.status.as_ref().unwrap().tracks[0].inserts.len(), 1);
+
+    writeln!(
+        stream,
+        "{{\"cmd\":\"SetTrackInsertParam\",\"args\":{{\"track_id\":\"vox\",\"insert_index\":0,\"param_name\":\"cutoff\",\"value\":0.72}}}}"
+    ).unwrap();
+    resp_line.clear();
+    reader.read_line(&mut resp_line).unwrap();
+    let resp: jamseq::ipc::IpcResponse = serde_json::from_str(&resp_line).unwrap();
+    assert!(resp.ok);
+    let insert_params = &resp.status.as_ref().unwrap().tracks[0].inserts[0].params;
+    let cutoff_param = insert_params.iter().find(|p| p.name.to_lowercase() == "cutoff").unwrap();
+    assert!((cutoff_param.value - 0.72).abs() < 1e-3);
+
     // 7. Test SaveProject & LoadProject (.jam.json convention)
     let test_proj_path = temp_dir.join("test_saved_project.jam.json");
     let test_proj_str = test_proj_path.to_str().unwrap().replace("\\", "/");
@@ -1008,6 +1037,55 @@ fn test_vst3_insert_effect_on_track() {
     let peak: f32 = out_l.iter().chain(out_r.iter()).map(|s| s.abs()).fold(0.0, f32::max);
     println!("Track with VST3 insert audio output peak: {}", peak);
     assert!(peak > 0.0001, "Expected audio output from track through VST3 insert");
+}
+
+#[test]
+fn test_track_insert_param_update() {
+    let jamsynth_path = if std::path::Path::new("target/debug/libjamsynth.so").exists() {
+        "target/debug/libjamsynth.so"
+    } else if std::path::Path::new("../target/debug/libjamsynth.so").exists() {
+        "../target/debug/libjamsynth.so"
+    } else {
+        panic!("libjamsynth.so not found");
+    };
+
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    host.add_custom_track("track_0", "Sub Bass", "synth:sub808");
+
+    // Add insert effect to track 0
+    let success = host.add_track_insert("track_0", jamsynth_path, "JamSynth Insert");
+    assert!(success, "Failed to add JamSynth insert to track");
+    assert_eq!(host.tracks[0].inserts.len(), 1);
+
+    // Initial parameters
+    let initial_params = host.tracks[0].inserts[0].get_parameters();
+    let _initial_cutoff = initial_params.iter().find(|p| p.0.to_lowercase() == "cutoff").map(|p| p.1).unwrap_or(0.0);
+
+    // Change parameter via set_track_insert_param
+    let target_cutoff = 0.75;
+    assert!(host.set_track_insert_param("track_0", 0, "cutoff", target_cutoff));
+
+    // Verify parameter changed and persisted on the insert
+    let updated_params = host.tracks[0].inserts[0].get_parameters();
+    let updated_cutoff = updated_params.iter().find(|p| p.0.to_lowercase() == "cutoff").map(|p| p.1).unwrap_or(0.0);
+    assert!((updated_cutoff - target_cutoff).abs() < 1e-3, "Expected cutoff to be updated to {}, got {}", target_cutoff, updated_cutoff);
+
+    // Verify track stem is marked dirty
+    assert!(host.tracks[0].stem_dirty);
+
+    // Verify project persistence saves the updated insert parameters
+    let tmp_path = std::env::temp_dir().join("test_insert_params.jam.json");
+    host.save_project_to_file(&tmp_path).expect("Failed to save project");
+
+    let mut new_host = JamSeqHost::new(120.0, 48000.0);
+    new_host.load_project_from_file(&tmp_path).expect("Failed to load project");
+
+    assert_eq!(new_host.tracks[0].inserts.len(), 1);
+    let loaded_params = new_host.tracks[0].inserts[0].get_parameters();
+    let loaded_cutoff = loaded_params.iter().find(|p| p.0.to_lowercase() == "cutoff").map(|p| p.1).unwrap_or(0.0);
+    assert!((loaded_cutoff - target_cutoff).abs() < 1e-3, "Loaded insert parameter must match saved parameter");
+
+    let _ = std::fs::remove_file(tmp_path);
 }
 
 #[test]
