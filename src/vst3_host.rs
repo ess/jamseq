@@ -116,7 +116,29 @@ impl Vst3Track {
             } else if step_count > 64 {
                 crate::ipc::ParamType::Int
             } else {
-                crate::ipc::ParamType::Float
+                // step_count == 0: Plugins like Surge XT may report step_count = 0 for discrete mode/type parameters
+                let n = p.name.to_lowercase();
+                let is_likely_enum = n.contains("type") || n.contains("mode") || n.contains("model") || n.contains("waveform") || n.contains("algorithm") || n.contains("shape");
+                let mut probed_enum = None;
+                if is_likely_enum {
+                    let num_probes = 48;
+                    let mut probe_labels = Vec::new();
+                    for step in 0..=num_probes {
+                        let norm = step as f64 / num_probes as f64;
+                        if let Ok(label) = plugin.format_parameter(p.id, norm) {
+                            let trimmed = label.trim().to_string();
+                            if !trimmed.is_empty() && !probe_labels.contains(&trimmed) {
+                                probe_labels.push(trimmed);
+                            }
+                        }
+                    }
+                    let has_named = probe_labels.iter().any(|l| l.parse::<f64>().is_err());
+                    if probe_labels.len() >= 2 && probe_labels.len() <= 64 && has_named {
+                        probed_enum = Some(crate::ipc::ParamType::Enum { labels: probe_labels });
+                    }
+                }
+
+                probed_enum.unwrap_or(crate::ipc::ParamType::Float)
             };
 
             let display_value = plugin.format_parameter(p.id, p.value).ok().and_then(|s| {

@@ -1744,3 +1744,35 @@ fn test_param_grouping_and_typed_controls() {
     let _ = std::fs::remove_file(&temp_path);
 }
 
+#[test]
+fn test_surge_xt_effects_enum_type() {
+    let surge_clap = std::path::Path::new("/usr/lib/clap/Surge XT Effects.clap");
+    if !surge_clap.exists() {
+        return;
+    }
+
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    host.add_custom_track("track_1", "Synth Track", "synth:reese");
+    let added = host.add_track_insert("track_1", "/usr/lib/clap/Surge XT Effects.clap", "Surge XT Effects (CLAP)");
+    assert!(added, "Surge XT Effects CLAP must load successfully");
+
+    let lead_idx = host.track_map["track_1"];
+    let statuses = host.tracks[lead_idx].inserts[0].get_param_statuses();
+    let fx_type = statuses.iter().find(|p| p.name == "FX Type").expect("FX Type parameter must exist");
+
+    match &fx_type.param_type {
+        jamseq::ipc::ParamType::Enum { labels } => {
+            assert!(labels.len() >= 20, "Surge XT Effects should discover at least 20 effect labels, discovered {}", labels.len());
+            assert!(labels.iter().any(|l: &String| l.contains("Delay") || l.contains("Reverb")), "Discovered labels should contain Delay or Reverb");
+        }
+        other => panic!("Expected ParamType::Enum for 'FX Type', got {:?}", other),
+    }
+
+    // Test setting parameter to an enum index value and verifying display_value
+    host.tracks[lead_idx].inserts[0].set_parameter("FX Type", 0.05);
+    let updated_statuses = host.tracks[lead_idx].inserts[0].get_param_statuses();
+    let updated_fx_type = updated_statuses.iter().find(|p| p.name == "FX Type").unwrap();
+    assert!(updated_fx_type.display_value.as_ref().map(|s| s.contains("Reverb")).unwrap_or(false),
+        "Setting FX Type to 0.05 should update display_value to Reverb, got: {:?}", updated_fx_type.display_value);
+}
+

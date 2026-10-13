@@ -221,7 +221,30 @@ impl ClapTrack {
                                 } else if is_stepped {
                                     crate::ipc::ParamType::Int
                                 } else {
-                                    crate::ipc::ParamType::Float
+                                    // Plugins like Surge XT may omit IS_STEPPED / IS_ENUM for type/mode parameters with 0.0..1.0 float ranges
+                                    let n = name.to_lowercase();
+                                    let is_likely_enum = n.contains("type") || n.contains("mode") || n.contains("model") || n.contains("waveform") || n.contains("algorithm") || n.contains("shape");
+                                    let mut probed_enum = None;
+                                    if is_likely_enum {
+                                        let num_probes = 48;
+                                        let mut probe_labels = Vec::new();
+                                        let mut text_buf = [0u8; 128];
+                                        for step in 0..=num_probes {
+                                            let probe_val = min as f64 + (step as f64 / num_probes as f64) * (max as f64 - min as f64);
+                                            if let Ok(bytes) = params_ext.value_to_text(&handle, info.id, probe_val, &mut text_buf) {
+                                                let trimmed = String::from_utf8_lossy(bytes).trim().to_string();
+                                                if !trimmed.is_empty() && !probe_labels.contains(&trimmed) {
+                                                    probe_labels.push(trimmed);
+                                                }
+                                            }
+                                        }
+                                        let has_named = probe_labels.iter().any(|l| l.parse::<f64>().is_err());
+                                        if probe_labels.len() >= 2 && probe_labels.len() <= 64 && has_named {
+                                            probed_enum = Some(crate::ipc::ParamType::Enum { labels: probe_labels });
+                                        }
+                                    }
+
+                                    probed_enum.unwrap_or(crate::ipc::ParamType::Float)
                                 };
 
                                 let mut text_buf = [0u8; 128];
@@ -371,7 +394,12 @@ impl ClapTrack {
 
                 param.value = clamped;
                 if let crate::ipc::ParamType::Enum { ref labels } = param.param_type {
-                    let step_idx = (clamped - param.min).round() as usize;
+                    let step_idx = if labels.len() > 1 && (param.max - param.min) <= 1.0 {
+                        let norm = (clamped - param.min) / (param.max - param.min);
+                        (norm * (labels.len() - 1) as f32).round() as usize
+                    } else {
+                        (clamped - param.min).round() as usize
+                    };
                     if let Some(lbl) = labels.get(step_idx) {
                         param.display_value = Some(lbl.clone());
                     }
