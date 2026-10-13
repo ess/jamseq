@@ -1794,3 +1794,53 @@ fn test_surge_xt_effects_lv2_master_insert() {
     host.process_block(&mut left, &mut right);
 }
 
+#[test]
+fn test_surge_xt_effects_clap_parameter_names_and_groups() {
+    let vst3_path = "/usr/lib/vst3/Surge XT Effects.vst3";
+    let clap_path = "/usr/lib/clap/Surge XT Effects.clap";
+
+    if !std::path::Path::new(clap_path).exists() {
+        return;
+    }
+
+    let track = jamseq::clap_host::ClapTrack::load(clap_path, 48000.0).expect("Should load Surge XT Effects CLAP");
+    let statuses = track.get_param_statuses();
+
+    println!("=== VERIFYING CLAP PARAMETERS ===");
+    for p in &statuses {
+        println!("CLAP param: name='{}', group='{}', type={:?}, val={}, disp={:?}",
+            p.name, p.group, p.param_type, p.value, p.display_value);
+    }
+
+    // Verify that parameters are NOT named generic "FX Parameter N"
+    assert!(
+        !statuses.iter().any(|p| p.name.starts_with("FX Parameter")),
+        "CLAP parameters should have specific names, not generic 'FX Parameter N'"
+    );
+
+    // Verify specific parameter names exist
+    assert!(statuses.iter().any(|p| p.name == "Delay Time Left"), "Expected 'Delay Time Left'");
+    assert!(statuses.iter().any(|p| p.name == "Delay Time Right"), "Expected 'Delay Time Right'");
+    assert!(statuses.iter().any(|p| p.name == "EQ Feedback"), "Expected 'EQ Feedback'");
+    assert!(statuses.iter().any(|p| p.name == "FX Type"), "Expected 'FX Type'");
+
+    // Verify parameter grouping: "EQ Feedback" must belong to "Feedback" group
+    let feedback_param = statuses.iter().find(|p| p.name == "EQ Feedback").expect("EQ Feedback param");
+    assert_eq!(feedback_param.group, "Feedback", "EQ Feedback should be grouped under 'Feedback'");
+
+    // If VST3 is also installed, verify the parameter names match between CLAP and VST3
+    if std::path::Path::new(vst3_path).exists() {
+        let vst3_track = jamseq::vst3_host::Vst3Track::load(vst3_path, 48000.0).expect("Should load VST3");
+        let vst3_statuses = vst3_track.get_param_statuses();
+
+        let clap_names: Vec<&str> = statuses.iter().map(|p| p.name.as_str()).collect();
+        let vst3_names: Vec<&str> = vst3_statuses.iter().map(|p| p.name.as_str()).collect();
+
+        // Check that key effect parameters match
+        for key_param in &["Delay Time Left", "Delay Time Right", "EQ Feedback", "EQ Crossfeed", "FX Type"] {
+            assert!(clap_names.contains(key_param), "CLAP should contain {}", key_param);
+            assert!(vst3_names.contains(key_param), "VST3 should contain {}", key_param);
+        }
+    }
+}
+

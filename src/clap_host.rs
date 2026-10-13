@@ -1,4 +1,7 @@
-use clack_extensions::params::{ParamInfoBuffer, ParamInfoFlags, PluginParams};
+use clack_extensions::params::{
+    HostParams, HostParamsImplMainThread, HostParamsImplShared, ParamClearFlags, ParamInfoBuffer,
+    ParamInfoFlags, ParamRescanFlags, PluginParams,
+};
 use clack_extensions::timer::{HostTimer, HostTimerImpl, PluginTimer, TimerId};
 use clack_host::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent, TransportEvent, TransportFlags};
 use clack_host::events::EventFlags;
@@ -6,13 +9,37 @@ use clack_host::host::HostError;
 use clack_host::prelude::*;
 use clack_host::utils::{BeatTime, SecondsTime};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc as StdArc, Mutex};
+
+pub struct JamSeqClapShared {
+    pub rescan_needed: StdArc<AtomicBool>,
+}
+
+impl<'a> SharedHandler<'a> for JamSeqClapShared {
+    fn request_restart(&self) {}
+    fn request_process(&self) {}
+    fn request_callback(&self) {}
+}
+
+impl HostParamsImplShared for JamSeqClapShared {
+    fn request_flush(&self) {}
+}
 
 pub struct JamSeqClapMainThread {
     pub timers: StdArc<Mutex<Vec<TimerId>>>,
+    pub rescan_needed: StdArc<AtomicBool>,
 }
 
 impl<'a> MainThreadHandler<'a> for JamSeqClapMainThread {}
+
+impl HostParamsImplMainThread for JamSeqClapMainThread {
+    fn rescan(&self, _flags: ParamRescanFlags) {
+        self.rescan_needed.store(true, Ordering::Relaxed);
+    }
+
+    fn clear(&self, _param_id: ClapId, _flags: ParamClearFlags) {}
+}
 
 impl HostTimerImpl for JamSeqClapMainThread {
     fn register_timer(&self, _period_ms: u32) -> Result<TimerId, HostError> {
@@ -30,12 +57,13 @@ impl HostTimerImpl for JamSeqClapMainThread {
 
 pub struct JamSeqClapHost;
 impl HostHandlers for JamSeqClapHost {
-    type Shared<'a> = ();
+    type Shared<'a> = JamSeqClapShared;
     type MainThread<'a> = JamSeqClapMainThread;
     type AudioProcessor<'a> = ();
 
-    fn declare_extensions(builder: &mut HostExtensions<'_, Self>, _shared: &()) {
+    fn declare_extensions(builder: &mut HostExtensions<'_, Self>, _shared: &JamSeqClapShared) {
         builder.register::<HostTimer>();
+        builder.register::<HostParams>();
     }
 }
 
@@ -43,6 +71,7 @@ impl HostHandlers for JamSeqClapHost {
 pub struct ClapParam {
     pub id: ClapId,
     pub name: String,
+    pub raw_name: String,
     pub module: String, // Hierarchical path (e.g. "Filter/Cutoff", "Amp/Envelope")
     pub group: String,
     pub param_type: crate::ipc::ParamType,
@@ -60,6 +89,7 @@ pub struct ClapTrack {
     pub pending_params: StdArc<Mutex<Vec<(ClapId, f64)>>>,   // (param_id, value)
     pub params: StdArc<Mutex<Vec<ClapParam>>>,
     pub param_index: StdArc<Mutex<HashMap<String, usize>>>,
+    pub rescan_needed: StdArc<AtomicBool>,
     pub current_bpm: f64,
     pub out_l: Vec<f32>,
     pub out_r: Vec<f32>,
@@ -127,10 +157,13 @@ impl ClapTrack {
 
                 let timers = StdArc::new(Mutex::new(Vec::new()));
                 let timers_clone = timers.clone();
+                let rescan_needed = StdArc::new(AtomicBool::new(false));
+                let rescan_needed_main = rescan_needed.clone();
+                let rescan_needed_shared = rescan_needed.clone();
 
                 let mut instance = match PluginInstance::<JamSeqClapHost>::new(
-                    |_| (),
-                    |_| JamSeqClapMainThread { timers },
+                    |_| JamSeqClapShared { rescan_needed: rescan_needed_shared },
+                    |_| JamSeqClapMainThread { timers, rescan_needed: rescan_needed_main },
                     entry,
                     plugin_id,
                     &host_info,
@@ -141,137 +174,6 @@ impl ClapTrack {
                         return;
                     }
                 };
-
-                // Query and introspect all tweakable parameters via PluginParams extension
-                {
-                    let handle = instance.plugin_handle();
-                    if let Some(params_ext) = handle.get_extension::<PluginParams>() {
-                        let count = params_ext.count(&handle);
-                        let mut buf = ParamInfoBuffer::new();
-                        let mut p_list = params_init.lock().unwrap();
-                        let mut p_map = param_index_init.lock().unwrap();
-
-                        for i in 0..count {
-                            if let Some(info) = params_ext.get_info(&handle, i, &mut buf) {
-                                let name = String::from_utf8_lossy(info.name).to_string();
-                                let min = info.min_value as f32;
-                                let max = info.max_value as f32;
-                                let def = info.default_value as f32;
-                                let val = params_ext.get_value(&handle, info.id).map(|v| v as f32).unwrap_or(def);
-
-                                let idx = p_list.len();
-                                p_map.insert(name.clone(), idx);
-                                p_map.insert(name.to_lowercase(), idx);
-                                p_map.insert(name.to_lowercase().replace(' ', "_"), idx);
-                                p_map.insert(name.to_lowercase().replace('_', " "), idx);
-                                let stripped_ms = name.to_lowercase().replace(" (ms)", "").replace("_ms", "").replace(" ms", "");
-                                p_map.insert(stripped_ms.clone(), idx);
-                                p_map.insert(format!("{}_ms", stripped_ms), idx);
-                                p_map.insert(format!("{} (ms)", stripped_ms), idx);
-
-                                let mod_path = String::from_utf8_lossy(info.module).to_string();
-                                let mod_trimmed = mod_path.trim_matches('/').trim();
-                                let group = if !mod_trimmed.is_empty() {
-                                    mod_trimmed.replace('/', " > ")
-                                } else {
-                                    let n = name.to_lowercase();
-                                    if n.contains("cutoff") || n.contains("reso") || n.contains("drive") || n.contains("filter") {
-                                        "Filter".to_string()
-                                    } else if n.contains("attack") || n.contains("decay") || n.contains("sustain") || n.contains("release") || n.contains("env") {
-                                        "Amp Envelope".to_string()
-                                    } else if n.contains("glide") || n.contains("voice") || n.contains("portamento") || n.contains("tuning") {
-                                        "Voice".to_string()
-                                    } else if n.contains("gain") || n.contains("volume") || n.contains("master") || n.contains("pan") {
-                                        "Output".to_string()
-                                    } else {
-                                        "General".to_string()
-                                    }
-                                };
-
-                                let is_bypass = info.flags.contains(ParamInfoFlags::IS_BYPASS);
-                                let is_stepped = info.flags.contains(ParamInfoFlags::IS_STEPPED);
-                                let is_enum = info.flags.contains(ParamInfoFlags::IS_ENUM);
-
-                                let range = (max - min).round() as i64;
-                                let param_type = if is_bypass || (is_stepped && min == 0.0 && max == 1.0) {
-                                    crate::ipc::ParamType::Bool
-                                } else if (is_enum || is_stepped) && range > 0 && range <= 64 {
-                                    let mut labels = Vec::new();
-                                    let mut text_buf = [0u8; 128];
-                                    for step in 0..=range {
-                                        let step_val = min as f64 + step as f64;
-                                        let label = if let Ok(bytes) = params_ext.value_to_text(&handle, info.id, step_val, &mut text_buf) {
-                                            String::from_utf8_lossy(bytes).trim().to_string()
-                                        } else {
-                                            String::new()
-                                        };
-                                        labels.push(label);
-                                    }
-                                    let has_named_labels = labels.iter().any(|l| !l.is_empty() && l.parse::<i64>().is_err());
-                                    if is_enum || has_named_labels {
-                                        for (step_i, l) in labels.iter_mut().enumerate() {
-                                            if l.is_empty() {
-                                                *l = format!("{}", min as i64 + step_i as i64);
-                                            }
-                                        }
-                                        crate::ipc::ParamType::Enum { labels }
-                                    } else {
-                                        crate::ipc::ParamType::Int
-                                    }
-                                } else if is_stepped {
-                                    crate::ipc::ParamType::Int
-                                } else {
-                                    // Plugins like Surge XT may omit IS_STEPPED / IS_ENUM for type/mode parameters with 0.0..1.0 float ranges
-                                    let n = name.to_lowercase();
-                                    let is_likely_enum = n.contains("type") || n.contains("mode") || n.contains("model") || n.contains("waveform") || n.contains("algorithm") || n.contains("shape");
-                                    let mut probed_enum = None;
-                                    if is_likely_enum {
-                                        let num_probes = 48;
-                                        let mut probe_labels = Vec::new();
-                                        let mut text_buf = [0u8; 128];
-                                        for step in 0..=num_probes {
-                                            let probe_val = min as f64 + (step as f64 / num_probes as f64) * (max as f64 - min as f64);
-                                            if let Ok(bytes) = params_ext.value_to_text(&handle, info.id, probe_val, &mut text_buf) {
-                                                let trimmed = String::from_utf8_lossy(bytes).trim().to_string();
-                                                if !trimmed.is_empty() && !probe_labels.contains(&trimmed) {
-                                                    probe_labels.push(trimmed);
-                                                }
-                                            }
-                                        }
-                                        let has_named = probe_labels.iter().any(|l| l.parse::<f64>().is_err());
-                                        if probe_labels.len() >= 2 && probe_labels.len() <= 64 && has_named {
-                                            probed_enum = Some(crate::ipc::ParamType::Enum { labels: probe_labels });
-                                        }
-                                    }
-
-                                    probed_enum.unwrap_or(crate::ipc::ParamType::Float)
-                                };
-
-                                let mut text_buf = [0u8; 128];
-                                let display_value = if let Ok(bytes) = params_ext.value_to_text(&handle, info.id, val as f64, &mut text_buf) {
-                                    let s = String::from_utf8_lossy(bytes).trim().to_string();
-                                    if !s.is_empty() { Some(s) } else { None }
-                                } else {
-                                    None
-                                };
-
-                                p_list.push(ClapParam {
-                                    id: info.id,
-                                    name,
-                                    module: mod_path,
-                                    group,
-                                    param_type,
-                                    display_value,
-                                    min,
-                                    max,
-                                    default: def,
-                                    value: val,
-                                });
-                            }
-                        }
-                        println!("[jamseq:clap] Introspected {} parameters for {}", p_list.len(), plugin_name);
-                    }
-                }
 
                 let audio_config = PluginAudioConfiguration {
                     sample_rate: sample_rate as f64,
@@ -295,6 +197,12 @@ impl ClapTrack {
                     }
                 };
 
+                // Query and introspect all tweakable parameters via PluginParams extension
+                // (Performed AFTER activation and starting DSP so dynamic parameter names/types
+                // like Surge XT Effects are fully initialized!)
+                introspect_params(&instance.plugin_handle(), &params_init, &param_index_init);
+                println!("[jamseq:clap] Introspected {} parameters for {}", params_init.lock().unwrap().len(), plugin_name);
+
                 let _ = init_tx.send(Ok(started_processor));
                 println!("[jamseq:clap] ✓ Started CLAP DSP processor for: {}", plugin_name);
 
@@ -308,6 +216,9 @@ impl ClapTrack {
                             timer.on_timer(&instance.plugin_handle(), timer_id);
                         }
                     }
+                    if rescan_needed.swap(false, Ordering::Relaxed) {
+                        introspect_params(&instance.plugin_handle(), &params_init, &param_index_init);
+                    }
                 }
             })?;
 
@@ -320,6 +231,7 @@ impl ClapTrack {
             pending_params: StdArc::new(Mutex::new(Vec::new())),
             params: params_arc,
             param_index: param_index_arc,
+            rescan_needed: StdArc::new(AtomicBool::new(false)),
             current_bpm: 120.0,
             out_l: vec![0.0f32; 1024],
             out_r: vec![0.0f32; 1024],
@@ -366,47 +278,61 @@ impl ClapTrack {
     }
 
     pub fn set_parameter(&self, name: &str, value: f32) {
-        let mut params = self.params.lock().unwrap();
-        let index_map = self.param_index.lock().unwrap();
-        let idx = index_map.get(name)
-            .or_else(|| index_map.get(&name.to_lowercase()))
-            .or_else(|| index_map.get(&name.to_lowercase().replace(' ', "_")))
-            .or_else(|| index_map.get(&name.to_lowercase().replace('_', " ")));
-        if let Some(&i) = idx {
-            if let Some(param) = params.get_mut(i) {
-                let clamped = if param.min >= 0.0 && param.max <= 1.0 && value > 1.0 {
-                    // Plugin parameter expects 0.0..1.0 normalized value, but caller passed an unnormalized plain value
-                    let n = name.to_lowercase();
-                    if n.contains("cutoff") {
-                        // 20..20000 Hz with skew -2.0 (log-like)
-                        let hz = value.clamp(20.0, 20000.0);
-                        ((hz / 20.0).ln() / (20000.0 / 20.0f32).ln()).clamp(0.0, 1.0)
-                    } else if n.contains("glide") {
-                        (value / 1000.0).clamp(0.0, 1.0)
-                    } else if n.contains("attack") || n.contains("decay") || n.contains("release") {
-                        (value / 5000.0).clamp(0.0, 1.0)
+        let is_enum_or_type = {
+            let mut params = self.params.lock().unwrap();
+            let index_map = self.param_index.lock().unwrap();
+            let idx = index_map.get(name)
+                .or_else(|| index_map.get(&name.to_lowercase()))
+                .or_else(|| index_map.get(&name.to_lowercase().replace(' ', "_")))
+                .or_else(|| index_map.get(&name.to_lowercase().replace('_', " ")));
+            if let Some(&i) = idx {
+                if let Some(param) = params.get_mut(i) {
+                    let clamped = if param.min >= 0.0 && param.max <= 1.0 && value > 1.0 {
+                        // Plugin parameter expects 0.0..1.0 normalized value, but caller passed an unnormalized plain value
+                        let n = name.to_lowercase();
+                        if n.contains("cutoff") {
+                            // 20..20000 Hz with skew -2.0 (log-like)
+                            let hz = value.clamp(20.0, 20000.0);
+                            ((hz / 20.0).ln() / (20000.0 / 20.0f32).ln()).clamp(0.0, 1.0)
+                        } else if n.contains("glide") {
+                            (value / 1000.0).clamp(0.0, 1.0)
+                        } else if n.contains("attack") || n.contains("decay") || n.contains("release") {
+                            (value / 5000.0).clamp(0.0, 1.0)
+                        } else {
+                            value.clamp(param.min, param.max)
+                        }
                     } else {
                         value.clamp(param.min, param.max)
-                    }
-                } else {
-                    value.clamp(param.min, param.max)
-                };
-
-                param.value = clamped;
-                if let crate::ipc::ParamType::Enum { ref labels } = param.param_type {
-                    let step_idx = if labels.len() > 1 && (param.max - param.min) <= 1.0 {
-                        let norm = (clamped - param.min) / (param.max - param.min);
-                        (norm * (labels.len() - 1) as f32).round() as usize
-                    } else {
-                        (clamped - param.min).round() as usize
                     };
-                    if let Some(lbl) = labels.get(step_idx) {
-                        param.display_value = Some(lbl.clone());
+
+                    param.value = clamped;
+                    if let crate::ipc::ParamType::Enum { ref labels } = param.param_type {
+                        let step_idx = if labels.len() > 1 && (param.max - param.min) <= 1.0 {
+                            let norm = (clamped - param.min) / (param.max - param.min);
+                            (norm * (labels.len() - 1) as f32).round() as usize
+                        } else {
+                            (clamped - param.min).round() as usize
+                        };
+                        if let Some(lbl) = labels.get(step_idx) {
+                            param.display_value = Some(lbl.clone());
+                        }
                     }
+                    let id = param.id;
+                    self.pending_params.lock().unwrap().push((id, clamped as f64));
+
+                    matches!(param.param_type, crate::ipc::ParamType::Enum { .. })
+                        || param.name.to_lowercase().contains("type")
+                        || param.raw_name.to_lowercase().contains("type")
+                } else {
+                    false
                 }
-                let id = param.id;
-                self.pending_params.lock().unwrap().push((id, clamped as f64));
+            } else {
+                false
             }
+        };
+
+        if is_enum_or_type {
+            self.rescan_needed.store(true, Ordering::Relaxed);
         }
     }
 
@@ -558,5 +484,177 @@ impl ClapTrack {
                 Some(&transport),
             );
         }
+    }
+}
+
+fn introspect_params(
+    handle: &PluginMainThreadHandle<'_>,
+    params_arc: &StdArc<Mutex<Vec<ClapParam>>>,
+    param_index_arc: &StdArc<Mutex<HashMap<String, usize>>>,
+) {
+    if let Some(params_ext) = handle.get_extension::<PluginParams>() {
+        let count = params_ext.count(handle);
+        let mut buf = ParamInfoBuffer::new();
+        let mut new_params = Vec::new();
+        let mut new_index = HashMap::new();
+
+        let existing_values: HashMap<u32, f32> = {
+            let p_lock = params_arc.lock().unwrap();
+            p_lock.iter().map(|p| (p.id.get(), p.value)).collect()
+        };
+
+        for i in 0..count {
+            if let Some(info) = params_ext.get_info(handle, i, &mut buf) {
+                let raw_name = String::from_utf8_lossy(info.name).to_string();
+                let min = info.min_value as f32;
+                let max = info.max_value as f32;
+                let def = info.default_value as f32;
+                let val = existing_values
+                    .get(&info.id.get())
+                    .copied()
+                    .unwrap_or_else(|| params_ext.get_value(handle, info.id).map(|v| v as f32).unwrap_or(def));
+
+                let mod_path = String::from_utf8_lossy(info.module).to_string();
+                let mod_trimmed = mod_path.trim_matches('/').trim();
+
+                let (group, display_name) = if !mod_trimmed.is_empty() {
+                    (mod_trimmed.replace('/', " > "), raw_name.clone())
+                } else if let Some(slash_idx) = raw_name.rfind('/') {
+                    let g = raw_name[..slash_idx].trim().to_string();
+                    let n = raw_name[slash_idx + 1..].trim().to_string();
+                    (
+                        if g.is_empty() { "General".to_string() } else { g.replace('/', " > ") },
+                        if n.is_empty() { raw_name.clone() } else { n },
+                    )
+                } else if raw_name.contains(':') || raw_name.contains(" - ") {
+                    if let Some(colon_idx) = raw_name.find(':') {
+                        let g = raw_name[..colon_idx].trim().to_string();
+                        let n = raw_name[colon_idx + 1..].trim().to_string();
+                        (g, n)
+                    } else {
+                        ("General".to_string(), raw_name.clone())
+                    }
+                } else {
+                    ("General".to_string(), raw_name.clone())
+                };
+
+                let group = if group == "General" {
+                    let n = display_name.to_lowercase();
+                    if n.contains("cutoff") || n.contains("reso") || n.contains("drive") || n.contains("filter") {
+                        "Filter".to_string()
+                    } else if n.contains("attack") || n.contains("decay") || n.contains("sustain") || n.contains("release") || n.contains("env") {
+                        "Amp Envelope".to_string()
+                    } else if n.contains("glide") || n.contains("voice") || n.contains("portamento") || n.contains("tuning") {
+                        "Voice".to_string()
+                    } else if n.contains("gain") || n.contains("volume") || n.contains("master") || n.contains("pan") {
+                        "Output".to_string()
+                    } else {
+                        "General".to_string()
+                    }
+                } else {
+                    group
+                };
+
+                let idx = new_params.len();
+                let mut register_key = |k: &str| {
+                    new_index.insert(k.to_string(), idx);
+                    new_index.insert(k.to_lowercase(), idx);
+                    new_index.insert(k.to_lowercase().replace(' ', "_"), idx);
+                    new_index.insert(k.to_lowercase().replace('_', " "), idx);
+                    let stripped_ms = k.to_lowercase().replace(" (ms)", "").replace("_ms", "").replace(" ms", "");
+                    new_index.insert(stripped_ms.clone(), idx);
+                    new_index.insert(format!("{}_ms", stripped_ms), idx);
+                    new_index.insert(format!("{} (ms)", stripped_ms), idx);
+                };
+
+                register_key(&display_name);
+                if raw_name != display_name {
+                    register_key(&raw_name);
+                }
+
+                let is_bypass = info.flags.contains(ParamInfoFlags::IS_BYPASS);
+                let is_stepped = info.flags.contains(ParamInfoFlags::IS_STEPPED);
+                let is_enum = info.flags.contains(ParamInfoFlags::IS_ENUM);
+
+                let range = (max - min).round() as i64;
+                let param_type = if is_bypass || (is_stepped && min == 0.0 && max == 1.0) {
+                    crate::ipc::ParamType::Bool
+                } else if (is_enum || is_stepped) && range > 0 && range <= 64 {
+                    let mut labels = Vec::new();
+                    let mut text_buf = [0u8; 128];
+                    for step in 0..=range {
+                        let step_val = min as f64 + step as f64;
+                        let label = if let Ok(bytes) = params_ext.value_to_text(handle, info.id, step_val, &mut text_buf) {
+                            String::from_utf8_lossy(bytes).trim().to_string()
+                        } else {
+                            String::new()
+                        };
+                        labels.push(label);
+                    }
+                    let has_named_labels = labels.iter().any(|l| !l.is_empty() && l.parse::<i64>().is_err());
+                    if is_enum || has_named_labels {
+                        for (step_i, l) in labels.iter_mut().enumerate() {
+                            if l.is_empty() {
+                                *l = format!("{}", min as i64 + step_i as i64);
+                            }
+                        }
+                        crate::ipc::ParamType::Enum { labels }
+                    } else {
+                        crate::ipc::ParamType::Int
+                    }
+                } else if is_stepped {
+                    crate::ipc::ParamType::Int
+                } else {
+                    let n = display_name.to_lowercase();
+                    let is_likely_enum = n.contains("type") || n.contains("mode") || n.contains("model") || n.contains("waveform") || n.contains("algorithm") || n.contains("shape");
+                    let mut probed_enum = None;
+                    if is_likely_enum {
+                        let num_probes = 48;
+                        let mut probe_labels = Vec::new();
+                        let mut text_buf = [0u8; 128];
+                        for step in 0..=num_probes {
+                            let probe_val = min as f64 + (step as f64 / num_probes as f64) * (max as f64 - min as f64);
+                            if let Ok(bytes) = params_ext.value_to_text(handle, info.id, probe_val, &mut text_buf) {
+                                let trimmed = String::from_utf8_lossy(bytes).trim().to_string();
+                                if !trimmed.is_empty() && !probe_labels.contains(&trimmed) {
+                                    probe_labels.push(trimmed);
+                                }
+                            }
+                        }
+                        let has_named = probe_labels.iter().any(|l| l.parse::<f64>().is_err());
+                        if probe_labels.len() >= 2 && probe_labels.len() <= 64 && has_named {
+                            probed_enum = Some(crate::ipc::ParamType::Enum { labels: probe_labels });
+                        }
+                    }
+
+                    probed_enum.unwrap_or(crate::ipc::ParamType::Float)
+                };
+
+                let mut text_buf = [0u8; 128];
+                let display_value = if let Ok(bytes) = params_ext.value_to_text(handle, info.id, val as f64, &mut text_buf) {
+                    let s = String::from_utf8_lossy(bytes).trim().to_string();
+                    if !s.is_empty() { Some(s) } else { None }
+                } else {
+                    None
+                };
+
+                new_params.push(ClapParam {
+                    id: info.id,
+                    name: display_name,
+                    raw_name,
+                    module: mod_path,
+                    group,
+                    param_type,
+                    display_value,
+                    min,
+                    max,
+                    default: def,
+                    value: val,
+                });
+            }
+        }
+
+        *params_arc.lock().unwrap() = new_params;
+        *param_index_arc.lock().unwrap() = new_index;
     }
 }
