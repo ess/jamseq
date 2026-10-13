@@ -1332,6 +1332,54 @@ fn test_stem_cache_manager_and_granular_block_stems() {
     let _ = std::fs::remove_dir_all(&cache_dir);
 }
 
+#[test]
+fn test_toast_json_block_ingestion() {
+    let toast_path = std::path::Path::new("/home/dwalters/toast.json");
+    if !toast_path.exists() {
+        return;
+    }
+
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    host.load_project_from_file(toast_path).expect("Failed to load toast.json");
+
+    assert_eq!(host.timeline.sections.len(), 3, "toast.json must have 3 sections");
+
+    let intro = host.timeline.sections.iter().find(|s| s.id == "intro").unwrap();
+    let verse = host.timeline.sections.iter().find(|s| s.id == "verse_1").unwrap();
+    let chorus = host.timeline.sections.iter().find(|s| s.id == "chorus_1").unwrap();
+
+    let intro_b = intro.track_blocks.get("track_1").expect("intro must have track_1 block");
+    let verse_b = verse.track_blocks.get("track_1").expect("verse must have track_1 block");
+    let chorus_b = chorus.track_blocks.get("track_1").expect("chorus must have track_1 block");
+
+    // Verify each block has its own distinct notes
+    assert!(!intro_b.events.is_empty(), "intro_b must have events migrated from toast.json");
+    assert!(!verse_b.events.is_empty(), "verse_b must have events migrated from toast.json");
+    assert!(!chorus_b.events.is_empty(), "chorus_b must have events migrated from toast.json");
+
+    // Intro has note 56
+    let intro_pitch = intro_b.events.iter().find_map(|e| match e.action {
+        jamseq::timeline::ScheduledAction::NoteOn { note, .. } => Some(note),
+        _ => None,
+    });
+    assert_eq!(intro_pitch, Some(56), "intro_b must contain pitch 56");
+
+    // Verse has note 64
+    let verse_pitch = verse_b.events.iter().find_map(|e| match e.action {
+        jamseq::timeline::ScheduledAction::NoteOn { note, .. } => Some(note),
+        _ => None,
+    });
+    assert_eq!(verse_pitch, Some(64), "verse_b must contain pitch 64");
+
+    // Chorus has note 55
+    let chorus_pitch = chorus_b.events.iter().find_map(|e| match e.action {
+        jamseq::timeline::ScheduledAction::NoteOn { note, .. } => Some(note),
+        _ => None,
+    });
+    assert_eq!(chorus_pitch, Some(55), "chorus_b must contain pitch 55");
+}
+
+
 
 
 

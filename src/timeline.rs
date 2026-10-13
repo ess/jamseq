@@ -468,7 +468,61 @@ impl Timeline {
         let mut events = arrangement.events;
         // Sort chronologically
         events.sort_by_key(|e| e.tick);
-        self.events = events;
+        self.events = events.clone();
+
+        // If track blocks have no events but arrangement has flat events, migrate flat events into section track blocks
+        let blocks_have_events = self.sections.iter().any(|s| s.track_blocks.values().any(|b| !b.events.is_empty()));
+        if !blocks_have_events && !events.is_empty() && !self.sections.is_empty() {
+            let mut sec_accum = 0u64;
+            for (idx, sec) in self.sections.iter_mut().enumerate() {
+                let sec_len = if sec.length_ticks > 0 {
+                    sec.length_ticks
+                } else if sec.bars > 0 {
+                    sec.bars as u64 * sec.time_signature.ticks_per_bar()
+                } else if sec.length_ticks() > 0 {
+                    sec.length_ticks()
+                } else {
+                    4 * PPQ
+                };
+                let sec_start = if idx == 0 {
+                    0
+                } else if sec.start_tick >= sec_accum {
+                    sec.start_tick
+                } else {
+                    sec_accum
+                };
+                let sec_end = sec_start + sec_len;
+
+                for ev in &events {
+                    if ev.tick >= sec_start && ev.tick < sec_end {
+                        let block = sec.track_blocks.entry(ev.track_id.clone()).or_insert_with(|| {
+                            TrackBlock::new(&format!("{}_{}", sec.id, ev.track_id), &ev.track_id, sec_len)
+                        });
+                        block.base_length_ticks = block.base_length_ticks.max(sec_len);
+                        let mut local_ev = ev.clone();
+                        local_ev.tick = (ev.tick.saturating_sub(sec_start)).saturating_sub(block.start_offset_ticks);
+                        block.events.push(local_ev);
+                    }
+                }
+                sec_accum = sec_end;
+            }
+            for sec in &mut self.sections {
+                for block in sec.track_blocks.values_mut() {
+                    block.events.sort_by_key(|e| e.tick);
+                    if let Some(max_tick) = block.events.iter().map(|e| e.tick).max() {
+                        if max_tick >= block.base_length_ticks {
+                            block.base_length_ticks = ((max_tick / 240) + 1) * 240;
+                        }
+                    }
+                }
+            }
+            let computed = self.computed_total_ticks();
+            if computed > 0 {
+                self.total_ticks = computed;
+                self.loop_end_tick = self.total_ticks;
+            }
+        }
+
         self.rebuild_active_events();
         self.reset();
     }
@@ -476,13 +530,18 @@ impl Timeline {
     /// Export the current live state into a TimelineArrangement for saving
     pub fn to_arrangement(&self) -> TimelineArrangement {
         let total_bars = (self.total_ticks / (4 * PPQ)) as u32;
+        let all_events = if !self.active_events.is_empty() {
+            self.active_events.clone()
+        } else {
+            self.events.clone()
+        };
         TimelineArrangement {
             title: self.title.clone(),
             bpm: self.bpm,
             total_bars,
             loop_enabled: self.loop_enabled,
             sections: self.sections.clone(),
-            events: self.events.clone(),
+            events: all_events,
         }
     }
 
