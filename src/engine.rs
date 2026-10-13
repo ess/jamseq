@@ -80,8 +80,11 @@ impl JamSeqHost {
         let path_ref = path.as_ref();
         let content = std::fs::read_to_string(path_ref)
             .with_context(|| format!("Failed to read project file at {:?}", path_ref))?;
-        let arrangement: TimelineArrangement = serde_json::from_str(&content)
+        let mut arrangement: TimelineArrangement = serde_json::from_str(&content)
             .with_context(|| format!("Failed to parse project JSON at {:?}", path_ref))?;
+        if arrangement.tracks.is_empty() {
+            arrangement.discover_tracks_from_content();
+        }
         self.load_arrangement(arrangement);
         self.project_path = Some(path_ref.to_string_lossy().to_string());
         Ok(())
@@ -97,7 +100,27 @@ impl JamSeqHost {
             std::path::PathBuf::from(format!("{}.jam.json", path_str))
         };
 
-        let arrangement = self.timeline.to_arrangement();
+        let mut arrangement = self.timeline.to_arrangement();
+        arrangement.tracks = self.tracks.iter().map(|t| {
+            let t_type = match &t.instrument {
+                crate::track::TrackInstrument::AudioClips(_) => "audio".to_string(),
+                crate::track::TrackInstrument::Sampler(_) => "sampler".to_string(),
+                crate::track::TrackInstrument::Vst3(_) => t.current_plugin.clone().unwrap_or_else(|| "vst3".to_string()),
+                crate::track::TrackInstrument::Lv2(_) => t.current_plugin.clone().unwrap_or_else(|| "lv2".to_string()),
+                _ => "synth".to_string(),
+            };
+            crate::timeline::TrackConfig {
+                id: t.id.clone(),
+                name: t.name.clone(),
+                track_type: t_type,
+                volume: t.volume,
+                pan: t.pan,
+                muted: t.muted,
+                solo: t.solo,
+                current_plugin: t.current_plugin.clone(),
+            }
+        }).collect();
+
         let json_data = serde_json::to_string_pretty(&arrangement)
             .context("Failed to serialize arrangement to JSON")?;
         if let Some(parent) = final_path.parent() {
@@ -752,7 +775,57 @@ impl JamSeqHost {
         order
     }
 
-    pub fn load_arrangement(&mut self, arrangement: TimelineArrangement) {
+    pub fn load_arrangement(&mut self, mut arrangement: TimelineArrangement) {
+        // If the arrangement did not have tracks saved (e.g. legacy or minimal project) and host has no tracks, auto-discover
+        if arrangement.tracks.is_empty() && self.tracks.is_empty() {
+            arrangement.discover_tracks_from_content();
+        }
+
+        if !arrangement.tracks.is_empty() {
+            self.tracks.clear();
+            self.track_map.clear();
+            for tc in &arrangement.tracks {
+                self.add_custom_track(&tc.id, &tc.name, &tc.track_type);
+                if let Some(&idx) = self.track_map.get(&tc.id) {
+                    self.tracks[idx].volume = tc.volume;
+                    self.tracks[idx].pan = tc.pan;
+                    self.tracks[idx].muted = tc.muted;
+                    self.tracks[idx].solo = tc.solo;
+                    if let Some(ref p) = tc.current_plugin {
+                        self.tracks[idx].current_plugin = Some(p.clone());
+                    }
+                }
+            }
+        } else {
+            // If arrangement has no tracks specified, ensure any track IDs referenced in sections/events exist
+            let mut missing_ids = Vec::new();
+            for sec in &arrangement.sections {
+                for (t_id, _) in &sec.track_blocks {
+                    if !self.track_map.contains_key(t_id) && !missing_ids.contains(t_id) {
+                        missing_ids.push(t_id.clone());
+                    }
+                }
+            }
+            for ev in &arrangement.events {
+                if !self.track_map.contains_key(&ev.track_id) && !missing_ids.contains(&ev.track_id) {
+                    missing_ids.push(ev.track_id.clone());
+                }
+            }
+            for id in missing_ids {
+                let track_type = if id.starts_with("audio_") || id.starts_with("mic_") { "audio" } else { "synth" };
+                let name = if id.starts_with("track_") {
+                    let num = id.strip_prefix("track_").unwrap_or("1");
+                    format!("MIDI Track {}", num)
+                } else if id.starts_with("audio_") {
+                    let num = id.strip_prefix("audio_").unwrap_or("1");
+                    format!("Audio Track {}", num)
+                } else {
+                    id.clone()
+                };
+                self.add_custom_track(&id, &name, track_type);
+            }
+        }
+
         self.timeline.load_arrangement(arrangement);
         for t in &mut self.tracks {
             t.mark_stem_dirty();

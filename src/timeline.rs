@@ -349,12 +349,40 @@ impl ScheduledEvent {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TrackConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default = "default_track_type")]
+    pub track_type: String,
+    #[serde(default = "default_volume")]
+    pub volume: f32,
+    #[serde(default)]
+    pub pan: f32,
+    #[serde(default)]
+    pub muted: bool,
+    #[serde(default)]
+    pub solo: bool,
+    #[serde(default)]
+    pub current_plugin: Option<String>,
+}
+
+fn default_track_type() -> String {
+    "synth".to_string()
+}
+
+fn default_volume() -> f32 {
+    1.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineArrangement {
     pub title: String,
     pub bpm: f64,
     pub total_bars: u32,
     pub loop_enabled: bool,
+    #[serde(default)]
+    pub tracks: Vec<TrackConfig>,
     pub sections: Vec<SongSection>,
     pub events: Vec<ScheduledEvent>,
 }
@@ -366,8 +394,63 @@ impl Default for TimelineArrangement {
             bpm: 120.0,
             total_bars: 0,
             loop_enabled: true,
+            tracks: Vec::new(),
             sections: Vec::new(),
             events: Vec::new(),
+        }
+    }
+}
+
+impl TimelineArrangement {
+    /// Auto-discovers tracks referenced in sections or events if the tracks array is empty
+    pub fn discover_tracks_from_content(&mut self) {
+        if !self.tracks.is_empty() {
+            return;
+        }
+
+        let mut discovered_ids = Vec::new();
+        for sec in &self.sections {
+            for (t_id, _) in &sec.track_blocks {
+                if !discovered_ids.contains(t_id) {
+                    discovered_ids.push(t_id.clone());
+                }
+            }
+        }
+        for ev in &self.events {
+            if !discovered_ids.contains(&ev.track_id) {
+                discovered_ids.push(ev.track_id.clone());
+            }
+        }
+
+        for id in discovered_ids {
+            let name = if id.starts_with("track_") {
+                let num = id.strip_prefix("track_").unwrap_or("1");
+                format!("MIDI Track {}", num)
+            } else if id.starts_with("audio_") {
+                let num = id.strip_prefix("audio_").unwrap_or("1");
+                format!("Audio Track {}", num)
+            } else {
+                let mut c = id.chars();
+                match c.next() {
+                    None => String::new(),
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                }
+            };
+            let track_type = if id.starts_with("audio_") || id.starts_with("mic_") {
+                "audio".to_string()
+            } else {
+                "synth".to_string()
+            };
+            self.tracks.push(TrackConfig {
+                id,
+                name,
+                track_type,
+                volume: 1.0,
+                pan: 0.0,
+                muted: false,
+                solo: false,
+                current_plugin: None,
+            });
         }
     }
 }
@@ -536,6 +619,7 @@ impl Timeline {
             bpm: self.bpm,
             total_bars,
             loop_enabled: self.loop_enabled,
+            tracks: Vec::new(),
             sections: self.sections.clone(),
             events: all_events,
         }

@@ -89,6 +89,7 @@ fn test_offline_render_to_wav() {
         bpm: 68.0,
         total_bars: 1,
         loop_enabled: false,
+        tracks: Vec::new(),
         sections: vec![jamseq::SongSection::new("test_verse", "Test Verse", 1, 1)],
         events,
     };
@@ -796,6 +797,7 @@ fn test_debug_playback_demo() {
         bpm: 68.0,
         total_bars: 4,
         loop_enabled: true,
+        tracks: Vec::new(),
         sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4)],
         events,
     };
@@ -864,6 +866,7 @@ fn test_server_playback_over_ipc() {
         bpm: 68.0,
         total_bars: 4,
         loop_enabled: true,
+        tracks: Vec::new(),
         sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4)],
         events,
     };
@@ -1378,6 +1381,115 @@ fn test_toast_json_block_ingestion() {
     });
     assert_eq!(chorus_pitch, Some(55), "chorus_b must contain pitch 55");
 }
+
+#[test]
+fn test_project_track_persistence_and_auto_discovery() {
+    let temp_dir = std::env::temp_dir();
+    let proj_file = temp_dir.join("test_track_discovery.jam.json");
+    let _ = fs::remove_file(&proj_file);
+
+    // 1. Simulate untitled.jam.json: JSON without a "tracks" field, referencing track_1 and track_2
+    let raw_json = r#"{
+        "title": "Untracked Project",
+        "bpm": 120.0,
+        "total_bars": 4,
+        "loop_enabled": true,
+        "sections": [
+            {
+                "id": "sec_intro",
+                "name": "Intro",
+                "time_signature": { "numerator": 4, "denominator": 4 },
+                "tempo": null,
+                "track_blocks": {
+                    "track_1": {
+                        "id": "intro_track_1",
+                        "track_id": "track_1",
+                        "start_offset_ticks": 0,
+                        "base_length_ticks": 3840,
+                        "loop_mode": "OneShot",
+                        "tempo": null,
+                        "events": [],
+                        "audio_file": null
+                    }
+                },
+                "start_tick": 0,
+                "length_ticks": 3840,
+                "start_bar": 1,
+                "bars": 1
+            },
+            {
+                "id": "sec_verse",
+                "name": "Verse",
+                "time_signature": { "numerator": 4, "denominator": 4 },
+                "tempo": null,
+                "track_blocks": {
+                    "track_2": {
+                        "id": "verse_track_2",
+                        "track_id": "track_2",
+                        "start_offset_ticks": 0,
+                        "base_length_ticks": 3840,
+                        "loop_mode": "OneShot",
+                        "tempo": null,
+                        "events": [],
+                        "audio_file": null
+                    }
+                },
+                "start_tick": 3840,
+                "length_ticks": 3840,
+                "start_bar": 2,
+                "bars": 1
+            }
+        ],
+        "events": [
+            {
+                "id": 1,
+                "tick": 0,
+                "track_id": "track_1",
+                "action": { "NoteOn": { "note": 60, "velocity": 0.8 } }
+            }
+        ]
+    }"#;
+    fs::write(&proj_file, raw_json).expect("Failed to write test raw JSON");
+
+    // 2. Load the project into a host
+    let mut host = JamSeqHost::new(120.0, 44100.0);
+    // Ensure host starts with 0 tracks
+    host.tracks.clear();
+    host.track_map.clear();
+    assert_eq!(host.tracks.len(), 0);
+
+    host.load_project_from_file(&proj_file).expect("Failed to load project from file");
+
+    // Must have auto-discovered track_1 and track_2!
+    assert_eq!(host.tracks.len(), 2, "Must discover exactly 2 tracks");
+    assert!(host.track_map.contains_key("track_1"), "Must contain track_1");
+    assert!(host.track_map.contains_key("track_2"), "Must contain track_2");
+    assert_eq!(host.tracks[0].name, "MIDI Track 1");
+    assert_eq!(host.tracks[1].name, "MIDI Track 2");
+
+    // 3. Rename track_1 and save
+    host.tracks[0].name = "Lead Synth".to_string();
+    host.tracks[0].volume = 0.75;
+    let saved_file = temp_dir.join("test_track_saved.jam.json");
+    let _ = fs::remove_file(&saved_file);
+    host.save_project_to_file(&saved_file).expect("Failed to save project");
+
+    // Verify saved JSON contains the "tracks" array
+    let saved_content = fs::read_to_string(&saved_file).expect("Failed to read saved file");
+    assert!(saved_content.contains(r#""tracks""#), "Saved project must contain 'tracks' array");
+    assert!(saved_content.contains("Lead Synth"), "Saved project must persist renamed track");
+
+    // 4. Reload into a new host and verify fidelity
+    let mut reload_host = JamSeqHost::new(120.0, 44100.0);
+    reload_host.load_project_from_file(&saved_file).expect("Failed to reload saved project");
+    assert_eq!(reload_host.tracks.len(), 2);
+    assert_eq!(reload_host.tracks[0].name, "Lead Synth");
+    assert!((reload_host.tracks[0].volume - 0.75).abs() < 1e-4);
+
+    let _ = fs::remove_file(&proj_file);
+    let _ = fs::remove_file(&saved_file);
+}
+
 
 
 
