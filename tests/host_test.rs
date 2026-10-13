@@ -1241,6 +1241,98 @@ fn test_polytempo_block_playback_and_loop_modes() {
     assert!(peak > 0.001, "Polytempo block must produce audio in host process_block");
 }
 
+#[test]
+fn test_stem_cache_manager_and_granular_block_stems() {
+    use jamseq::stem_cache::StemCacheManager;
+    use jamseq::timeline::{LoopMode, SongSection, TempoOverride, TrackBlock};
+
+    let cache_dir = std::env::temp_dir().join("jamseq_test_stem_cache_dir");
+    let mut cache_mgr = StemCacheManager::new(&cache_dir).expect("Failed to create StemCacheManager");
+    cache_mgr.clear().expect("Failed to clear test cache dir");
+
+    // 1. Verify Content-Addressed Hash Stability & Invalidation
+    let mut block1 = TrackBlock::new("block_1", "bass_track", 1920)
+        .with_tempo(TempoOverride::AbsoluteBpm(120.0))
+        .with_loop_mode(LoopMode::OneShot);
+    block1.add_note(1, 2, 0, 480, 40, 1.0);
+
+    let key1 = cache_mgr.compute_block_key("bass_track", "verse", &block1, Some("patch_a"), 120.0);
+    let key1_repeat = cache_mgr.compute_block_key("bass_track", "verse", &block1, Some("patch_a"), 120.0);
+    assert_eq!(key1, key1_repeat, "Identical block parameters must produce identical content hash");
+
+    // Changing note pitch or velocity changes key
+    let mut block2 = block1.clone();
+    block2.events[0].action = jamseq::timeline::ScheduledAction::NoteOn { note: 41, velocity: 1.0 };
+    let key2 = cache_mgr.compute_block_key("bass_track", "verse", &block2, Some("patch_a"), 120.0);
+    assert_ne!(key1, key2, "Mutating a note must yield a distinct cache key");
+
+    // Changing tempo override changes key
+    let block3 = block1.clone().with_tempo(TempoOverride::Ratio(3, 2));
+    let key3 = cache_mgr.compute_block_key("bass_track", "verse", &block3, Some("patch_a"), 180.0);
+    assert_ne!(key1, key3, "Metric modulation tempo override must yield a distinct cache key");
+
+    // 2. Store and Load Chunks
+    let left_samples = vec![0.5f32; 512];
+    let right_samples = vec![-0.5f32; 512];
+    let stored_path = cache_mgr.store_chunk(&key1, &left_samples, &right_samples, 48000).expect("Store chunk failed");
+    assert!(stored_path.exists(), "Stored chunk WAV must exist on disk");
+    assert!(cache_mgr.get_cached_chunk(&key1).is_some());
+
+    let loaded = cache_mgr.load_chunk(&key1).expect("Load chunk failed");
+    assert_eq!(loaded.samples_left.len(), 512);
+    assert_eq!(loaded.samples_right.len(), 512);
+    assert!((loaded.samples_left[0] - 0.5).abs() < 0.01);
+    assert!((loaded.samples_right[0] - (-0.5)).abs() < 0.01);
+
+    // Invalidate track
+    cache_mgr.invalidate_track("bass_track");
+    assert!(cache_mgr.get_cached_chunk(&key1).is_none(), "Invalidated track chunks must be purged");
+
+    // 3. Engine Granular Block Stem Rendering & Stitching
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    let mut bass = JamSynthEngine::new(48000.0);
+    bass.load_patch(JamSynthPatch::preset_808_sub());
+    host.add_track(Track::new_synth("sub808", "Sub 808", bass));
+
+    // Section 1: Intro (1 bar = 3840 ticks)
+    let mut sec_intro = SongSection::new_empty("sec_intro", "Intro", 1);
+    let mut b_intro = TrackBlock::new("tb_intro", "sub808", 3840);
+    b_intro.add_note(10, 11, 0, 960, 36, 1.0);
+    sec_intro.set_block(b_intro);
+    host.add_section(sec_intro);
+
+    // Section 2: Verse (1 bar = 3840 ticks)
+    let mut sec_verse = SongSection::new_empty("sec_verse", "Verse", 3);
+    let mut b_verse = TrackBlock::new("tb_verse", "sub808", 3840);
+    b_verse.add_note(20, 21, 0, 960, 38, 1.0);
+    sec_verse.set_block(b_verse);
+    host.add_section(sec_verse);
+
+    // Initial stem generation for dirty tracks
+    let generated = host.generate_stems_for_dirty_tracks();
+    assert_eq!(generated, 1, "Must generate stem for sub808");
+
+    let track_idx = *host.track_map.get("sub808").unwrap();
+    assert!(!host.tracks[track_idx].stem_dirty, "Track stem must no longer be dirty");
+    assert!(host.tracks[track_idx].cached_stem.is_some(), "Track must have stitched cached stem");
+
+    // Stitched stem length should span both sections (Intro 3840 + Verse 3840 = 7680 ticks)
+    let expected_samples = host.timeline.ticks_to_samples(7680) as usize;
+    let actual_samples = host.tracks[track_idx].cached_stem.as_ref().unwrap().buffer.as_ref().unwrap().samples_left.len();
+    assert_eq!(actual_samples, expected_samples, "Stitched stem length must match total arrangement ticks");
+
+    // Calling again without modifications generates 0 stems
+    let generated_again = host.generate_stems_for_dirty_tracks();
+    assert_eq!(generated_again, 0, "Clean tracks must skip stem regeneration");
+
+    // Verify individual block chunks are cached on disk
+    let chunk_intro = host.render_track_block("sub808", "sec_intro").expect("Must load cached intro block");
+    assert!(!chunk_intro.samples_left.is_empty(), "Cached intro block chunk must not be empty");
+
+    let _ = std::fs::remove_dir_all(&cache_dir);
+}
+
+
 
 
 
