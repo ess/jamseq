@@ -3,7 +3,7 @@ use jamsynth::patch::JamSynthPatch;
 use jamsynth::JamSynthEngine;
 use jamseq::engine::JamSeqHost;
 use jamseq::sampler::{SamplerConfig, SamplerInstrument};
-use jamseq::timeline::{ScheduledAction, ScheduledEvent, TimelineArrangement, TICKS_PER_16TH};
+use jamseq::timeline::{ScheduledAction, ScheduledEvent, TimelineArrangement, TrackBlock, TICKS_PER_16TH};
 use jamseq::track::Track;
 use std::fs;
 use std::path::Path;
@@ -1842,5 +1842,42 @@ fn test_surge_xt_effects_clap_parameter_names_and_groups() {
             assert!(vst3_names.contains(key_param), "VST3 should contain {}", key_param);
         }
     }
+}
+
+#[test]
+fn test_disallow_overlapping_notes_on_same_row() {
+    let mut block = TrackBlock::new("tb_overlap", "synth_1", 3840);
+
+    // 1. Add full-bar note on pitch 60 (tick 0 to 3840)
+    block.add_note(1, 2, 0, 3840, 60, 0.8);
+    assert_eq!(block.events.len(), 2, "Should have 1 NoteOn and 1 NoteOff");
+
+    // 2. Query occupancy along the note
+    assert!(block.has_note_at(60, 0), "Tick 0 is start of note");
+    assert!(block.has_note_at(60, 1920), "Tick 1920 is inside note");
+    assert!(block.has_note_at(60, 3839), "Tick 3839 is inside note");
+    assert!(!block.has_note_at(60, 3840), "Tick 3840 is at/past note off");
+    assert!(!block.has_note_at(62, 1920), "Different pitch 62 is not occupied");
+
+    // 3. Attempting to add an overlapping note on pitch 60 inside the bar should be rejected
+    block.add_note(3, 4, 1920, 960, 60, 0.9);
+    assert_eq!(block.events.len(), 2, "Must reject duplicate overlapping note on pitch 60");
+
+    // 4. Test note on different pitch (pitch 62) inside the bar is allowed
+    block.add_note(5, 6, 1920, 960, 62, 0.9);
+    assert_eq!(block.events.len(), 4, "Different pitch 62 is permitted");
+
+    // 5. Test duration clamping when placing a note upstream of an existing note
+    let mut block2 = TrackBlock::new("tb_clamp", "synth_1", 3840);
+    // Note already exists from 1920 to 2880 on pitch 60
+    block2.add_note(10, 11, 1920, 960, 60, 0.8);
+    assert_eq!(block2.next_note_start(60, 0), Some(1920));
+
+    // Placing a note starting at 0 with duration 3840 should clamp to duration 1920
+    block2.add_note(12, 13, 0, 3840, 60, 0.8);
+    let intervals = block2.note_intervals(60);
+    assert_eq!(intervals.len(), 2);
+    assert_eq!(intervals[0], (0, 1920), "Upstream note must clamp at 1920 to avoid overlap");
+    assert_eq!(intervals[1], (1920, 2880), "Existing downstream note remains intact");
 }
 

@@ -169,6 +169,37 @@ impl TrackBlock {
         self.start_offset_ticks + self.effective_length_ticks()
     }
 
+    /// Returns all (start_tick, end_tick) intervals for notes of the given pitch in this block.
+    pub fn note_intervals(&self, pitch: u8) -> Vec<(u64, u64)> {
+        let mut intervals = Vec::new();
+        for (i, ev) in self.events.iter().enumerate() {
+            if let ScheduledAction::NoteOn { note, .. } = ev.action {
+                if note == pitch {
+                    let end_tick = self.events.iter().skip(i + 1).find(|off_ev| {
+                        off_ev.tick > ev.tick
+                            && match off_ev.action {
+                                ScheduledAction::NoteOff { note: off_n } => off_n == note,
+                                _ => false,
+                            }
+                    }).map(|off_ev| off_ev.tick).unwrap_or(ev.tick + 240);
+                    intervals.push((ev.tick, end_tick.max(ev.tick + 60)));
+                }
+            }
+        }
+        intervals.sort_by_key(|(s, _)| *s);
+        intervals
+    }
+
+    /// Check if a tick falls inside an existing note of the given pitch.
+    pub fn has_note_at(&self, pitch: u8, tick: u64) -> bool {
+        self.note_intervals(pitch).into_iter().any(|(start, end)| tick >= start && tick < end)
+    }
+
+    /// Returns the tick of the next note start on this pitch strictly after `from_tick`, if any.
+    pub fn next_note_start(&self, pitch: u8, from_tick: u64) -> Option<u64> {
+        self.note_intervals(pitch).into_iter().find(|(start, _)| *start > from_tick).map(|(start, _)| start)
+    }
+
     pub fn add_note(
         &mut self,
         note_on_id: u64,
@@ -178,8 +209,21 @@ impl TrackBlock {
         note: u8,
         velocity: f32,
     ) {
+        // Prevent overlapping notes on the same pitch:
+        if self.has_note_at(note, tick) {
+            return;
+        }
+        let eff_duration = if let Some(next_start) = self.next_note_start(note, tick) {
+            duration_ticks.min(next_start.saturating_sub(tick))
+        } else {
+            duration_ticks
+        };
+        if eff_duration == 0 {
+            return;
+        }
+
         let on = ScheduledEvent::new(note_on_id, tick, &self.track_id, ScheduledAction::NoteOn { note, velocity });
-        let off = ScheduledEvent::new(note_off_id, tick + duration_ticks, &self.track_id, ScheduledAction::NoteOff { note });
+        let off = ScheduledEvent::new(note_off_id, tick + eff_duration, &self.track_id, ScheduledAction::NoteOff { note });
         self.events.push(on);
         self.events.push(off);
         self.events.sort_by_key(|e| e.tick);
