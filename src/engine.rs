@@ -1235,7 +1235,7 @@ impl JamSeqHost {
                         clap.process_effect_block(bus_l, bus_r);
                     }
                     crate::track::InsertEffect::Lv2 { track: lv2, .. } => {
-                        lv2.process_block(bus_l, bus_r);
+                        lv2.process_effect_block(bus_l, bus_r);
                     }
                     crate::track::InsertEffect::Vst3 { track: vst3, .. } => {
                         vst3.process_effect_block(bus_l, bus_r);
@@ -1274,7 +1274,7 @@ impl JamSeqHost {
                         clap.process_effect_block(&mut master_left[..num_samples], &mut master_right[..num_samples]);
                     }
                     crate::track::InsertEffect::Lv2 { track: lv2, .. } => {
-                        lv2.process_block(&mut master_left[..num_samples], &mut master_right[..num_samples]);
+                        lv2.process_effect_block(&mut master_left[..num_samples], &mut master_right[..num_samples]);
                     }
                     crate::track::InsertEffect::Vst3 { track: vst3, .. } => {
                         vst3.process_effect_block(&mut master_left[..num_samples], &mut master_right[..num_samples]);

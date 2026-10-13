@@ -1688,3 +1688,159 @@ fn test_cascading_meter_and_polymeter_hierarchy() {
 
     let _ = std::fs::remove_file(&meter_project_path);
 }
+
+#[test]
+fn test_param_grouping_and_typed_controls() {
+    let host = std::sync::Arc::new(std::sync::Mutex::new(JamSeqHost::new(120.0, 48000.0)));
+    {
+        let mut h = host.lock().unwrap();
+        h.add_custom_track("track_lead", "Lead Synth", "synth:reese");
+
+        let lead_idx = h.track_map["track_lead"];
+        let statuses = h.tracks[lead_idx].get_param_statuses();
+        assert!(!statuses.is_empty(), "Expected param statuses on synth track");
+
+        // Verify JamSynth parameters are categorized into Filter, Amp Envelope, and Voice
+        let filter_params: Vec<_> = statuses.iter().filter(|p| p.group == "Filter").collect();
+        let env_params: Vec<_> = statuses.iter().filter(|p| p.group == "Amp Envelope").collect();
+        let voice_params: Vec<_> = statuses.iter().filter(|p| p.group == "Voice").collect();
+
+        assert_eq!(filter_params.len(), 3); // cutoff, resonance, drive
+        assert_eq!(env_params.len(), 4); // attack_ms, decay_ms, sustain, release_ms
+        assert_eq!(voice_params.len(), 1); // glide_ms
+
+        let cutoff = statuses.iter().find(|p| p.name.to_lowercase() == "cutoff").unwrap();
+        assert!(cutoff.display_value.is_some());
+        assert_eq!(cutoff.param_type, jamseq::ipc::ParamType::Float);
+    }
+
+    // Verify status struct over IPC contains the groups and types
+    let resp = jamseq::ipc::execute_command(jamseq::ipc::IpcCommand::GetStatus, &host);
+    assert!(resp.ok);
+    let status_json = serde_json::to_string(&resp.status).unwrap();
+    assert!(status_json.contains("\"group\":\"Filter\""));
+    assert!(status_json.contains("\"group\":\"Amp Envelope\""));
+    assert!(status_json.contains("\"param_type\":\"Float\""));
+
+    // Verify project persistence of parameters
+    let temp_path = std::env::temp_dir().join("test_param_persistence.jam.json");
+    let saved_val = {
+        let mut h = host.lock().unwrap();
+        // Modify a parameter value
+        h.tracks[0].set_parameter("cutoff", 880.0);
+        let val = h.tracks[0].get_parameters().iter().find(|(n, _, _, _)| n.to_lowercase() == "cutoff").unwrap().1;
+        h.save_project_to_file(&temp_path).expect("Failed to save project");
+        val
+    };
+
+    let mut reload_host = JamSeqHost::new(120.0, 48000.0);
+    reload_host.load_project_from_file(&temp_path).expect("Failed to load project");
+    assert_eq!(reload_host.tracks.len(), 1);
+
+    let reloaded_statuses = reload_host.tracks[0].get_param_statuses();
+    let reloaded_cutoff = reloaded_statuses.iter().find(|p| p.name.to_lowercase() == "cutoff").unwrap();
+    assert!((reloaded_cutoff.value - saved_val).abs() < 1e-4, "Cutoff value must be restored from project file");
+
+    let _ = std::fs::remove_file(&temp_path);
+}
+
+#[test]
+fn test_surge_xt_effects_enum_type() {
+    let surge_clap = std::path::Path::new("/usr/lib/clap/Surge XT Effects.clap");
+    if !surge_clap.exists() {
+        return;
+    }
+
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    host.add_custom_track("track_1", "Synth Track", "synth:reese");
+    let added = host.add_track_insert("track_1", "/usr/lib/clap/Surge XT Effects.clap", "Surge XT Effects (CLAP)");
+    assert!(added, "Surge XT Effects CLAP must load successfully");
+
+    let lead_idx = host.track_map["track_1"];
+    let statuses = host.tracks[lead_idx].inserts[0].get_param_statuses();
+    let fx_type = statuses.iter().find(|p| p.name == "FX Type").expect("FX Type parameter must exist");
+
+    match &fx_type.param_type {
+        jamseq::ipc::ParamType::Enum { labels } => {
+            assert!(labels.len() >= 20, "Surge XT Effects should discover at least 20 effect labels, discovered {}", labels.len());
+            assert!(labels.iter().any(|l: &String| l.contains("Delay") || l.contains("Reverb")), "Discovered labels should contain Delay or Reverb");
+        }
+        other => panic!("Expected ParamType::Enum for 'FX Type', got {:?}", other),
+    }
+
+    // Test setting parameter to an enum index value and verifying display_value
+    host.tracks[lead_idx].inserts[0].set_parameter("FX Type", 0.05);
+    let updated_statuses = host.tracks[lead_idx].inserts[0].get_param_statuses();
+    let updated_fx_type = updated_statuses.iter().find(|p| p.name == "FX Type").unwrap();
+    assert!(updated_fx_type.display_value.as_ref().map(|s| s.contains("Reverb")).unwrap_or(false),
+        "Setting FX Type to 0.05 should update display_value to Reverb, got: {:?}", updated_fx_type.display_value);
+}
+
+#[test]
+fn test_surge_xt_effects_lv2_master_insert() {
+    let surge_lv2 = std::path::Path::new("/usr/lib/lv2/Surge XT Effects.lv2");
+    if !surge_lv2.exists() {
+        return;
+    }
+
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    let uri = "https://surge-synth-team.org//plugins/Surge_XT_Effects";
+    let added = host.add_master_insert(uri, "Surge XT Effects (LV2)");
+    assert!(added, "Must be able to add Surge XT Effects LV2 as master insert");
+
+    // Render a block to trigger audio processing through master inserts
+    let mut left = vec![0.0f32; 512];
+    let mut right = vec![0.0f32; 512];
+    host.process_block(&mut left, &mut right);
+}
+
+#[test]
+fn test_surge_xt_effects_clap_parameter_names_and_groups() {
+    let vst3_path = "/usr/lib/vst3/Surge XT Effects.vst3";
+    let clap_path = "/usr/lib/clap/Surge XT Effects.clap";
+
+    if !std::path::Path::new(clap_path).exists() {
+        return;
+    }
+
+    let track = jamseq::clap_host::ClapTrack::load(clap_path, 48000.0).expect("Should load Surge XT Effects CLAP");
+    let statuses = track.get_param_statuses();
+
+    println!("=== VERIFYING CLAP PARAMETERS ===");
+    for p in &statuses {
+        println!("CLAP param: name='{}', group='{}', type={:?}, val={}, disp={:?}",
+            p.name, p.group, p.param_type, p.value, p.display_value);
+    }
+
+    // Verify that parameters are NOT named generic "FX Parameter N"
+    assert!(
+        !statuses.iter().any(|p| p.name.starts_with("FX Parameter")),
+        "CLAP parameters should have specific names, not generic 'FX Parameter N'"
+    );
+
+    // Verify specific parameter names exist
+    assert!(statuses.iter().any(|p| p.name == "Delay Time Left"), "Expected 'Delay Time Left'");
+    assert!(statuses.iter().any(|p| p.name == "Delay Time Right"), "Expected 'Delay Time Right'");
+    assert!(statuses.iter().any(|p| p.name == "EQ Feedback"), "Expected 'EQ Feedback'");
+    assert!(statuses.iter().any(|p| p.name == "FX Type"), "Expected 'FX Type'");
+
+    // Verify parameter grouping: "EQ Feedback" must belong to "Feedback" group
+    let feedback_param = statuses.iter().find(|p| p.name == "EQ Feedback").expect("EQ Feedback param");
+    assert_eq!(feedback_param.group, "Feedback", "EQ Feedback should be grouped under 'Feedback'");
+
+    // If VST3 is also installed, verify the parameter names match between CLAP and VST3
+    if std::path::Path::new(vst3_path).exists() {
+        let vst3_track = jamseq::vst3_host::Vst3Track::load(vst3_path, 48000.0).expect("Should load VST3");
+        let vst3_statuses = vst3_track.get_param_statuses();
+
+        let clap_names: Vec<&str> = statuses.iter().map(|p| p.name.as_str()).collect();
+        let vst3_names: Vec<&str> = vst3_statuses.iter().map(|p| p.name.as_str()).collect();
+
+        // Check that key effect parameters match
+        for key_param in &["Delay Time Left", "Delay Time Right", "EQ Feedback", "EQ Crossfeed", "FX Type"] {
+            assert!(clap_names.contains(key_param), "CLAP should contain {}", key_param);
+            assert!(vst3_names.contains(key_param), "VST3 should contain {}", key_param);
+        }
+    }
+}
+
