@@ -45,6 +45,14 @@ impl InsertEffect {
         }
     }
 
+    pub fn get_param_statuses(&self) -> Vec<crate::ipc::TrackParamStatus> {
+        match self {
+            InsertEffect::Clap { track, .. } => track.get_param_statuses(),
+            InsertEffect::Lv2 { track, .. } => track.get_param_statuses(),
+            InsertEffect::Vst3 { track, .. } => track.get_param_statuses(),
+        }
+    }
+
     pub fn set_parameter(&mut self, param_name: &str, value: f32) {
         match self {
             InsertEffect::Clap { track, .. } => track.set_parameter(param_name, value),
@@ -423,6 +431,92 @@ impl Track {
             TrackInstrument::Clap(clap) => clap.get_parameters(),
             TrackInstrument::Lv2(lv2) => lv2.get_parameters(),
             TrackInstrument::Vst3(vst3) => vst3.get_parameters(),
+        }
+    }
+
+    pub fn get_param_statuses(&self) -> Vec<crate::ipc::TrackParamStatus> {
+        match &self.instrument {
+            TrackInstrument::Synth(synth) => {
+                vec![
+                    crate::ipc::TrackParamStatus {
+                        name: "cutoff".to_string(),
+                        value: synth.patch.filter.cutoff_hz,
+                        min: 40.0,
+                        max: 12000.0,
+                        group: "Filter".to_string(),
+                        param_type: crate::ipc::ParamType::Float,
+                        display_value: Some(format!("{:.1} Hz", synth.patch.filter.cutoff_hz)),
+                    },
+                    crate::ipc::TrackParamStatus {
+                        name: "resonance".to_string(),
+                        value: synth.patch.filter.resonance,
+                        min: 0.0,
+                        max: 0.95,
+                        group: "Filter".to_string(),
+                        param_type: crate::ipc::ParamType::Float,
+                        display_value: Some(format!("{:.2}", synth.patch.filter.resonance)),
+                    },
+                    crate::ipc::TrackParamStatus {
+                        name: "drive".to_string(),
+                        value: synth.patch.drive.amount,
+                        min: 0.0,
+                        max: 1.0,
+                        group: "Filter".to_string(),
+                        param_type: crate::ipc::ParamType::Float,
+                        display_value: Some(format!("{:.0}%", synth.patch.drive.amount * 100.0)),
+                    },
+                    crate::ipc::TrackParamStatus {
+                        name: "attack_ms".to_string(),
+                        value: synth.patch.amp_env.attack_ms,
+                        min: 0.5,
+                        max: 1000.0,
+                        group: "Amp Envelope".to_string(),
+                        param_type: crate::ipc::ParamType::Float,
+                        display_value: Some(format!("{:.1} ms", synth.patch.amp_env.attack_ms)),
+                    },
+                    crate::ipc::TrackParamStatus {
+                        name: "decay_ms".to_string(),
+                        value: synth.patch.amp_env.decay_ms,
+                        min: 10.0,
+                        max: 3000.0,
+                        group: "Amp Envelope".to_string(),
+                        param_type: crate::ipc::ParamType::Float,
+                        display_value: Some(format!("{:.1} ms", synth.patch.amp_env.decay_ms)),
+                    },
+                    crate::ipc::TrackParamStatus {
+                        name: "sustain".to_string(),
+                        value: synth.patch.amp_env.sustain,
+                        min: 0.0,
+                        max: 1.0,
+                        group: "Amp Envelope".to_string(),
+                        param_type: crate::ipc::ParamType::Float,
+                        display_value: Some(format!("{:.2}", synth.patch.amp_env.sustain)),
+                    },
+                    crate::ipc::TrackParamStatus {
+                        name: "release_ms".to_string(),
+                        value: synth.patch.amp_env.release_ms,
+                        min: 10.0,
+                        max: 3000.0,
+                        group: "Amp Envelope".to_string(),
+                        param_type: crate::ipc::ParamType::Float,
+                        display_value: Some(format!("{:.1} ms", synth.patch.amp_env.release_ms)),
+                    },
+                    crate::ipc::TrackParamStatus {
+                        name: "glide_ms".to_string(),
+                        value: synth.patch.glide_ms,
+                        min: 0.0,
+                        max: 300.0,
+                        group: "Voice".to_string(),
+                        param_type: crate::ipc::ParamType::Float,
+                        display_value: Some(format!("{:.1} ms", synth.patch.glide_ms)),
+                    },
+                ]
+            }
+            TrackInstrument::Sampler(_) => Vec::new(),
+            TrackInstrument::AudioClips(_) => Vec::new(),
+            TrackInstrument::Clap(clap) => clap.get_param_statuses(),
+            TrackInstrument::Lv2(lv2) => lv2.get_param_statuses(),
+            TrackInstrument::Vst3(vst3) => vst3.get_param_statuses(),
         }
     }
 

@@ -10,6 +10,9 @@ use vst3_host::plugin::Plugin;
 pub struct Vst3Param {
     pub id: u32,
     pub name: String,
+    pub group: String,
+    pub param_type: crate::ipc::ParamType,
+    pub display_value: Option<String>,
     pub min: f32,
     pub max: f32,
     pub default: f32,
@@ -52,18 +55,94 @@ impl Vst3Track {
         let mut param_index = HashMap::new();
 
         for (i, p) in raw_params.into_iter().enumerate() {
+            let (group, display_name) = if let Some(slash_idx) = p.name.rfind('/') {
+                let g = p.name[..slash_idx].trim().to_string();
+                let n = p.name[slash_idx + 1..].trim().to_string();
+                (
+                    if g.is_empty() { "General".to_string() } else { g.replace('/', " > ") },
+                    if n.is_empty() { p.name.clone() } else { n },
+                )
+            } else if !p.unit.is_empty() && (p.name.contains(':') || p.name.contains(" - ")) {
+                if let Some(colon_idx) = p.name.find(':') {
+                    let g = p.name[..colon_idx].trim().to_string();
+                    let n = p.name[colon_idx + 1..].trim().to_string();
+                    (g, n)
+                } else {
+                    ("General".to_string(), p.name.clone())
+                }
+            } else {
+                ("General".to_string(), p.name.clone())
+            };
+
+            let group = if group == "General" {
+                let n = display_name.to_lowercase();
+                if n.contains("cutoff") || n.contains("reso") || n.contains("drive") || n.contains("filter") {
+                    "Filter".to_string()
+                } else if n.contains("attack") || n.contains("decay") || n.contains("sustain") || n.contains("release") || n.contains("env") {
+                    "Amp Envelope".to_string()
+                } else if n.contains("glide") || n.contains("voice") || n.contains("portamento") || n.contains("tuning") {
+                    "Voice".to_string()
+                } else if n.contains("gain") || n.contains("volume") || n.contains("master") || n.contains("pan") {
+                    "Output".to_string()
+                } else {
+                    "General".to_string()
+                }
+            } else {
+                group
+            };
+
+            let is_bypass = p.is_bypass;
+            let step_count = p.step_count;
+            let param_type = if is_bypass || step_count == 1 {
+                crate::ipc::ParamType::Bool
+            } else if step_count > 1 && step_count <= 64 {
+                let mut labels = Vec::new();
+                for step in 0..=step_count {
+                    let norm = step as f64 / step_count as f64;
+                    let label = plugin.format_parameter(p.id, norm).unwrap_or_default().trim().to_string();
+                    labels.push(label);
+                }
+                let has_named_labels = labels.iter().any(|l| !l.is_empty() && l.parse::<i64>().is_err());
+                if has_named_labels {
+                    for (step_i, l) in labels.iter_mut().enumerate() {
+                        if l.is_empty() {
+                            *l = format!("{}", step_i);
+                        }
+                    }
+                    crate::ipc::ParamType::Enum { labels }
+                } else {
+                    crate::ipc::ParamType::Int
+                }
+            } else if step_count > 64 {
+                crate::ipc::ParamType::Int
+            } else {
+                crate::ipc::ParamType::Float
+            };
+
+            let display_value = plugin.format_parameter(p.id, p.value).ok().and_then(|s| {
+                let trimmed = s.trim().to_string();
+                if !trimmed.is_empty() { Some(trimmed) } else { None }
+            });
+
             let param = Vst3Param {
                 id: p.id,
-                name: p.name.clone(),
+                name: display_name,
+                group,
+                param_type,
+                display_value,
                 min: p.min as f32,
                 max: p.max as f32,
                 default: p.default as f32,
                 value: p.value as f32,
             };
-            param_index.insert(p.name.clone(), i);
-            param_index.insert(p.name.to_lowercase(), i);
-            param_index.insert(p.name.to_lowercase().replace(' ', "_"), i);
-            param_index.insert(p.name.to_lowercase().replace('_', " "), i);
+            param_index.insert(param.name.clone(), i);
+            param_index.insert(param.name.to_lowercase(), i);
+            param_index.insert(param.name.to_lowercase().replace(' ', "_"), i);
+            param_index.insert(param.name.to_lowercase().replace('_', " "), i);
+            if p.name != param.name {
+                param_index.insert(p.name.clone(), i);
+                param_index.insert(p.name.to_lowercase(), i);
+            }
             params.push(param);
         }
 
@@ -123,6 +202,22 @@ impl Vst3Track {
             .collect()
     }
 
+    pub fn get_param_statuses(&self) -> Vec<crate::ipc::TrackParamStatus> {
+        let params = self.params.lock().unwrap();
+        params
+            .iter()
+            .map(|p| crate::ipc::TrackParamStatus {
+                name: p.name.clone(),
+                value: p.value,
+                min: p.min,
+                max: p.max,
+                group: p.group.clone(),
+                param_type: p.param_type.clone(),
+                display_value: p.display_value.clone(),
+            })
+            .collect()
+    }
+
     pub fn set_parameter(&self, name: &str, value: f32) {
         let mut params = self.params.lock().unwrap();
         let index_map = self.param_index.lock().unwrap();
@@ -139,6 +234,12 @@ impl Vst3Track {
                 let id = param.id;
                 if let Ok(mut plugin) = self.plugin.lock() {
                     let _ = plugin.set_parameter(id, clamped as f64);
+                    if let Ok(formatted) = plugin.format_parameter(id, clamped as f64) {
+                        let trimmed = formatted.trim().to_string();
+                        if !trimmed.is_empty() {
+                            param.display_value = Some(trimmed);
+                        }
+                    }
                 }
             }
         }

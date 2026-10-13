@@ -43,6 +43,9 @@ struct AtomSequenceBuffer {
 pub struct Lv2ControlPort {
     pub index: usize,
     pub name: String,
+    pub group: String,
+    pub param_type: crate::ipc::ParamType,
+    pub display_value: Option<String>,
     pub min: f32,
     pub max: f32,
     pub default: f32,
@@ -257,6 +260,9 @@ impl Lv2Track {
         let control_class = world.new_uri("http://lv2plug.in/ns/lv2core#ControlPort");
         let audio_class = world.new_uri("http://lv2plug.in/ns/lv2core#AudioPort");
         let atom_class = world.new_uri("http://lv2plug.in/ns/ext/atom#AtomPort");
+        let toggled_class = world.new_uri("http://lv2plug.in/ns/lv2core#toggled");
+        let integer_class = world.new_uri("http://lv2plug.in/ns/lv2core#integer");
+        let enum_class = world.new_uri("http://lv2plug.in/ns/lv2core#enumeration");
 
         for i in 0..num_ports {
             if let Some(port) = plugin.port_by_index(i) {
@@ -292,16 +298,98 @@ impl Lv2Track {
                     let min_val = range.minimum.as_ref().and_then(|n| n.as_float()).unwrap_or(0.0);
                     let max_val = range.maximum.as_ref().and_then(|n| n.as_float()).unwrap_or(1.0);
 
+                    let is_toggled = port.has_property(&toggled_class);
+                    let is_integer = port.has_property(&integer_class);
+                    let is_enumeration = port.has_property(&enum_class);
+
+                    let sp_coll = port.scale_points();
+                    let sp_count = sp_coll.count();
+
+                    let param_type = if is_toggled || (min_val == 0.0 && max_val == 1.0 && (is_integer || sp_count == 2)) {
+                        crate::ipc::ParamType::Bool
+                    } else if (is_enumeration || sp_count > 0) && sp_count <= 64 {
+                        let mut pts: Vec<(f32, String)> = sp_coll.iter().filter_map(|sp| {
+                            let val = sp.value().as_float()?;
+                            let lbl = sp.label().as_str()?.to_string();
+                            Some((val, lbl))
+                        }).collect();
+                        pts.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+                        if !pts.is_empty() {
+                            let labels = pts.into_iter().map(|(_, l)| l).collect();
+                            crate::ipc::ParamType::Enum { labels }
+                        } else if is_integer {
+                            crate::ipc::ParamType::Int
+                        } else {
+                            crate::ipc::ParamType::Float
+                        }
+                    } else if is_integer {
+                        crate::ipc::ParamType::Int
+                    } else {
+                        crate::ipc::ParamType::Float
+                    };
+
+                    let (group, display_name) = if let Some(slash_idx) = name.rfind('/') {
+                        let g = name[..slash_idx].trim().to_string();
+                        let n = name[slash_idx + 1..].trim().to_string();
+                        (
+                            if g.is_empty() { "General".to_string() } else { g.replace('/', " > ") },
+                            if n.is_empty() { name.clone() } else { n },
+                        )
+                    } else if let Some(colon_idx) = name.find(':') {
+                        let g = name[..colon_idx].trim().to_string();
+                        let n = name[colon_idx + 1..].trim().to_string();
+                        (
+                            if g.is_empty() { "General".to_string() } else { g },
+                            if n.is_empty() { name.clone() } else { n },
+                        )
+                    } else {
+                        ("General".to_string(), name.clone())
+                    };
+
+                    let group = if group == "General" {
+                        let n = display_name.to_lowercase();
+                        if n.contains("cutoff") || n.contains("reso") || n.contains("drive") || n.contains("filter") {
+                            "Filter".to_string()
+                        } else if n.contains("attack") || n.contains("decay") || n.contains("sustain") || n.contains("release") || n.contains("env") {
+                            "Amp Envelope".to_string()
+                        } else if n.contains("glide") || n.contains("voice") || n.contains("portamento") || n.contains("tuning") {
+                            "Voice".to_string()
+                        } else if n.contains("gain") || n.contains("volume") || n.contains("master") || n.contains("pan") {
+                            "Output".to_string()
+                        } else {
+                            "General".to_string()
+                        }
+                    } else {
+                        group
+                    };
+
+                    let display_value = match &param_type {
+                        crate::ipc::ParamType::Bool => Some(if def_val > 0.5 { "On".to_string() } else { "Off".to_string() }),
+                        crate::ipc::ParamType::Enum { labels } => {
+                            let idx = (def_val - min_val).round() as usize;
+                            labels.get(idx).cloned()
+                        }
+                        crate::ipc::ParamType::Int => Some(format!("{}", def_val as i64)),
+                        crate::ipc::ParamType::Float => None,
+                    };
+
                     let idx = control_ports.len();
-                    port_index_map.insert(name.clone(), idx);
-                    port_index_map.insert(name.to_lowercase(), idx);
+                    port_index_map.insert(display_name.clone(), idx);
+                    port_index_map.insert(display_name.to_lowercase(), idx);
+                    if display_name != name {
+                        port_index_map.insert(name.clone(), idx);
+                        port_index_map.insert(name.to_lowercase(), idx);
+                    }
                     if !symbol.is_empty() {
                         port_index_map.insert(symbol.clone(), idx);
                     }
 
                     control_ports.push(Lv2ControlPort {
                         index: i,
-                        name,
+                        name: display_name,
+                        group,
+                        param_type,
+                        display_value,
                         min: min_val,
                         max: max_val,
                         default: def_val,
@@ -399,13 +487,45 @@ impl Lv2Track {
         ports.iter().map(|p| (p.name.clone(), p.value, p.min, p.max)).collect()
     }
 
+    pub fn get_param_statuses(&self) -> Vec<crate::ipc::TrackParamStatus> {
+        let ports = self.control_ports.lock().unwrap();
+        ports
+            .iter()
+            .map(|p| crate::ipc::TrackParamStatus {
+                name: p.name.clone(),
+                value: p.value,
+                min: p.min,
+                max: p.max,
+                group: p.group.clone(),
+                param_type: p.param_type.clone(),
+                display_value: p.display_value.clone(),
+            })
+            .collect()
+    }
+
     pub fn set_parameter(&self, name: &str, value: f32) {
         let mut ports = self.control_ports.lock().unwrap();
         let map = self.port_index_map.lock().unwrap();
         let idx = map.get(name).or_else(|| map.get(&name.to_lowercase()));
         if let Some(&i) = idx {
             if let Some(port) = ports.get_mut(i) {
-                port.value = value.clamp(port.min, port.max);
+                let clamped = value.clamp(port.min, port.max);
+                port.value = clamped;
+                match &port.param_type {
+                    crate::ipc::ParamType::Bool => {
+                        port.display_value = Some(if clamped > 0.5 { "On".to_string() } else { "Off".to_string() });
+                    }
+                    crate::ipc::ParamType::Enum { labels } => {
+                        let step_idx = (clamped - port.min).round() as usize;
+                        if let Some(lbl) = labels.get(step_idx) {
+                            port.display_value = Some(lbl.clone());
+                        }
+                    }
+                    crate::ipc::ParamType::Int => {
+                        port.display_value = Some(format!("{}", clamped as i64));
+                    }
+                    crate::ipc::ParamType::Float => {}
+                }
             }
         }
     }

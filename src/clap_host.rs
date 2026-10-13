@@ -1,4 +1,4 @@
-use clack_extensions::params::{ParamInfoBuffer, PluginParams};
+use clack_extensions::params::{ParamInfoBuffer, ParamInfoFlags, PluginParams};
 use clack_extensions::timer::{HostTimer, HostTimerImpl, PluginTimer, TimerId};
 use clack_host::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent, TransportEvent, TransportFlags};
 use clack_host::events::EventFlags;
@@ -44,6 +44,9 @@ pub struct ClapParam {
     pub id: ClapId,
     pub name: String,
     pub module: String, // Hierarchical path (e.g. "Filter/Cutoff", "Amp/Envelope")
+    pub group: String,
+    pub param_type: crate::ipc::ParamType,
+    pub display_value: Option<String>,
     pub min: f32,
     pub max: f32,
     pub default: f32,
@@ -167,10 +170,75 @@ impl ClapTrack {
                                 p_map.insert(format!("{} (ms)", stripped_ms), idx);
 
                                 let mod_path = String::from_utf8_lossy(info.module).to_string();
+                                let mod_trimmed = mod_path.trim_matches('/').trim();
+                                let group = if !mod_trimmed.is_empty() {
+                                    mod_trimmed.replace('/', " > ")
+                                } else {
+                                    let n = name.to_lowercase();
+                                    if n.contains("cutoff") || n.contains("reso") || n.contains("drive") || n.contains("filter") {
+                                        "Filter".to_string()
+                                    } else if n.contains("attack") || n.contains("decay") || n.contains("sustain") || n.contains("release") || n.contains("env") {
+                                        "Amp Envelope".to_string()
+                                    } else if n.contains("glide") || n.contains("voice") || n.contains("portamento") || n.contains("tuning") {
+                                        "Voice".to_string()
+                                    } else if n.contains("gain") || n.contains("volume") || n.contains("master") || n.contains("pan") {
+                                        "Output".to_string()
+                                    } else {
+                                        "General".to_string()
+                                    }
+                                };
+
+                                let is_bypass = info.flags.contains(ParamInfoFlags::IS_BYPASS);
+                                let is_stepped = info.flags.contains(ParamInfoFlags::IS_STEPPED);
+                                let is_enum = info.flags.contains(ParamInfoFlags::IS_ENUM);
+
+                                let range = (max - min).round() as i64;
+                                let param_type = if is_bypass || (is_stepped && min == 0.0 && max == 1.0) {
+                                    crate::ipc::ParamType::Bool
+                                } else if (is_enum || is_stepped) && range > 0 && range <= 64 {
+                                    let mut labels = Vec::new();
+                                    let mut text_buf = [0u8; 128];
+                                    for step in 0..=range {
+                                        let step_val = min as f64 + step as f64;
+                                        let label = if let Ok(bytes) = params_ext.value_to_text(&handle, info.id, step_val, &mut text_buf) {
+                                            String::from_utf8_lossy(bytes).trim().to_string()
+                                        } else {
+                                            String::new()
+                                        };
+                                        labels.push(label);
+                                    }
+                                    let has_named_labels = labels.iter().any(|l| !l.is_empty() && l.parse::<i64>().is_err());
+                                    if is_enum || has_named_labels {
+                                        for (step_i, l) in labels.iter_mut().enumerate() {
+                                            if l.is_empty() {
+                                                *l = format!("{}", min as i64 + step_i as i64);
+                                            }
+                                        }
+                                        crate::ipc::ParamType::Enum { labels }
+                                    } else {
+                                        crate::ipc::ParamType::Int
+                                    }
+                                } else if is_stepped {
+                                    crate::ipc::ParamType::Int
+                                } else {
+                                    crate::ipc::ParamType::Float
+                                };
+
+                                let mut text_buf = [0u8; 128];
+                                let display_value = if let Ok(bytes) = params_ext.value_to_text(&handle, info.id, val as f64, &mut text_buf) {
+                                    let s = String::from_utf8_lossy(bytes).trim().to_string();
+                                    if !s.is_empty() { Some(s) } else { None }
+                                } else {
+                                    None
+                                };
+
                                 p_list.push(ClapParam {
                                     id: info.id,
                                     name,
                                     module: mod_path,
+                                    group,
+                                    param_type,
+                                    display_value,
                                     min,
                                     max,
                                     default: def,
@@ -258,6 +326,22 @@ impl ClapTrack {
         params.iter().map(|p| (p.name.clone(), p.value, p.min, p.max)).collect()
     }
 
+    pub fn get_param_statuses(&self) -> Vec<crate::ipc::TrackParamStatus> {
+        let params = self.params.lock().unwrap();
+        params
+            .iter()
+            .map(|p| crate::ipc::TrackParamStatus {
+                name: p.name.clone(),
+                value: p.value,
+                min: p.min,
+                max: p.max,
+                group: p.group.clone(),
+                param_type: p.param_type.clone(),
+                display_value: p.display_value.clone(),
+            })
+            .collect()
+    }
+
     pub fn set_parameter(&self, name: &str, value: f32) {
         let mut params = self.params.lock().unwrap();
         let index_map = self.param_index.lock().unwrap();
@@ -286,6 +370,12 @@ impl ClapTrack {
                 };
 
                 param.value = clamped;
+                if let crate::ipc::ParamType::Enum { ref labels } = param.param_type {
+                    let step_idx = (clamped - param.min).round() as usize;
+                    if let Some(lbl) = labels.get(step_idx) {
+                        param.display_value = Some(lbl.clone());
+                    }
+                }
                 let id = param.id;
                 self.pending_params.lock().unwrap().push((id, clamped as f64));
             }

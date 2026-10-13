@@ -1688,3 +1688,38 @@ fn test_cascading_meter_and_polymeter_hierarchy() {
 
     let _ = std::fs::remove_file(&meter_project_path);
 }
+
+#[test]
+fn test_param_grouping_and_typed_controls() {
+    let host = std::sync::Arc::new(std::sync::Mutex::new(JamSeqHost::new(120.0, 48000.0)));
+    {
+        let mut h = host.lock().unwrap();
+        h.add_custom_track("track_lead", "Lead Synth", "synth:reese");
+
+        let lead_idx = h.track_map["track_lead"];
+        let statuses = h.tracks[lead_idx].get_param_statuses();
+        assert!(!statuses.is_empty(), "Expected param statuses on synth track");
+
+        // Verify JamSynth parameters are categorized into Filter, Amp Envelope, and Voice
+        let filter_params: Vec<_> = statuses.iter().filter(|p| p.group == "Filter").collect();
+        let env_params: Vec<_> = statuses.iter().filter(|p| p.group == "Amp Envelope").collect();
+        let voice_params: Vec<_> = statuses.iter().filter(|p| p.group == "Voice").collect();
+
+        assert_eq!(filter_params.len(), 3); // cutoff, resonance, drive
+        assert_eq!(env_params.len(), 4); // attack_ms, decay_ms, sustain, release_ms
+        assert_eq!(voice_params.len(), 1); // glide_ms
+
+        let cutoff = statuses.iter().find(|p| p.name.to_lowercase() == "cutoff").unwrap();
+        assert!(cutoff.display_value.is_some());
+        assert_eq!(cutoff.param_type, jamseq::ipc::ParamType::Float);
+    }
+
+    // Verify status struct over IPC contains the groups and types
+    let resp = jamseq::ipc::execute_command(jamseq::ipc::IpcCommand::GetStatus, &host);
+    assert!(resp.ok);
+    let status_json = serde_json::to_string(&resp.status).unwrap();
+    assert!(status_json.contains("\"group\":\"Filter\""));
+    assert!(status_json.contains("\"group\":\"Amp Envelope\""));
+    assert!(status_json.contains("\"param_type\":\"Float\""));
+}
+

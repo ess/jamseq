@@ -309,12 +309,42 @@ pub struct TrackInsertStatus {
     pub params: Vec<TrackParamStatus>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ParamType {
+    /// Continuous floating-point slider (e.g. Cutoff, Volume, Pan)
+    Float,
+    /// Boolean on/off toggle (e.g. Bypass, Sync, Invert)
+    Bool,
+    /// Stepped integer counter / slider (e.g. Voices 1..16, Octave -2..+2)
+    Int,
+    /// Stepped discrete choice / dropdown with named labels (e.g. FX Type, Waveform, Filter Mode)
+    Enum {
+        labels: Vec<String>,
+    },
+}
+
+impl Default for ParamType {
+    fn default() -> Self {
+        ParamType::Float
+    }
+}
+
+fn default_param_group() -> String {
+    "General".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrackParamStatus {
     pub name: String,
     pub value: f32,
     pub min: f32,
     pub max: f32,
+    #[serde(default = "default_param_group")]
+    pub group: String,
+    #[serde(default)]
+    pub param_type: ParamType,
+    #[serde(default)]
+    pub display_value: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -487,7 +517,7 @@ fn handle_client(stream: UnixStream, host: Arc<Mutex<JamSeqHost>>) {
     }
 }
 
-fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcResponse {
+pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcResponse {
     let mut h = match host.lock() {
         Ok(guard) => guard,
         Err(_) => {
@@ -852,11 +882,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
         .tracks
         .iter()
         .map(|t| {
-            let params = t
-                .get_parameters()
-                .into_iter()
-                .map(|(name, value, min, max)| TrackParamStatus { name, value, min, max })
-                .collect();
+            let params = t.get_param_statuses();
 
             let inserts = t
                 .inserts
@@ -864,11 +890,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 .map(|ins| TrackInsertStatus {
                     name: ins.name().to_string(),
                     uri: ins.uri().to_string(),
-                    params: ins
-                        .get_parameters()
-                        .into_iter()
-                        .map(|(name, value, min, max)| TrackParamStatus { name, value, min, max })
-                        .collect(),
+                    params: ins.get_param_statuses(),
                 })
                 .collect();
 
@@ -924,11 +946,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
         .map(|ins| TrackInsertStatus {
             name: ins.name().to_string(),
             uri: ins.uri().to_string(),
-            params: ins
-                .get_parameters()
-                .into_iter()
-                .map(|(name, value, min, max)| TrackParamStatus { name, value, min, max })
-                .collect(),
+            params: ins.get_param_statuses(),
         })
         .collect();
 
@@ -942,11 +960,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 .map(|ins| TrackInsertStatus {
                     name: ins.name().to_string(),
                     uri: ins.uri().to_string(),
-                    params: ins
-                        .get_parameters()
-                        .into_iter()
-                        .map(|(name, value, min, max)| TrackParamStatus { name, value, min, max })
-                        .collect(),
+                    params: ins.get_param_statuses(),
                 })
                 .collect();
             AuxBusStatus {
