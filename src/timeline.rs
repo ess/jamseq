@@ -376,12 +376,32 @@ impl Default for TimelineArrangement {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct TrackPlaybackCursor {
+    pub current_tick: f64,
+}
+
+impl TrackPlaybackCursor {
+    pub fn new(start_tick: f64) -> Self {
+        Self { current_tick: start_tick }
+    }
+
+    pub fn advance(&mut self, samples: usize, effective_bpm: f64, sample_rate: f32) -> (u64, u64) {
+        let start_tick = self.current_tick as u64;
+        let delta_ticks = (samples as f64 * effective_bpm * PPQ as f64) / (60.0 * sample_rate as f64);
+        self.current_tick += delta_ticks;
+        let end_tick = self.current_tick as u64;
+        (start_tick, end_tick)
+    }
+}
+
 pub struct Timeline {
     pub title: String,
     pub bpm: f64,
     pub sample_rate: f64,
     pub current_sample: u64,
     pub current_tick: u64,
+    pub current_sub_tick: f64,
     pub total_ticks: u64,
     pub loop_enabled: bool,
     pub loop_start_tick: u64,
@@ -389,18 +409,21 @@ pub struct Timeline {
     pub is_playing: bool,
     pub sections: Vec<SongSection>,
     pub events: Vec<ScheduledEvent>,
+    pub active_events: Vec<ScheduledEvent>,
+    pub track_cursors: HashMap<String, TrackPlaybackCursor>,
 
     event_cursor: usize,
 }
 
 impl Timeline {
     pub fn new(bpm: f64, sample_rate: f64) -> Self {
-        Self {
+        let mut t = Self {
             title: "Untitled".to_string(),
             bpm: if bpm > 10.0 { bpm } else { 120.0 },
             sample_rate: if sample_rate > 0.0 { sample_rate } else { 44100.0 },
             current_sample: 0,
             current_tick: 0,
+            current_sub_tick: 0.0,
             total_ticks: 0,
             loop_enabled: true,
             loop_start_tick: 0,
@@ -408,8 +431,12 @@ impl Timeline {
             is_playing: false,
             sections: Vec::new(),
             events: Vec::new(),
+            active_events: Vec::new(),
+            track_cursors: HashMap::new(),
             event_cursor: 0,
-        }
+        };
+        t.rebuild_active_events();
+        t
     }
 
     pub fn samples_to_ticks(&self, samples: u64) -> u64 {
@@ -442,6 +469,7 @@ impl Timeline {
         // Sort chronologically
         events.sort_by_key(|e| e.tick);
         self.events = events;
+        self.rebuild_active_events();
         self.reset();
     }
 
@@ -642,7 +670,7 @@ impl Timeline {
         }
         self.sections.retain(|s| s.id != section.id);
         self.sections.push(section);
-        self.refresh_boundaries();
+        self.rebuild_active_events();
     }
 
     pub fn remove_section(&mut self, section_id: &str) -> bool {
@@ -650,7 +678,7 @@ impl Timeline {
         self.sections.retain(|s| s.id != section_id);
         let removed = self.sections.len() < orig_len;
         if removed {
-            self.refresh_boundaries();
+            self.rebuild_active_events();
         }
         removed
     }
@@ -663,7 +691,7 @@ impl Timeline {
                 self.loop_end_tick = sec_end;
             }
             self.sections[pos] = section;
-            self.refresh_boundaries();
+            self.rebuild_active_events();
             true
         } else {
             false
@@ -674,7 +702,7 @@ impl Timeline {
     pub fn set_track_block(&mut self, section_id: &str, block: TrackBlock) -> bool {
         if let Some(sec) = self.sections.iter_mut().find(|s| s.id == section_id) {
             sec.track_blocks.insert(block.track_id.clone(), block);
-            self.refresh_boundaries();
+            self.rebuild_active_events();
             true
         } else {
             false
@@ -685,7 +713,9 @@ impl Timeline {
     pub fn remove_track_block(&mut self, section_id: &str, track_id: &str) -> bool {
         if let Some(sec) = self.sections.iter_mut().find(|s| s.id == section_id) {
             let removed = sec.track_blocks.remove(track_id).is_some();
-            self.refresh_boundaries();
+            if removed {
+                self.rebuild_active_events();
+            }
             removed
         } else {
             false
@@ -696,6 +726,7 @@ impl Timeline {
     pub fn set_section_tempo(&mut self, section_id: &str, tempo: Option<TempoOverride>) -> bool {
         if let Some(sec) = self.sections.iter_mut().find(|s| s.id == section_id) {
             sec.tempo = tempo;
+            self.rebuild_active_events();
             true
         } else {
             false
@@ -707,32 +738,93 @@ impl Timeline {
         if let Some(sec) = self.sections.iter_mut().find(|s| s.id == section_id) {
             if let Some(block) = sec.track_blocks.get_mut(track_id) {
                 block.tempo = tempo;
+                self.rebuild_active_events();
                 return true;
             }
         }
         false
     }
 
+    /// Rebuild the materialized active events cache and refresh boundaries
+    pub fn rebuild_active_events(&mut self) {
+        self.refresh_boundaries();
+        self.active_events = self.materialize_all_events();
+        self.event_cursor = self.active_events.partition_point(|e| e.tick < self.current_tick);
+        for sec in &self.sections {
+            for track_id in sec.track_blocks.keys() {
+                self.track_cursors.entry(track_id.clone()).or_insert_with(|| TrackPlaybackCursor::new(self.current_tick as f64));
+            }
+        }
+    }
+
+    /// Get effective tempo for a specific track at a given tick position
+    pub fn get_track_effective_bpm(&self, track_id: &str, tick: u64) -> f64 {
+        if let Some(sec) = self.get_section_at_tick(tick) {
+            let sec_bpm = sec.effective_bpm(self.bpm);
+            if let Some(block) = sec.track_blocks.get(track_id) {
+                block.effective_bpm(sec_bpm)
+            } else {
+                sec_bpm
+            }
+        } else {
+            self.bpm
+        }
+    }
+
     /// Materialize all scheduled events combining timeline events and block-based events
     pub fn materialize_all_events(&self) -> Vec<ScheduledEvent> {
         let mut all_events = self.events.clone();
         let mut accum_tick = 0u64;
+
         for sec in &self.sections {
+            let sec_start = accum_tick;
+            let sec_len = sec.length_ticks();
+            let sec_bpm = sec.effective_bpm(self.bpm);
+
             for block in sec.track_blocks.values() {
-                let block_start = accum_tick + block.start_offset_ticks;
-                for ev in &block.events {
-                    let mut materialized = ev.clone();
-                    materialized.tick = block_start + ev.tick;
-                    all_events.push(materialized);
+                let block_bpm = block.effective_bpm(sec_bpm);
+                let tempo_scale = if block_bpm > 0.0 { sec_bpm / block_bpm } else { 1.0 };
+                let block_start = sec_start + block.start_offset_ticks;
+                let iter_sec_len = (block.base_length_ticks as f64 * tempo_scale).round() as u64;
+
+                let num_loops = match block.loop_mode {
+                    LoopMode::OneShot => 1,
+                    LoopMode::FixedLoops(count) => count,
+                    LoopMode::LoopToSection => {
+                        if iter_sec_len > 0 && sec_len > block.start_offset_ticks {
+                            let available = sec_len - block.start_offset_ticks;
+                            ((available as f64 / iter_sec_len as f64).ceil() as u32).max(1)
+                        } else {
+                            1
+                        }
+                    }
+                };
+
+                for loop_idx in 0..num_loops {
+                    let iter_start = block_start + loop_idx as u64 * iter_sec_len;
+                    for ev in &block.events {
+                        let scaled_tick = (ev.tick as f64 * tempo_scale).round() as u64;
+                        let abs_tick = iter_start + scaled_tick;
+
+                        if block.loop_mode == LoopMode::LoopToSection && abs_tick >= sec_start + sec_len {
+                            continue;
+                        }
+
+                        let mut materialized = ev.clone();
+                        materialized.tick = abs_tick;
+                        all_events.push(materialized);
+                    }
                 }
             }
-            accum_tick += sec.length_ticks();
+            accum_tick += sec_len;
         }
+
         all_events.sort_by_key(|e| e.tick);
         all_events
     }
 
     pub fn play(&mut self) {
+        self.rebuild_active_events();
         self.is_playing = true;
     }
 
@@ -743,32 +835,44 @@ impl Timeline {
     pub fn reset(&mut self) {
         self.current_sample = 0;
         self.current_tick = 0;
+        self.current_sub_tick = 0.0;
         self.event_cursor = 0;
+        for cursor in self.track_cursors.values_mut() {
+            cursor.current_tick = 0.0;
+        }
     }
 
     pub fn seek_tick(&mut self, tick: u64) {
+        self.rebuild_active_events();
         self.current_tick = tick;
+        self.current_sub_tick = tick as f64;
         self.current_sample = self.ticks_to_samples(tick);
-        // Find new cursor position
-        self.event_cursor = self.events.partition_point(|e| e.tick < tick);
+        self.event_cursor = self.active_events.partition_point(|e| e.tick < tick);
+        for cursor in self.track_cursors.values_mut() {
+            cursor.current_tick = tick as f64;
+        }
     }
 
     /// Advance the timeline by `num_samples` and return all scheduled events occurring in this window.
     pub fn advance_samples(&mut self, num_samples: usize) -> Vec<ScheduledEvent> {
-        if !self.is_playing || self.events.is_empty() {
+        if !self.is_playing || self.active_events.is_empty() {
             return Vec::new();
         }
 
-        self.current_sample += num_samples as u64;
-        let end_tick = self.samples_to_ticks(self.current_sample);
+        let current_sec = self.get_section_at_tick(self.current_tick);
+        let effective_bpm = current_sec.map(|s| s.effective_bpm(self.bpm)).unwrap_or(self.bpm);
+
+        let delta_ticks = (num_samples as f64 * effective_bpm * PPQ as f64) / (60.0 * self.sample_rate);
+        let next_sub_tick = self.current_sub_tick + delta_ticks;
+        let end_tick = next_sub_tick as u64;
 
         let mut due_events = Vec::new();
 
         // Check if we hit the loop boundary
-        if self.loop_enabled && end_tick >= self.loop_end_tick {
+        if self.loop_enabled && self.loop_end_tick > self.loop_start_tick && end_tick >= self.loop_end_tick {
             // Collect events up to the loop end
-            while self.event_cursor < self.events.len() {
-                let ev = &self.events[self.event_cursor];
+            while self.event_cursor < self.active_events.len() {
+                let ev = &self.active_events[self.event_cursor];
                 if ev.tick <= self.loop_end_tick {
                     due_events.push(ev.clone());
                     self.event_cursor += 1;
@@ -778,12 +882,15 @@ impl Timeline {
             }
 
             // Loop back to start
-            self.current_sample = self.ticks_to_samples(self.loop_start_tick);
-            self.current_tick = self.loop_start_tick;
-            self.event_cursor = self.events.partition_point(|e| e.tick < self.loop_start_tick);
+            let loop_span = (self.loop_end_tick - self.loop_start_tick) as f64;
+            let overshoot = next_sub_tick - self.loop_end_tick as f64;
+            self.current_sub_tick = self.loop_start_tick as f64 + (overshoot % loop_span);
+            self.current_tick = self.current_sub_tick as u64;
+            self.current_sample = self.ticks_to_samples(self.current_tick);
+            self.event_cursor = self.active_events.partition_point(|e| e.tick < self.current_tick);
         } else {
-            while self.event_cursor < self.events.len() {
-                let ev = &self.events[self.event_cursor];
+            while self.event_cursor < self.active_events.len() {
+                let ev = &self.active_events[self.event_cursor];
                 if ev.tick <= end_tick {
                     due_events.push(ev.clone());
                     self.event_cursor += 1;
@@ -791,7 +898,18 @@ impl Timeline {
                     break;
                 }
             }
+            self.current_sub_tick = next_sub_tick;
             self.current_tick = end_tick;
+            self.current_sample += num_samples as u64;
+        }
+
+        // Advance per-track playback cursors
+        let track_ids: Vec<String> = self.track_cursors.keys().cloned().collect();
+        for track_id in track_ids {
+            let track_bpm = self.get_track_effective_bpm(&track_id, self.current_tick);
+            if let Some(cursor) = self.track_cursors.get_mut(&track_id) {
+                cursor.advance(num_samples, track_bpm, self.sample_rate as f32);
+            }
         }
 
         due_events

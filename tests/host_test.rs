@@ -1135,6 +1135,112 @@ fn test_block_hierarchy_and_tempo_inheritance() {
     assert_eq!(timeline.total_ticks, 7680 + 7680 + 7680);
 }
 
+#[test]
+fn test_polytempo_block_playback_and_loop_modes() {
+    use jamseq::timeline::{LoopMode, SongSection, TempoOverride, TrackBlock};
+
+    let mut timeline = jamseq::Timeline::new(120.0, 48000.0);
+
+    // Section A (starts at 0)
+    let mut sec_a = SongSection::new_empty("sec_a", "Section A", 4);
+
+    // Track 1: Synth (standard 120 BPM, repeats 2 times via FixedLoops)
+    let mut synth_block = TrackBlock::new("tb_synth", "synth", 1920)
+        .with_loop_mode(LoopMode::FixedLoops(2));
+    synth_block.add_note(101, 102, 0, 480, 60, 0.8);
+    sec_a.set_block(synth_block);
+
+    // Track 2: Polytempo Lead (Ratio 3:2 = 180 BPM, starts at offset 960 ticks)
+    let mut lead_block = TrackBlock::new("tb_lead", "lead", 1920)
+        .with_offset(960)
+        .with_tempo(TempoOverride::Ratio(3, 2))
+        .with_loop_mode(LoopMode::OneShot);
+    // Note in lead local time: duration 480 ticks
+    lead_block.add_note(201, 202, 0, 480, 72, 0.9);
+    sec_a.set_block(lead_block);
+
+    // Track 3: Drum Loop (1 bar = 1920 ticks, LoopToSection to fill 3840 ticks)
+    let mut drum_block = TrackBlock::new("tb_drums", "drums", 1920)
+        .with_loop_mode(LoopMode::LoopToSection);
+    drum_block.add_note(301, 302, 0, 240, 36, 1.0);
+    sec_a.set_block(drum_block);
+
+    timeline.add_section(sec_a);
+
+    // Section extent: synth is 1920*2 = 3840 ticks. drums loop to 3840 ticks.
+    // lead is 960 + 1920 = 2880 ticks.
+    assert_eq!(timeline.total_ticks, 3840);
+
+    // Verify materialized active events
+    let events = timeline.materialize_all_events();
+
+    // Synth: Loop 0 (NoteOn @ 0, NoteOff @ 480), Loop 1 (NoteOn @ 1920, NoteOff @ 2400)
+    let synth_notes: Vec<&ScheduledEvent> = events.iter().filter(|e| e.track_id == "synth").collect();
+    assert_eq!(synth_notes.len(), 4);
+    assert_eq!(synth_notes[0].tick, 0);
+    assert_eq!(synth_notes[1].tick, 480);
+    assert_eq!(synth_notes[2].tick, 1920);
+    assert_eq!(synth_notes[3].tick, 2400);
+
+    // Lead (Ratio 3:2): NoteOn @ 960 (960 + 0).
+    // Note duration scaled by 120/180 = 2/3: 480 * 2/3 = 320 ticks!
+    // NoteOff @ 960 + 320 = 1280 ticks!
+    let lead_notes: Vec<&ScheduledEvent> = events.iter().filter(|e| e.track_id == "lead").collect();
+    assert_eq!(lead_notes.len(), 2);
+    assert_eq!(lead_notes[0].tick, 960);
+    assert_eq!(lead_notes[1].tick, 1280);
+
+    // Drums (LoopToSection over 3840 ticks with base 1920): 2 iterations (0 and 1920)
+    let drum_notes: Vec<&ScheduledEvent> = events.iter().filter(|e| e.track_id == "drums").collect();
+    assert_eq!(drum_notes.len(), 4);
+    assert_eq!(drum_notes[0].tick, 0);
+    assert_eq!(drum_notes[1].tick, 240);
+    assert_eq!(drum_notes[2].tick, 1920);
+    assert_eq!(drum_notes[3].tick, 2160);
+
+    // Test Audio Advance & Playback Cursors
+    timeline.seek_tick(0);
+    timeline.play();
+
+    // Advance 480 samples at 48000 Hz = 0.01 seconds
+    // At 120 BPM: 0.01 * 2 beats/sec * 960 PPQ = 19.2 ticks
+    // Synth cursor advances at 120 BPM (19.2 ticks)
+    // Lead cursor advances at 180 BPM = 0.01 * 3 beats/sec * 960 PPQ = 28.8 ticks
+    let due = timeline.advance_samples(480);
+    assert!(!due.is_empty(), "Events at tick 0 must fire on first advance");
+    assert_eq!(due[0].tick, 0);
+
+    let synth_cursor = timeline.track_cursors.get("synth").unwrap();
+    let lead_cursor = timeline.track_cursors.get("lead").unwrap();
+
+    assert!((synth_cursor.current_tick - 19.2).abs() < 0.1, "Synth cursor must advance at 120 BPM");
+    assert!((lead_cursor.current_tick - 28.8).abs() < 0.1, "Lead cursor must advance at 180 BPM polytempo");
+
+    // Test Host Integration with JamSeqHost audio block
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    let mut engine = JamSynthEngine::new(48000.0);
+    engine.load_patch(JamSynthPatch::preset_reese_bass());
+    host.add_track(Track::new_synth("poly_bass", "Poly Bass", engine));
+
+    let mut bass_sec = SongSection::new_empty("b_sec", "Bass Section", 2);
+    let mut bass_block = TrackBlock::new("tb_bass", "poly_bass", 1920)
+        .with_tempo(TempoOverride::Ratio(3, 2))
+        .with_loop_mode(LoopMode::OneShot);
+    bass_block.add_note(401, 402, 0, 480, 48, 0.9);
+    bass_sec.set_block(bass_block);
+    host.add_section(bass_sec);
+
+    host.timeline.seek_tick(0);
+    host.play();
+
+    let mut left = vec![0.0f32; 512];
+    let mut right = vec![0.0f32; 512];
+    host.process_block(&mut left, &mut right);
+
+    let peak = left.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(peak > 0.001, "Polytempo block must produce audio in host process_block");
+}
+
 
 
 

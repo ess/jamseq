@@ -131,6 +131,7 @@ pub struct Track {
     pub pan: f32,    // -1.0 (hard left) to 1.0 (hard right)
     pub current_plugin: Option<String>,
     pub peak_level: f32,
+    pub current_bpm: f64,
 }
 
 impl Track {
@@ -151,6 +152,7 @@ impl Track {
             pan: 0.0,
             current_plugin: Some("JamSynth (Built-in)".to_string()),
             peak_level: 0.0,
+            current_bpm: 120.0,
         }
     }
 
@@ -171,6 +173,7 @@ impl Track {
             pan: 0.0,
             current_plugin: Some(plugin_name.to_string()),
             peak_level: 0.0,
+            current_bpm: 120.0,
         }
     }
 
@@ -191,6 +194,7 @@ impl Track {
             pan: 0.0,
             current_plugin: Some(plugin_name.to_string()),
             peak_level: 0.0,
+            current_bpm: 120.0,
         }
     }
 
@@ -211,6 +215,7 @@ impl Track {
             pan: 0.0,
             current_plugin: Some("Sampler".to_string()),
             peak_level: 0.0,
+            current_bpm: 120.0,
         }
     }
 
@@ -231,6 +236,7 @@ impl Track {
             pan: 0.0,
             current_plugin: None,
             peak_level: 0.0,
+            current_bpm: 120.0,
         }
     }
 
@@ -251,6 +257,7 @@ impl Track {
             pan: 0.0,
             current_plugin: Some(plugin_name.to_string()),
             peak_level: 0.0,
+            current_bpm: 120.0,
         }
     }
 
@@ -301,6 +308,20 @@ impl Track {
             TrackInstrument::Clap(_) => {}
             TrackInstrument::Lv2(_) => {}
             TrackInstrument::Vst3(vst3) => vst3.set_sample_rate(rate),
+        }
+    }
+
+    pub fn set_tempo(&mut self, bpm: f64) {
+        self.current_bpm = bpm;
+        match &mut self.instrument {
+            TrackInstrument::Clap(clap) => clap.set_tempo(bpm),
+            _ => {}
+        }
+        for ins in &mut self.inserts {
+            match ins {
+                InsertEffect::Clap { track, .. } => track.set_tempo(bpm),
+                _ => {}
+            }
         }
     }
 

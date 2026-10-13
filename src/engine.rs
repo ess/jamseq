@@ -843,12 +843,16 @@ impl JamSeqHost {
         self.sidechain_buffers.clear();
         let track_order = self.get_track_processing_order();
 
+        let current_tick = self.timeline.current_tick;
+
         // Render all tracks into master bus and tap aux sends & sidechains
         for &track_idx in &track_order {
             let track = &mut self.tracks[track_idx];
             if any_solo && !track.solo {
                 continue;
             }
+            let effective_bpm = self.timeline.get_track_effective_bpm(&track.id, current_tick);
+            track.set_tempo(effective_bpm);
             let is_armed = self.armed_track_id.as_deref() == Some(&track.id);
             track.process_block(
                 current_sample,
