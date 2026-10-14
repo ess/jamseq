@@ -387,12 +387,36 @@ impl JamSeqHost {
             "audio" => {
                 Track::new_audio_clips(id, name, AudioClipTrack::new())
             }
+            "sampler" => {
+                Track::new_sampler(id, name, crate::sampler::SamplerInstrument::new(crate::sampler::SamplerConfig::default(), sr))
+            }
+            _ if track_type.starts_with("http://") || track_type.starts_with("https://") || track_type.starts_with("urn:") => {
+                match crate::lv2_host::Lv2Track::load(track_type, sr) {
+                    Ok(lv2_inst) => Track::new_lv2(id, name, lv2_inst, name),
+                    Err(e) => {
+                        eprintln!("[jamseq] Failed to load LV2 track '{}': {}", track_type, e);
+                        Track::new_synth(id, name, jamsynth::JamSynthEngine::new(sr))
+                    }
+                }
+            }
             _ if track_type.ends_with(".vst3") || track_type.starts_with("vst3:") => {
                 let path = track_type.strip_prefix("vst3:").unwrap_or(track_type);
                 match crate::vst3_host::Vst3Track::load(path, sr) {
                     Ok(vst3_inst) => Track::new_vst3(id, name, vst3_inst, name),
                     Err(e) => {
                         eprintln!("[jamseq] Failed to load VST3 track '{}': {}", path, e);
+                        Track::new_synth(id, name, jamsynth::JamSynthEngine::new(sr))
+                    }
+                }
+            }
+            _ if (track_type.ends_with(".clap") || track_type.ends_with(".so"))
+                && !track_type.contains("libjamsynth")
+                && !track_type.contains("JamSynth") =>
+            {
+                match crate::clap_host::ClapTrack::load(track_type, sr) {
+                    Ok(clap_inst) => Track::new_clap(id, name, clap_inst, name),
+                    Err(e) => {
+                        eprintln!("[jamseq] Failed to load CLAP track '{}': {}", track_type, e);
                         Track::new_synth(id, name, jamsynth::JamSynthEngine::new(sr))
                     }
                 }
@@ -490,15 +514,14 @@ impl JamSeqHost {
             let sr = self.sample_rate;
             let track = &mut self.tracks[idx];
 
-            track.current_plugin = Some(display_name.to_string());
-
-            if uri_or_type.starts_with("synth:") || uri_or_type == "jamsynth" {
+            if uri_or_type.starts_with("synth:") || uri_or_type == "jamsynth" || uri_or_type == "synth" {
                 if let Some(jamsynth_path) = crate::plugin_scanner::find_jamsynth_plugin() {
                     match crate::clap_host::ClapTrack::load(&jamsynth_path.to_string_lossy(), sr) {
                         Ok(clap_inst) => {
                             apply_synth_preset(&clap_inst, uri_or_type);
                             println!("[jamseq] ✓ Switched track '{}' to JamSynth CLAP: {}", track_id, display_name);
                             track.instrument = TrackInstrument::Clap(Box::new(clap_inst));
+                            track.current_plugin = Some(display_name.to_string());
                             return;
                         }
                         Err(e) => {
@@ -517,12 +540,14 @@ impl JamSeqHost {
                     engine.load_patch(jamsynth::JamSynthPatch::preset_808_sub());
                 }
                 track.instrument = TrackInstrument::Synth(engine);
+                track.current_plugin = Some(display_name.to_string());
             } else if uri_or_type.ends_with(".vst3") || uri_or_type.starts_with("vst3:") {
                 let path = uri_or_type.strip_prefix("vst3:").unwrap_or(uri_or_type);
                 match crate::vst3_host::Vst3Track::load(path, sr) {
                     Ok(vst3_inst) => {
                         println!("[jamseq] ✓ Switched track '{}' to VST3 plugin: {}", track_id, display_name);
                         track.instrument = TrackInstrument::Vst3(Box::new(vst3_inst));
+                        track.current_plugin = Some(display_name.to_string());
                     }
                     Err(e) => {
                         eprintln!("[jamseq] Failed to load VST3 plugin '{}': {}", uri_or_type, e);
@@ -533,6 +558,7 @@ impl JamSeqHost {
                     Ok(clap_inst) => {
                         println!("[jamseq] ✓ Switched track '{}' to CLAP plugin: {}", track_id, display_name);
                         track.instrument = TrackInstrument::Clap(Box::new(clap_inst));
+                        track.current_plugin = Some(display_name.to_string());
                     }
                     Err(e) => {
                         eprintln!("[jamseq] Failed to load CLAP plugin '{}': {}", uri_or_type, e);
@@ -543,6 +569,7 @@ impl JamSeqHost {
                     Ok(lv2_inst) => {
                         println!("[jamseq] ✓ Switched track '{}' to LV2 plugin: {}", track_id, display_name);
                         track.instrument = TrackInstrument::Lv2(Box::new(lv2_inst));
+                        track.current_plugin = Some(display_name.to_string());
                     }
                     Err(e) => {
                         eprintln!("[jamseq] Failed to load LV2 plugin '{}': {}", uri_or_type, e);
@@ -951,7 +978,22 @@ impl JamSeqHost {
             self.tracks.clear();
             self.track_map.clear();
             for tc in &arrangement.tracks {
-                self.add_custom_track(&tc.id, &tc.name, &tc.track_type);
+                let mut resolved_type = tc.track_type.clone();
+                let display_name = tc.current_plugin.clone().unwrap_or_else(|| tc.name.clone());
+
+                // Auto-healing: If track_type was saved as libjamsynth.so or "synth", but current_plugin indicates an LV2, VST3, or CLAP plugin
+                if (resolved_type.contains("libjamsynth") || resolved_type == "synth")
+                    && !display_name.starts_with("JamSynth")
+                {
+                    if let Some(p) = self.available_plugins.iter().find(|p| {
+                        p.name == display_name
+                            || format!("{} ({})", p.name, p.plugin_format) == display_name
+                    }) {
+                        resolved_type = p.uri_or_path.clone();
+                    }
+                }
+
+                self.add_custom_track(&tc.id, &tc.name, &resolved_type);
                 if let Some(&idx) = self.track_map.get(&tc.id) {
                     self.tracks[idx].volume = tc.volume;
                     self.tracks[idx].pan = tc.pan;
