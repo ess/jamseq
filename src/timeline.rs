@@ -547,6 +547,7 @@ pub struct TimelineArrangement {
     #[serde(default)]
     pub aux_buses: Vec<AuxBusConfig>,
     pub sections: Vec<SongSection>,
+    #[serde(skip_serializing, default)]
     pub events: Vec<ScheduledEvent>,
 }
 
@@ -774,6 +775,7 @@ impl Timeline {
                 self.loop_end_tick = self.total_ticks;
             }
         }
+        self.events.clear();
 
         self.rebuild_active_events();
         self.reset();
@@ -782,11 +784,6 @@ impl Timeline {
     /// Export the current live state into a TimelineArrangement for saving
     pub fn to_arrangement(&self) -> TimelineArrangement {
         let total_bars = (self.total_ticks / (4 * PPQ)) as u32;
-        let all_events = if !self.active_events.is_empty() {
-            self.active_events.clone()
-        } else {
-            self.events.clone()
-        };
         TimelineArrangement {
             title: self.title.clone(),
             bpm: self.bpm,
@@ -797,7 +794,7 @@ impl Timeline {
             master_bus: None,
             aux_buses: Vec::new(),
             sections: self.sections.clone(),
-            events: all_events,
+            events: Vec::new(),
         }
     }
 
@@ -1148,9 +1145,9 @@ impl Timeline {
         }
     }
 
-    /// Materialize all scheduled events combining timeline events and block-based events
+    /// Materialize all scheduled events from block-based events
     pub fn materialize_all_events(&self) -> Vec<ScheduledEvent> {
-        let mut all_events = self.events.clone();
+        let mut all_events = Vec::new();
         let mut accum_tick = 0u64;
 
         for sec in &self.sections {

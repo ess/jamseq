@@ -480,7 +480,9 @@ fn test_robust_jamseq_features_suite() {
     assert_eq!(host.track_map.get("track_b"), Some(&1));
 
     // Test AutomationPoint dispatching on timeline
-    host.timeline.add_event(jamseq::ScheduledEvent::new(
+    let mut sec = jamseq::timeline::SongSection::new_empty("sec_auto", "Auto Section");
+    let mut block_b = jamseq::timeline::TrackBlock::new("tb_auto", "track_b", 1920);
+    block_b.events.push(jamseq::ScheduledEvent::new(
         999,
         0,
         "track_b",
@@ -489,6 +491,8 @@ fn test_robust_jamseq_features_suite() {
             value: 800.0,
         },
     ));
+    sec.set_block(block_b);
+    host.add_section(sec);
 
     host.play();
     let mut out_l = vec![0.0f32; 256];
@@ -667,8 +671,11 @@ fn test_track_freeze_and_unfreeze() {
     host.add_track(Track::new_synth("pad", "Pad", pad));
 
     // Schedule events
-    host.timeline.events.push(ScheduledEvent::new(1, 0, "pad", ScheduledAction::NoteOn { note: 60, velocity: 1.0 }));
-    host.timeline.events.push(ScheduledEvent::new(2, 4 * TICKS_PER_16TH, "pad", ScheduledAction::NoteOff { note: 60 }));
+    let mut sec = jamseq::timeline::SongSection::new_empty("sec_freeze", "Freeze Section");
+    let mut pad_block = jamseq::timeline::TrackBlock::new("tb_pad", "pad", 1920);
+    pad_block.add_note(1, 2, 0, 4 * TICKS_PER_16TH, 60, 1.0);
+    sec.set_block(pad_block);
+    host.add_section(sec);
     host.timeline.seek_tick(0);
 
     // Freeze track
@@ -703,8 +710,11 @@ fn test_track_bouncing() {
     host.add_track(Track::new_synth("lead", "Reese Lead", lead));
 
     // Schedule event
-    host.timeline.events.push(ScheduledEvent::new(1, 0, "lead", ScheduledAction::NoteOn { note: 48, velocity: 1.0 }));
-    host.timeline.events.push(ScheduledEvent::new(2, 4 * TICKS_PER_16TH, "lead", ScheduledAction::NoteOff { note: 48 }));
+    let mut sec = jamseq::timeline::SongSection::new_empty("sec_bounce", "Bounce Section");
+    let mut lead_block = jamseq::timeline::TrackBlock::new("tb_lead", "lead", 1920);
+    lead_block.add_note(1, 2, 0, 4 * TICKS_PER_16TH, 48, 1.0);
+    sec.set_block(lead_block);
+    host.add_section(sec);
 
     let bounce_id = host.bounce_track("lead", "Lead Stem").expect("Failed to bounce track");
     assert!(host.track_map.contains_key(&bounce_id), "New bounced track must exist in host track map");
@@ -722,9 +732,11 @@ fn test_autostem_mid_event_pause_and_unpause() {
     host.add_track(Track::new_synth("pad_long", "Long Ambient Pad", pad));
 
     // Pad note starts at tick 0 and sustains for an entire bar (1920 ticks)
-    host.timeline.events.push(ScheduledEvent::new(1, 0, "pad_long", ScheduledAction::NoteOn { note: 60, velocity: 1.0 }));
-    host.timeline.events.push(ScheduledEvent::new(2, 1920, "pad_long", ScheduledAction::NoteOff { note: 60 }));
-    host.timeline.events.sort_by_key(|e| e.tick);
+    let mut sec = jamseq::timeline::SongSection::new_empty("sec_pad", "Pad Section");
+    let mut pad_block = jamseq::timeline::TrackBlock::new("tb_pad", "pad_long", 1920);
+    pad_block.add_note(1, 2, 0, 1920, 60, 1.0);
+    sec.set_block(pad_block);
+    host.add_section(sec);
 
     // Initial state: track is dirty
     let pad_idx = *host.track_map.get("pad_long").unwrap();
@@ -1336,9 +1348,8 @@ fn test_stem_cache_manager_and_granular_block_stems() {
     use jamseq::stem_cache::StemCacheManager;
     use jamseq::timeline::{LoopMode, SongSection, TempoOverride, TrackBlock};
 
-    let cache_dir = std::env::temp_dir().join("jamseq_test_stem_cache_dir");
-    let mut cache_mgr = StemCacheManager::new(&cache_dir).expect("Failed to create StemCacheManager");
-    cache_mgr.clear().expect("Failed to clear test cache dir");
+    let mut cache_mgr = StemCacheManager::new();
+    cache_mgr.clear().expect("Failed to clear in-memory cache");
 
     // 1. Verify Content-Addressed Hash Stability & Invalidation
     let mut block1 = TrackBlock::new("block_1", "bass_track", 1920)
@@ -1361,11 +1372,10 @@ fn test_stem_cache_manager_and_granular_block_stems() {
     let key3 = cache_mgr.compute_block_key("bass_track", "verse", &block3, Some("patch_a"), 180.0);
     assert_ne!(key1, key3, "Metric modulation tempo override must yield a distinct cache key");
 
-    // 2. Store and Load Chunks
+    // 2. Store and Load Chunks in RAM
     let left_samples = vec![0.5f32; 512];
     let right_samples = vec![-0.5f32; 512];
-    let stored_path = cache_mgr.store_chunk(&key1, &left_samples, &right_samples, 48000).expect("Store chunk failed");
-    assert!(stored_path.exists(), "Stored chunk WAV must exist on disk");
+    cache_mgr.store_chunk(&key1, &left_samples, &right_samples, 48000).expect("Store chunk failed");
     assert!(cache_mgr.get_cached_chunk(&key1).is_some());
 
     let loaded = cache_mgr.load_chunk(&key1).expect("Load chunk failed");
@@ -1415,11 +1425,9 @@ fn test_stem_cache_manager_and_granular_block_stems() {
     let generated_again = host.generate_stems_for_dirty_tracks();
     assert_eq!(generated_again, 0, "Clean tracks must skip stem regeneration");
 
-    // Verify individual block chunks are cached on disk
+    // Verify individual block chunks are cached in memory
     let chunk_intro = host.render_track_block("sub808", "sec_intro").expect("Must load cached intro block");
     assert!(!chunk_intro.samples_left.is_empty(), "Cached intro block chunk must not be empty");
-
-    let _ = std::fs::remove_dir_all(&cache_dir);
 }
 
 #[test]
@@ -2062,6 +2070,71 @@ fn test_vst3_project_save_and_reload() {
     let max_amp = left.iter().chain(right.iter()).map(|s| s.abs()).fold(0.0f32, f32::max);
     println!("Audio peak from reloaded VST3 track: max_amp={}", max_amp);
     assert!(max_amp > 0.0001, "Expected audio output from reloaded VST3 track");
+
+    let _ = std::fs::remove_file(save_path);
+}
+
+#[test]
+fn test_track_block_single_source_of_truth_and_save_reload() {
+    use jamseq::timeline::{SongSection, TrackBlock};
+    use jamseq::track::Track;
+    use jamsynth::JamSynthEngine;
+
+    let mut host = JamSeqHost::new(120.0, 44100.0);
+    let synth = JamSynthEngine::new(44100.0);
+    host.add_track(Track::new_synth("lead", "Lead Synth", synth));
+
+    // 1. Create section and block with note 60 (tick 0..480) and note 64 (tick 480..960)
+    let mut sec = SongSection::new_empty("sec_verse", "Verse");
+    let mut block = TrackBlock::new("tb_lead", "lead", 1920);
+    block.add_note(1, 2, 0, 480, 60, 0.8);
+    block.add_note(3, 4, 480, 480, 64, 0.8);
+    sec.set_block(block.clone());
+    host.add_section(sec);
+
+    assert_eq!(host.timeline.active_events.len(), 4, "Should have 2 notes (4 events: on/off each)");
+    let pitches: Vec<u8> = host.timeline.active_events.iter().filter_map(|e| match e.action {
+        jamseq::ScheduledAction::NoteOn { note, .. } => Some(note),
+        _ => None,
+    }).collect();
+    assert_eq!(pitches, vec![60, 64]);
+
+    // 2. Piano roll edit: Delete note 60, and replace note 64 with note 67
+    let mut updated_block = TrackBlock::new("tb_lead", "lead", 1920);
+    updated_block.add_note(5, 6, 240, 480, 67, 0.9);
+    assert!(host.set_track_block("sec_verse", updated_block));
+
+    // Active events must update immediately with ZERO old notes
+    assert_eq!(host.timeline.active_events.len(), 2, "Should have only 1 note (2 events)");
+    let updated_pitches: Vec<u8> = host.timeline.active_events.iter().filter_map(|e| match e.action {
+        jamseq::ScheduledAction::NoteOn { note, .. } => Some(note),
+        _ => None,
+    }).collect();
+    assert_eq!(updated_pitches, vec![67], "Deleted note 60 must not linger");
+
+    // 3. Save project to JSON
+    let save_path = std::env::temp_dir().join("jamseq_test_single_source_of_truth.jam.json");
+    host.save_project_to_file(save_path.to_str().unwrap()).expect("Failed to save project");
+
+    // Verify root "events" is NOT serialized into the JSON
+    let json_content = std::fs::read_to_string(&save_path).expect("Failed to read saved project JSON");
+    let parsed_json: serde_json::Value = serde_json::from_str(&json_content).expect("Invalid JSON");
+    assert!(
+        parsed_json.get("events").is_none(),
+        "Saved project JSON must never serialize root 'events'"
+    );
+
+    // 4. Reload in a fresh host instance
+    let mut reloaded_host = JamSeqHost::new(120.0, 44100.0);
+    reloaded_host.load_project_from_file(save_path.to_str().unwrap()).expect("Failed to reload project");
+
+    // Verify reloaded host has ONLY the modified note (67) and did NOT resurrect deleted note 60
+    assert_eq!(reloaded_host.timeline.active_events.len(), 2);
+    let reloaded_pitches: Vec<u8> = reloaded_host.timeline.active_events.iter().filter_map(|e| match e.action {
+        jamseq::ScheduledAction::NoteOn { note, .. } => Some(note),
+        _ => None,
+    }).collect();
+    assert_eq!(reloaded_pitches, vec![67], "Reloaded project must not resurrect deleted notes");
 
     let _ = std::fs::remove_file(save_path);
 }

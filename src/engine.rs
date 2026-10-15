@@ -42,10 +42,7 @@ impl JamSeqHost {
     pub fn new(bpm: f64, sample_rate: f32) -> Self {
         let sr = if sample_rate > 0.0 { sample_rate } else { 44100.0 };
         let available_plugins = crate::plugin_scanner::PluginScanner::scan_all();
-        let stem_cache_dir = std::env::temp_dir().join("jamseq_stem_cache");
-        let stem_cache = crate::stem_cache::StemCacheManager::new(stem_cache_dir).unwrap_or_else(|_| {
-            crate::stem_cache::StemCacheManager::new("/tmp/jamseq_stem_cache").unwrap()
-        });
+        let stem_cache = crate::stem_cache::StemCacheManager::new();
         Self {
             timeline: Timeline::new(bpm, sr as f64),
             tracks: Vec::new(),
