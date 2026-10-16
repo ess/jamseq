@@ -235,27 +235,39 @@ impl JamSeqHost {
     }
 
     pub fn add_section(&mut self, section: crate::timeline::SongSection) {
+        let block_refs: Vec<(String, String)> = section.track_blocks.iter()
+            .map(|(t_id, b)| (t_id.clone(), b.id.clone()))
+            .collect();
         self.timeline.add_section(section);
-        for t in &mut self.tracks {
-            t.mark_stem_dirty();
+        for (track_id, block_id) in block_refs {
+            self.rebake_block(&track_id, &block_id);
         }
     }
 
     pub fn remove_section(&mut self, section_id: &str) -> bool {
+        let block_ids: Vec<(String, String)> = self.timeline.sections.iter()
+            .find(|s| s.id == section_id)
+            .map(|s| s.track_blocks.iter().map(|(t_id, b)| (t_id.clone(), b.id.clone())).collect())
+            .unwrap_or_default();
         let res = self.timeline.remove_section(section_id);
         if res {
-            for t in &mut self.tracks {
-                t.mark_stem_dirty();
+            for (track_id, block_id) in block_ids {
+                if let Some(&idx) = self.track_map.get(&track_id) {
+                    self.tracks[idx].active_block_stems.retain(|bs| bs.block_id != block_id);
+                }
             }
         }
         res
     }
 
     pub fn update_section(&mut self, section: crate::timeline::SongSection) -> bool {
+        let block_refs: Vec<(String, String)> = section.track_blocks.iter()
+            .map(|(t_id, b)| (t_id.clone(), b.id.clone()))
+            .collect();
         let res = self.timeline.update_section(section);
         if res {
-            for t in &mut self.tracks {
-                t.mark_stem_dirty();
+            for (track_id, block_id) in block_refs {
+                self.rebake_block(&track_id, &block_id);
             }
         }
         res
@@ -263,20 +275,24 @@ impl JamSeqHost {
 
     pub fn set_track_block(&mut self, section_id: &str, block: crate::timeline::TrackBlock) -> bool {
         let track_id = block.track_id.clone();
+        let block_id = block.id.clone();
         let res = self.timeline.set_track_block(section_id, block);
         if res {
-            self.rebake_single_block(&track_id, section_id);
+            self.rebake_block(&track_id, &block_id);
         }
         res
     }
 
     pub fn remove_track_block(&mut self, section_id: &str, track_id: &str) -> bool {
+        let maybe_block_id = self.timeline.sections.iter()
+            .find(|s| s.id == section_id)
+            .and_then(|s| s.track_blocks.get(track_id).map(|b| b.id.clone()));
         let res = self.timeline.remove_track_block(section_id, track_id);
         if res {
-            if let Some(&idx) = self.track_map.get(track_id) {
-                self.tracks[idx].active_block_stems.retain(|bs| {
-                    !self.timeline.sections.iter().any(|s| s.id == section_id && s.track_blocks.values().any(|b| b.id == bs.block_id))
-                });
+            if let Some(block_id) = maybe_block_id {
+                if let Some(&idx) = self.track_map.get(track_id) {
+                    self.tracks[idx].active_block_stems.retain(|bs| bs.block_id != block_id);
+                }
             }
         }
         res
@@ -287,7 +303,7 @@ impl JamSeqHost {
         let block_id = block.id.clone();
         let res = self.timeline.set_timeline_block(block);
         if res {
-            self.rebake_single_timeline_block(&track_id, &block_id);
+            self.rebake_block(&track_id, &block_id);
         }
         res
     }
@@ -315,44 +331,39 @@ impl JamSeqHost {
     }
 
     pub fn set_section_tempo(&mut self, section_id: &str, tempo: Option<crate::timeline::TempoOverride>) -> bool {
-        let res = self.timeline.set_section_tempo(section_id, tempo);
-        if res {
-            for t in &mut self.tracks {
-                t.mark_stem_dirty();
-            }
-        }
-        res
+        self.timeline.set_section_tempo(section_id, tempo)
     }
 
     pub fn set_block_tempo(&mut self, section_id: &str, track_id: &str, tempo: Option<crate::timeline::TempoOverride>) -> bool {
+        let maybe_block_id = self.timeline.sections.iter()
+            .find(|s| s.id == section_id)
+            .and_then(|s| s.track_blocks.get(track_id).map(|b| b.id.clone()));
         let res = self.timeline.set_block_tempo(section_id, track_id, tempo);
         if res {
-            self.mark_track_dirty(track_id);
+            if let Some(block_id) = maybe_block_id {
+                self.rebake_block(track_id, &block_id);
+            }
         }
         res
     }
 
     pub fn set_project_time_signature(&mut self, time_signature: crate::timeline::TimeSignature) {
         self.timeline.set_project_time_signature(time_signature);
-        for t in &mut self.tracks {
-            t.mark_stem_dirty();
-        }
     }
 
     pub fn set_section_time_signature(&mut self, section_id: &str, time_signature: Option<crate::timeline::TimeSignature>) -> bool {
-        let res = self.timeline.set_section_time_signature(section_id, time_signature);
-        if res {
-            for t in &mut self.tracks {
-                t.mark_stem_dirty();
-            }
-        }
-        res
+        self.timeline.set_section_time_signature(section_id, time_signature)
     }
 
     pub fn set_block_time_signature(&mut self, section_id: &str, track_id: &str, time_signature: Option<crate::timeline::TimeSignature>) -> bool {
+        let maybe_block_id = self.timeline.sections.iter()
+            .find(|s| s.id == section_id)
+            .and_then(|s| s.track_blocks.get(track_id).map(|b| b.id.clone()));
         let res = self.timeline.set_block_time_signature(section_id, track_id, time_signature);
         if res {
-            self.mark_track_dirty(track_id);
+            if let Some(block_id) = maybe_block_id {
+                self.rebake_block(track_id, &block_id);
+            }
         }
         res
     }
@@ -363,8 +374,8 @@ impl JamSeqHost {
             self.timeline.sample_rate = rate as f64;
             for t in &mut self.tracks {
                 t.set_sample_rate(rate);
-                t.mark_stem_dirty();
             }
+            self.rebake_all_blocks();
         }
     }
 
@@ -689,7 +700,6 @@ impl JamSeqHost {
 
     /// Set a parameter on a track's insert effect
     pub fn set_track_insert_param(&mut self, track_id: &str, insert_index: usize, param_name: &str, value: f32) -> bool {
-        self.mark_track_dirty(track_id);
         if let Some(&idx) = self.track_map.get(track_id) {
             let track = &mut self.tracks[idx];
             if insert_index < track.inserts.len() {
@@ -1096,15 +1106,11 @@ impl JamSeqHost {
         }
 
         self.timeline.load_arrangement(arrangement);
-        for t in &mut self.tracks {
-            t.mark_stem_dirty();
-        }
-        self.generate_stems_for_dirty_tracks();
+        self.rebake_all_blocks();
     }
 
     pub fn seek_tick(&mut self, tick: u64) {
         self.timeline.seek_tick(tick);
-        self.generate_stems_for_dirty_tracks();
     }
 
     pub fn set_armed_track(&mut self, track_id: Option<String>) {
@@ -1126,7 +1132,6 @@ impl JamSeqHost {
 
     pub fn play(&mut self) {
         if !self.timeline.is_playing {
-            self.generate_stems_for_dirty_tracks();
             self.timeline.play();
         }
     }
@@ -1136,7 +1141,6 @@ impl JamSeqHost {
         for t in &mut self.tracks {
             t.all_notes_off();
         }
-        self.generate_stems_for_dirty_tracks();
     }
 
     /// Render a block of stereo audio into master_left and master_right.
@@ -1604,96 +1608,30 @@ impl JamSeqHost {
         })
     }
 
-    /// Mark a track and any dependent sidechained tracks dirty for stem regeneration
-    pub fn mark_track_dirty(&mut self, track_id: &str) {
-        if let Some(&idx) = self.track_map.get(track_id) {
-            self.tracks[idx].mark_stem_dirty();
-            self.stem_cache.invalidate_track(track_id);
-        }
-        let dep_tracks: Vec<String> = self.tracks.iter()
-            .flat_map(|t| {
-                if t.id == track_id {
-                    t.sidechains.iter().map(|s| s.target_track_id.clone()).collect()
-                } else {
-                    Vec::new()
-                }
-            })
-            .collect();
-
-        for dep_id in dep_tracks {
-            if let Some(&idx) = self.track_map.get(&dep_id) {
-                self.tracks[idx].mark_stem_dirty();
-                self.stem_cache.invalidate_track(&dep_id);
-            }
-        }
-    }
-
-    /// Offline render a single track block for a given (track_id, section_id).
-    /// Uses StemCacheManager to bypass rendering if a matching content hash is already cached.
-    /// Employs dynamic silence detection (-80 dBFS threshold, 200ms window, 10s ceiling) for boundary ringing.
-    pub fn render_track_block(&mut self, track_id: &str, section_id: &str) -> Result<crate::sampler::SampleBuffer> {
+    /// Offline render a single block directly through its track's instrument and DSP chain.
+    /// Employs dynamic silence detection (-80 dBFS threshold, 200ms window, 10s ceiling).
+    /// Does NOT touch or disrupt `self.timeline` (no seeking, no playhead pause).
+    pub fn render_block(
+        &mut self,
+        track_id: &str,
+        block: &crate::timeline::TrackBlock,
+    ) -> Result<crate::sampler::SampleBuffer> {
         let &target_idx = self.track_map.get(track_id).ok_or_else(|| anyhow::anyhow!("Track not found: {}", track_id))?;
-        let (section_idx, sec) = self.timeline.sections.iter().enumerate()
-            .find(|(_, s)| s.id == section_id)
-            .ok_or_else(|| anyhow::anyhow!("Section not found: {}", section_id))?;
-        
-        let block = match sec.track_blocks.get(track_id) {
-            Some(b) => b.clone(),
-            None => {
-                return Ok(crate::sampler::SampleBuffer {
-                    channels: 2,
-                    sample_rate: self.sample_rate as u32,
-                    samples_left: Vec::new(),
-                    samples_right: Vec::new(),
-                });
-            }
-        };
 
-        let eff_sec_bpm = sec.effective_bpm(self.timeline.bpm);
-        let eff_block_bpm = block.effective_bpm(eff_sec_bpm);
-        let patch_summary = format!("{:?}", self.tracks[target_idx].get_parameters());
-        let cache_key = self.stem_cache.compute_block_key(track_id, section_id, &block, Some(&patch_summary), eff_block_bpm);
+        // Effective BPM for this block
+        let eff_bpm = self.timeline.get_track_effective_bpm(track_id, block.start_offset_ticks);
 
-        // Check cache first!
-        if let Ok(buf) = self.stem_cache.load_chunk(&cache_key) {
-            return Ok(buf);
-        }
-
-        // Cache miss: render block audio
-        let orig_active_stems = std::mem::take(&mut self.tracks[target_idx].active_block_stems);
-        let orig_states: Vec<(bool, bool)> = self.tracks.iter().map(|t| (t.muted, t.solo)).collect();
-        let orig_aux_mutes: Vec<bool> = self.aux_buses.iter().map(|b| b.muted).collect();
-        let orig_pos = self.timeline.current_tick;
-        let orig_loop = self.timeline.loop_enabled;
-        let orig_master_inserts = std::mem::take(&mut self.master_bus.inserts);
+        // Save target track fader/pan
         let orig_track_vol = self.tracks[target_idx].volume;
         let orig_track_pan = self.tracks[target_idx].pan;
-        let orig_master_gain = self.master_gain;
-        let orig_master_vol = self.master_bus.volume;
-        let orig_master_pan = self.master_bus.pan;
-
-        // Solo target track at unity gain
-        for t in &mut self.tracks {
-            t.solo = t.id == track_id;
-            t.muted = false;
-        }
         self.tracks[target_idx].volume = 1.0;
         self.tracks[target_idx].pan = 0.0;
-        self.master_gain = 1.0;
-        self.master_bus.volume = 1.0;
-        self.master_bus.pan = 0.0;
-        for b in &mut self.aux_buses {
-            b.muted = true;
-        }
 
-        let section_start_tick = self.timeline.section_start_tick(section_idx);
-        let block_start_tick = section_start_tick + block.start_offset_ticks;
         let block_dur_ticks = block.effective_length_ticks().max(crate::timeline::TICKS_PER_16TH);
-        let total_samples = self.timeline.ticks_to_samples(block_dur_ticks) as usize;
-
-        self.timeline.seek_tick(block_start_tick);
-        self.timeline.loop_enabled = false;
-        self.timeline.play();
+        let ticks_per_beat = crate::timeline::PPQ as f64;
+        let beats = block_dur_ticks as f64 / ticks_per_beat;
+        let seconds = beats * (60.0 / eff_bpm);
+        let total_samples = (seconds * self.sample_rate as f64).round() as usize;
 
         let mut samples_left = Vec::with_capacity(total_samples);
         let mut samples_right = Vec::with_capacity(total_samples);
@@ -1701,22 +1639,94 @@ impl JamSeqHost {
         let block_size = 512;
         let mut left = vec![0.0f32; block_size];
         let mut right = vec![0.0f32; block_size];
-        let mut rendered = 0;
+        let mut scratch_left = vec![0.0f32; block_size];
+        let mut scratch_right = vec![0.0f32; block_size];
 
-        // Phase 1: Render all scheduled notes in block
-        while rendered < total_samples {
-            let current_block = (total_samples - rendered).min(block_size);
-            self.process_block(&mut left[..current_block], &mut right[..current_block]);
-            samples_left.extend_from_slice(&left[..current_block]);
-            samples_right.extend_from_slice(&right[..current_block]);
-            rendered += current_block;
+        // Sort block events by tick offset relative to block start (0..block_dur_ticks)
+        let mut sorted_events = block.events.clone();
+        sorted_events.sort_by_key(|e| e.tick);
+        let mut next_ev_idx = 0;
+
+        let samples_per_tick = (60.0 / eff_bpm) * (self.sample_rate as f64) / ticks_per_beat;
+
+        // Ensure track is quiet before starting block render
+        self.tracks[target_idx].all_notes_off();
+
+        // Phase 1: Render block duration, dispatching events at the appropriate tick offsets
+        let mut current_sample = 0;
+        while current_sample < total_samples {
+            let chunk_size = (total_samples - current_sample).min(block_size);
+            let chunk_end_sample = current_sample + chunk_size;
+
+            let chunk_end_tick = if samples_per_tick > 0.0 {
+                (chunk_end_sample as f64 / samples_per_tick).round() as u64
+            } else {
+                0
+            };
+
+            // Dispatch any events occurring up to chunk_end_tick
+            while next_ev_idx < sorted_events.len() && sorted_events[next_ev_idx].tick < chunk_end_tick {
+                let ev = &sorted_events[next_ev_idx];
+                match &ev.action {
+                    crate::timeline::ScheduledAction::NoteOn { note, velocity } => {
+                        self.tracks[target_idx].note_on(*note, *velocity);
+                    }
+                    crate::timeline::ScheduledAction::NoteOff { note } => {
+                        self.tracks[target_idx].note_off(*note);
+                    }
+                    crate::timeline::ScheduledAction::ControlChange { cc, value } => {
+                        self.tracks[target_idx].handle_cc(*cc, *value);
+                    }
+                    crate::timeline::ScheduledAction::SetParam { param_name, value } => {
+                        self.tracks[target_idx].set_parameter(param_name, *value);
+                    }
+                    crate::timeline::ScheduledAction::LoadPatchJson { json } => {
+                        match &mut self.tracks[target_idx].instrument {
+                            crate::track::TrackInstrument::Clap(clap) => {
+                                if let Ok(patch) = jamsynth::JamSynthPatch::from_json(json) {
+                                    clap.set_parameter("cutoff", patch.filter.cutoff_hz);
+                                    clap.set_parameter("resonance", patch.filter.resonance);
+                                    clap.set_parameter("glide", patch.glide_ms);
+                                    clap.set_parameter("drive", patch.drive.amount);
+                                    clap.set_parameter("attack", patch.amp_env.attack_ms);
+                                    clap.set_parameter("decay", patch.amp_env.decay_ms);
+                                    clap.set_parameter("sustain", patch.amp_env.sustain);
+                                    clap.set_parameter("release", patch.amp_env.release_ms);
+                                }
+                            }
+                            crate::track::TrackInstrument::Synth(synth) => {
+                                let _ = synth.load_patch_json(json);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                next_ev_idx += 1;
+            }
+
+            left[..chunk_size].fill(0.0);
+            right[..chunk_size].fill(0.0);
+
+            self.tracks[target_idx].process_block(
+                current_sample as u64,
+                &mut left[..chunk_size],
+                &mut right[..chunk_size],
+                &mut scratch_left[..chunk_size],
+                &mut scratch_right[..chunk_size],
+                None,
+                true, // bypass stems so instrument + FX process live
+                true,
+            );
+
+            samples_left.extend_from_slice(&left[..chunk_size]);
+            samples_right.extend_from_slice(&right[..chunk_size]);
+            current_sample += chunk_size;
         }
 
         // Phase 2: Dynamic Tail Rendering with Silence Detection (-80 dBFS cutoff with 10s ceiling)
         let silence_threshold = 0.0001f32; // -80 dBFS
         let silence_window_samples = (0.2 * self.sample_rate) as usize; // 200 ms
-        let four_bars_ticks = 4 * 4 * crate::timeline::PPQ;
-        let four_bars_samples = self.timeline.ticks_to_samples(four_bars_ticks) as usize;
+        let four_bars_samples = (4.0 * 4.0 * (60.0 / eff_bpm) * self.sample_rate as f64).round() as usize;
         let max_tail_ceiling = (10.0 * self.sample_rate as f64) as usize;
         let max_tail_samples = max_tail_ceiling.max(four_bars_samples);
 
@@ -1735,10 +1745,10 @@ impl JamSeqHost {
                 sim_sample,
                 &mut left[..chunk_size],
                 &mut right[..chunk_size],
-                &mut self.scratch_left[..chunk_size],
-                &mut self.scratch_right[..chunk_size],
+                &mut scratch_left[..chunk_size],
+                &mut scratch_right[..chunk_size],
                 None,
-                true, // bypass stems so we process live voice decay and reverb tails
+                true, // bypass stems so we capture natural decay and reverb tails
                 true,
             );
 
@@ -1764,182 +1774,11 @@ impl JamSeqHost {
             }
         }
 
-        self.timeline.pause();
-        for t in &mut self.tracks {
-            t.all_notes_off();
-        }
-
-        // Restore target track states
-        self.tracks[target_idx].active_block_stems = orig_active_stems;
-        self.tracks[target_idx].volume = orig_track_vol;
-        self.tracks[target_idx].pan = orig_track_pan;
-        self.master_gain = orig_master_gain;
-        self.master_bus.volume = orig_master_vol;
-        self.master_bus.pan = orig_master_pan;
-        for (i, t) in self.tracks.iter_mut().enumerate() {
-            if i < orig_states.len() {
-                t.muted = orig_states[i].0;
-                t.solo = orig_states[i].1;
-            }
-        }
-        for (i, b) in self.aux_buses.iter_mut().enumerate() {
-            if i < orig_aux_mutes.len() {
-                b.muted = orig_aux_mutes[i];
-            }
-        }
-        self.master_bus.inserts = orig_master_inserts;
-        self.timeline.loop_enabled = orig_loop;
-        self.timeline.seek_tick(orig_pos);
-
-        // Store into cache
-        let _ = self.stem_cache.store_chunk(&cache_key, &samples_left, &samples_right, self.sample_rate as u32);
-
-        Ok(crate::sampler::SampleBuffer {
-            channels: 2,
-            sample_rate: self.sample_rate as u32,
-            samples_left,
-            samples_right,
-        })
-    }
-
-    /// Offline render an ad-hoc continuous timeline block with dynamic silence detection.
-    pub fn render_timeline_block(&mut self, block: &crate::timeline::TrackBlock) -> Result<crate::sampler::SampleBuffer> {
-        let &target_idx = self.track_map.get(&block.track_id).ok_or_else(|| anyhow::anyhow!("Track not found: {}", block.track_id))?;
-        let eff_bpm = self.timeline.get_track_effective_bpm(&block.track_id, block.start_offset_ticks);
-        let patch_summary = format!("{:?}", self.tracks[target_idx].get_parameters());
-        let cache_key = self.stem_cache.compute_timeline_block_key(&block.track_id, block, Some(&patch_summary), eff_bpm);
-
-        if let Ok(buf) = self.stem_cache.load_chunk(&cache_key) {
-            return Ok(buf);
-        }
-
-        let orig_active_stems = std::mem::take(&mut self.tracks[target_idx].active_block_stems);
-        let orig_states: Vec<(bool, bool)> = self.tracks.iter().map(|t| (t.muted, t.solo)).collect();
-        let orig_aux_mutes: Vec<bool> = self.aux_buses.iter().map(|b| b.muted).collect();
-        let orig_pos = self.timeline.current_tick;
-        let orig_loop = self.timeline.loop_enabled;
-        let orig_master_inserts = std::mem::take(&mut self.master_bus.inserts);
-        let orig_track_vol = self.tracks[target_idx].volume;
-        let orig_track_pan = self.tracks[target_idx].pan;
-        let orig_master_gain = self.master_gain;
-        let orig_master_vol = self.master_bus.volume;
-        let orig_master_pan = self.master_bus.pan;
-
-        for t in &mut self.tracks {
-            t.solo = t.id == block.track_id;
-            t.muted = false;
-        }
-        self.tracks[target_idx].volume = 1.0;
-        self.tracks[target_idx].pan = 0.0;
-        self.master_gain = 1.0;
-        self.master_bus.volume = 1.0;
-        self.master_bus.pan = 0.0;
-        for b in &mut self.aux_buses {
-            b.muted = true;
-        }
-
-        let block_dur_ticks = block.base_length_ticks.max(crate::timeline::TICKS_PER_16TH);
-        let total_samples = self.timeline.ticks_to_samples(block_dur_ticks) as usize;
-
-        self.timeline.seek_tick(block.start_offset_ticks);
-        self.timeline.loop_enabled = false;
-        self.timeline.play();
-
-        let mut samples_left = Vec::with_capacity(total_samples);
-        let mut samples_right = Vec::with_capacity(total_samples);
-
-        let block_size = 512;
-        let mut left = vec![0.0f32; block_size];
-        let mut right = vec![0.0f32; block_size];
-        let mut rendered = 0;
-
-        while rendered < total_samples {
-            let current_block = (total_samples - rendered).min(block_size);
-            self.process_block(&mut left[..current_block], &mut right[..current_block]);
-            samples_left.extend_from_slice(&left[..current_block]);
-            samples_right.extend_from_slice(&right[..current_block]);
-            rendered += current_block;
-        }
-
-        // Phase 2: Dynamic Tail Rendering with Silence Detection
-        let silence_threshold = 0.0001f32;
-        let silence_window_samples = (0.2 * self.sample_rate) as usize;
-        let four_bars_ticks = 4 * 4 * crate::timeline::PPQ;
-        let four_bars_samples = self.timeline.ticks_to_samples(four_bars_ticks) as usize;
-        let max_tail_ceiling = (10.0 * self.sample_rate as f64) as usize;
-        let max_tail_samples = max_tail_ceiling.max(four_bars_samples);
-
-        let mut silent_samples = 0;
-        let mut tail_samples_rendered = 0;
-
         self.tracks[target_idx].all_notes_off();
 
-        while tail_samples_rendered < max_tail_samples {
-            let chunk_size = block_size.min(max_tail_samples - tail_samples_rendered);
-            left[..chunk_size].fill(0.0);
-            right[..chunk_size].fill(0.0);
-
-            let sim_sample = (total_samples + tail_samples_rendered) as u64;
-            self.tracks[target_idx].process_block(
-                sim_sample,
-                &mut left[..chunk_size],
-                &mut right[..chunk_size],
-                &mut self.scratch_left[..chunk_size],
-                &mut self.scratch_right[..chunk_size],
-                None,
-                true,
-                true,
-            );
-
-            samples_left.extend_from_slice(&left[..chunk_size]);
-            samples_right.extend_from_slice(&right[..chunk_size]);
-            tail_samples_rendered += chunk_size;
-
-            let mut chunk_peak = 0.0f32;
-            for i in 0..chunk_size {
-                let mag = left[i].abs().max(right[i].abs());
-                if mag > chunk_peak {
-                    chunk_peak = mag;
-                }
-            }
-
-            if chunk_peak < silence_threshold {
-                silent_samples += chunk_size;
-                if silent_samples >= silence_window_samples {
-                    break;
-                }
-            } else {
-                silent_samples = 0;
-            }
-        }
-
-        self.timeline.pause();
-        for t in &mut self.tracks {
-            t.all_notes_off();
-        }
-
-        self.tracks[target_idx].active_block_stems = orig_active_stems;
+        // Restore target track volume & pan
         self.tracks[target_idx].volume = orig_track_vol;
         self.tracks[target_idx].pan = orig_track_pan;
-        self.master_gain = orig_master_gain;
-        self.master_bus.volume = orig_master_vol;
-        self.master_bus.pan = orig_master_pan;
-        for (i, t) in self.tracks.iter_mut().enumerate() {
-            if i < orig_states.len() {
-                t.muted = orig_states[i].0;
-                t.solo = orig_states[i].1;
-            }
-        }
-        for (i, b) in self.aux_buses.iter_mut().enumerate() {
-            if i < orig_aux_mutes.len() {
-                b.muted = orig_aux_mutes[i];
-            }
-        }
-        self.master_bus.inserts = orig_master_inserts;
-        self.timeline.loop_enabled = orig_loop;
-        self.timeline.seek_tick(orig_pos);
-
-        let _ = self.stem_cache.store_chunk(&cache_key, &samples_left, &samples_right, self.sample_rate as u32);
 
         Ok(crate::sampler::SampleBuffer {
             channels: 2,
@@ -1949,60 +1788,15 @@ impl JamSeqHost {
         })
     }
 
-    /// Re-render only a single modified track block in 1-3ms and atomically swap into track.active_block_stems
-    pub fn rebake_single_block(&mut self, track_id: &str, section_id: &str) -> bool {
-        let (_section_idx, sec_start_tick, maybe_block) = match self.timeline.sections.iter().enumerate().find(|(_, s)| s.id == section_id) {
-            Some((idx, s)) => (idx, self.timeline.section_start_tick(idx), s.track_blocks.get(track_id).cloned()),
-            None => return false,
-        };
+    /// Re-render only a single modified track block and atomically swap into track.active_block_stems
+    pub fn rebake_block(&mut self, track_id: &str, block_id: &str) -> bool {
+        let maybe_resolved = self.timeline.get_resolved_blocks_for_track(track_id)
+            .into_iter()
+            .find(|(b, _)| b.id == block_id)
+            .map(|(b, tick)| (b.clone(), tick));
 
-        let block = match maybe_block {
-            Some(b) => b,
-            None => {
-                if let Some(&t_idx) = self.track_map.get(track_id) {
-                    self.tracks[t_idx].active_block_stems.retain(|bs| {
-                        !self.timeline.sections.iter().any(|s| s.id == section_id && s.track_blocks.values().any(|b| b.id == bs.block_id))
-                    });
-                }
-                return true;
-            }
-        };
-
-        match self.render_track_block(track_id, section_id) {
-            Ok(buf) => {
-                let block_start_tick = sec_start_tick + block.start_offset_ticks;
-                let start_sample = self.timeline.ticks_to_samples(block_start_tick) as usize;
-                let end_sample = start_sample + buf.samples_left.len();
-
-                let new_stem = crate::track::BlockStem {
-                    block_id: block.id.clone(),
-                    track_id: track_id.to_string(),
-                    start_sample,
-                    end_sample,
-                    buffer: buf,
-                };
-
-                if let Some(&t_idx) = self.track_map.get(track_id) {
-                    if let Some(pos) = self.tracks[t_idx].active_block_stems.iter().position(|bs| bs.block_id == block.id) {
-                        self.tracks[t_idx].active_block_stems[pos] = new_stem;
-                    } else {
-                        self.tracks[t_idx].active_block_stems.push(new_stem);
-                    }
-                    self.tracks[t_idx].stem_dirty = false;
-                }
-                true
-            }
-            Err(e) => {
-                eprintln!("[jamseq] Failed to rebake single block {}_{}: {}", section_id, track_id, e);
-                false
-            }
-        }
-    }
-
-    /// Re-render an ad-hoc timeline block in 1-3ms and atomically swap into track.active_block_stems
-    pub fn rebake_single_timeline_block(&mut self, track_id: &str, block_id: &str) -> bool {
-        let block = match self.timeline.get_timeline_block(block_id).cloned() {
-            Some(b) => b,
+        let (block, abs_start_tick) = match maybe_resolved {
+            Some((b, tick)) => (b, tick),
             None => {
                 if let Some(&t_idx) = self.track_map.get(track_id) {
                     self.tracks[t_idx].active_block_stems.retain(|bs| bs.block_id != block_id);
@@ -2011,9 +1805,9 @@ impl JamSeqHost {
             }
         };
 
-        match self.render_timeline_block(&block) {
+        match self.render_block(track_id, &block) {
             Ok(buf) => {
-                let start_sample = self.timeline.ticks_to_samples(block.start_offset_ticks) as usize;
+                let start_sample = self.timeline.ticks_to_samples(abs_start_tick) as usize;
                 let end_sample = start_sample + buf.samples_left.len();
 
                 let new_stem = crate::track::BlockStem {
@@ -2030,100 +1824,59 @@ impl JamSeqHost {
                     } else {
                         self.tracks[t_idx].active_block_stems.push(new_stem);
                     }
-                    self.tracks[t_idx].stem_dirty = false;
                 }
                 true
             }
             Err(e) => {
-                eprintln!("[jamseq] Failed to rebake timeline block {}: {}", block_id, e);
+                eprintln!("[jamseq] Failed to rebake block {}: {}", block_id, e);
                 false
             }
         }
     }
 
-    /// Autogenerate discrete in-memory stems for all dirty tracks without whole-song stitching.
-    /// Each block is rendered independently with natural decay tail spillover into RAM.
-    /// Returns the number of stems generated.
-    pub fn generate_stems_for_dirty_tracks(&mut self) -> usize {
-        let dirty_ids: Vec<String> = self.tracks.iter()
-            .filter(|t| !t.is_frozen && (t.stem_dirty || !t.has_active_stems()))
-            .map(|t| t.id.clone())
+    /// Rebake all blocks for a given track (e.g. after parameter or preset changes)
+    pub fn rebake_blocks_for_track(&mut self, track_id: &str) -> usize {
+        let resolved: Vec<(crate::timeline::TrackBlock, u64)> = self.timeline
+            .get_resolved_blocks_for_track(track_id)
+            .into_iter()
+            .map(|(b, tick)| (b.clone(), tick))
             .collect();
 
-        if dirty_ids.is_empty() {
-            return 0;
-        }
+        let mut count = 0;
+        for (block, abs_start_tick) in resolved {
+            if let Ok(buf) = self.render_block(track_id, &block) {
+                let start_sample = self.timeline.ticks_to_samples(abs_start_tick) as usize;
+                let end_sample = start_sample + buf.samples_left.len();
 
-        let mut generated_count = 0;
+                let new_stem = crate::track::BlockStem {
+                    block_id: block.id.clone(),
+                    track_id: track_id.to_string(),
+                    start_sample,
+                    end_sample,
+                    buffer: buf,
+                };
 
-        for track_id in dirty_ids {
-            let has_section_blocks = self.timeline.sections.iter().any(|s| s.track_blocks.contains_key(&track_id));
-            let has_timeline_blocks = self.timeline.timeline_blocks.iter().any(|b| b.track_id == track_id);
-
-            if has_section_blocks || has_timeline_blocks {
-                let mut block_stems = Vec::new();
-
-                // 1. Render all section blocks for this track
-                let section_ids: Vec<String> = self.timeline.sections.iter().map(|s| s.id.clone()).collect();
-                for (sec_idx, sec_id) in section_ids.iter().enumerate() {
-                    let maybe_block = {
-                        let sec = self.timeline.sections.iter().find(|s| s.id == *sec_id).unwrap();
-                        sec.track_blocks.get(&track_id).cloned()
-                    };
-
-                    if let Some(block) = maybe_block {
-                        if let Ok(buf) = self.render_track_block(&track_id, sec_id) {
-                            let sec_start_tick = self.timeline.section_start_tick(sec_idx);
-                            let block_start_tick = sec_start_tick + block.start_offset_ticks;
-                            let start_sample = self.timeline.ticks_to_samples(block_start_tick) as usize;
-                            let end_sample = start_sample + buf.samples_left.len();
-
-                            block_stems.push(crate::track::BlockStem {
-                                block_id: block.id.clone(),
-                                track_id: track_id.clone(),
-                                start_sample,
-                                end_sample,
-                                buffer: buf,
-                            });
-                        }
+                if let Some(&t_idx) = self.track_map.get(track_id) {
+                    if let Some(pos) = self.tracks[t_idx].active_block_stems.iter().position(|bs| bs.block_id == block.id) {
+                        self.tracks[t_idx].active_block_stems[pos] = new_stem;
+                    } else {
+                        self.tracks[t_idx].active_block_stems.push(new_stem);
                     }
-                }
-
-                // 2. Render all continuous timeline blocks for this track
-                let timeline_blocks_cloned: Vec<crate::timeline::TrackBlock> = self.timeline.timeline_blocks.iter()
-                    .filter(|b| b.track_id == track_id)
-                    .cloned()
-                    .collect();
-                for tb in timeline_blocks_cloned {
-                    if let Ok(buf) = self.render_timeline_block(&tb) {
-                        let start_sample = self.timeline.ticks_to_samples(tb.start_offset_ticks) as usize;
-                        let end_sample = start_sample + buf.samples_left.len();
-
-                        block_stems.push(crate::track::BlockStem {
-                            block_id: tb.id.clone(),
-                            track_id: track_id.clone(),
-                            start_sample,
-                            end_sample,
-                            buffer: buf,
-                        });
-                    }
-                }
-
-                if let Some(&idx) = self.track_map.get(&track_id) {
-                    self.tracks[idx].active_block_stems = block_stems;
-                    self.tracks[idx].stem_dirty = false;
-                    generated_count += 1;
-                    continue;
+                    count += 1;
                 }
             }
-
-            if let Some(&idx) = self.track_map.get(&track_id) {
-                self.tracks[idx].active_block_stems.clear();
-                self.tracks[idx].stem_dirty = false;
-            }
         }
+        count
+    }
 
-        generated_count
+    /// Rebake all blocks in the arrangement
+    pub fn rebake_all_blocks(&mut self) -> usize {
+        let track_ids: Vec<String> = self.tracks.iter().map(|t| t.id.clone()).collect();
+        let mut total = 0;
+        for tid in track_ids {
+            total += self.rebake_blocks_for_track(&tid);
+        }
+        total
     }
 
     /// Freeze a track by rendering it offline to audio and replacing instrument/inserts with a zero-CPU audio clip player

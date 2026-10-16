@@ -145,7 +145,6 @@ pub struct Track {
     pub is_frozen: bool,
     pub active_block_stems: Vec<BlockStem>,
     pub arranger_mode: crate::timeline::TrackArrangerMode,
-    pub stem_dirty: bool,
     pub volume: f32, // Gain multiplier (0.0 to 2.0)
     pub pan: f32,    // -1.0 (hard left) to 1.0 (hard right)
     pub current_plugin: Option<String>,
@@ -171,7 +170,6 @@ impl Track {
             is_frozen: false,
             active_block_stems: Vec::new(),
             arranger_mode: crate::timeline::TrackArrangerMode::Section,
-            stem_dirty: true,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some("JamSynth (Built-in)".to_string()),
@@ -193,7 +191,6 @@ impl Track {
             is_frozen: false,
             active_block_stems: Vec::new(),
             arranger_mode: crate::timeline::TrackArrangerMode::Section,
-            stem_dirty: true,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some(plugin_name.to_string()),
@@ -215,7 +212,6 @@ impl Track {
             is_frozen: false,
             active_block_stems: Vec::new(),
             arranger_mode: crate::timeline::TrackArrangerMode::Section,
-            stem_dirty: true,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some(plugin_name.to_string()),
@@ -237,7 +233,6 @@ impl Track {
             is_frozen: false,
             active_block_stems: Vec::new(),
             arranger_mode: crate::timeline::TrackArrangerMode::Section,
-            stem_dirty: true,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some("Sampler".to_string()),
@@ -259,7 +254,6 @@ impl Track {
             is_frozen: false,
             active_block_stems: Vec::new(),
             arranger_mode: crate::timeline::TrackArrangerMode::Timeline,
-            stem_dirty: false,
             volume: 1.0,
             pan: 0.0,
             current_plugin: None,
@@ -281,7 +275,6 @@ impl Track {
             is_frozen: false,
             active_block_stems: Vec::new(),
             arranger_mode: crate::timeline::TrackArrangerMode::Section,
-            stem_dirty: true,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some(plugin_name.to_string()),
@@ -322,11 +315,6 @@ impl Track {
 
     pub fn remove_sidechain(&mut self, target_track_id: &str, target_insert_index: usize) {
         self.sidechains.retain(|s| !(s.target_track_id == target_track_id && s.target_insert_index == target_insert_index));
-    }
-
-    pub fn mark_stem_dirty(&mut self) {
-        self.active_block_stems.clear();
-        self.stem_dirty = true;
     }
 
     pub fn set_sample_rate(&mut self, rate: f32) {
@@ -409,7 +397,6 @@ impl Track {
 
     /// Set a named DSP / engine parameter live
     pub fn set_parameter(&mut self, param_name: &str, value: f32) {
-        self.mark_stem_dirty();
         match &mut self.instrument {
             TrackInstrument::Synth(synth) => {
                 match param_name {
@@ -576,7 +563,6 @@ impl Track {
 
     /// Load a synth patch from a JSON preset file into this track
     pub fn load_patch_from_file(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
-        self.mark_stem_dirty();
         let content = std::fs::read_to_string(path)?;
         match &mut self.instrument {
             TrackInstrument::Clap(clap) => {
