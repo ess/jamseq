@@ -259,15 +259,28 @@ pub enum IpcCommand {
     UpdateSection {
         section: SongSection,
     },
-    /// Add or update a TrackBlock in a section
-    SetTrackBlock {
-        section_id: String,
+    /// Create and allocate a new TrackBlock (in a section or on the timeline)
+    AddBlock {
+        track_id: String,
+        #[serde(default)]
+        block_id: Option<String>,
+        #[serde(default)]
+        section_id: Option<String>,
+        #[serde(default)]
+        start_tick: Option<u64>,
+        #[serde(default)]
+        length_ticks: Option<u64>,
+    },
+    /// Update an existing TrackBlock in place
+    UpdateBlock {
         block: TrackBlock,
     },
-    /// Remove a TrackBlock from a section
-    RemoveTrackBlock {
-        section_id: String,
+    /// Remove a TrackBlock (from a section or the timeline)
+    RemoveBlock {
         track_id: String,
+        block_id: String,
+        #[serde(default)]
+        section_id: Option<String>,
     },
     /// Set a section's tempo override
     SetSectionTempo {
@@ -295,14 +308,6 @@ pub enum IpcCommand {
         section_id: String,
         track_id: String,
         time_signature: Option<TimeSignature>,
-    },
-    /// Set an ad-hoc timeline block
-    SetTimelineBlock {
-        block: TrackBlock,
-    },
-    /// Remove an ad-hoc timeline block
-    RemoveTimelineBlock {
-        block_id: String,
     },
     /// Set a track's arranger mode (Section vs Timeline)
     SetTrackArrangerMode {
@@ -821,12 +826,16 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
             let _ = h.update_section(section);
             build_status_response(&h)
         }
-        IpcCommand::SetTrackBlock { section_id, block } => {
-            let _ = h.set_track_block(&section_id, block);
+        IpcCommand::AddBlock { track_id, block_id, section_id, start_tick, length_ticks } => {
+            let _ = h.add_block(&track_id, block_id.as_deref(), section_id.as_deref(), start_tick, length_ticks);
             build_status_response(&h)
         }
-        IpcCommand::RemoveTrackBlock { section_id, track_id } => {
-            let _ = h.remove_track_block(&section_id, &track_id);
+        IpcCommand::UpdateBlock { block } => {
+            let _ = h.update_block(block);
+            build_status_response(&h)
+        }
+        IpcCommand::RemoveBlock { track_id, block_id, section_id } => {
+            let _ = h.remove_block(&track_id, &block_id, section_id.as_deref());
             build_status_response(&h)
         }
         IpcCommand::SetSectionTempo { section_id, tempo } => {
@@ -847,14 +856,6 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
         }
         IpcCommand::SetBlockTimeSignature { section_id, track_id, time_signature } => {
             let _ = h.set_block_time_signature(&section_id, &track_id, time_signature);
-            build_status_response(&h)
-        }
-        IpcCommand::SetTimelineBlock { block } => {
-            let _ = h.set_timeline_block(block);
-            build_status_response(&h)
-        }
-        IpcCommand::RemoveTimelineBlock { block_id } => {
-            let _ = h.remove_timeline_block(&block_id);
             build_status_response(&h)
         }
         IpcCommand::SetTrackArrangerMode { track_id, mode } => {

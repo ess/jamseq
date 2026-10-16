@@ -273,7 +273,130 @@ impl JamSeqHost {
         res
     }
 
-    pub fn set_track_block(&mut self, section_id: &str, block: crate::timeline::TrackBlock) -> bool {
+    pub fn add_block(
+        &mut self,
+        track_id: &str,
+        suggested_block_id: Option<&str>,
+        section_id: Option<&str>,
+        start_tick: Option<u64>,
+        length_ticks: Option<u64>,
+    ) -> Option<crate::timeline::TrackBlock> {
+        let (block, block_id) = if let Some(sec_id) = section_id {
+            let sec_len = self.timeline.sections.iter()
+                .find(|s| s.id == sec_id)
+                .map(|s| s.length_ticks)
+                .unwrap_or(3840);
+            let len = length_ticks.unwrap_or(sec_len);
+            let block_id = suggested_block_id
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("{}_{}", sec_id, track_id));
+            let mut block = crate::timeline::TrackBlock::new(&block_id, track_id, len);
+            block.section_id = Some(sec_id.to_string());
+            if let Some(sec) = self.timeline.sections.iter_mut().find(|s| s.id == sec_id) {
+                sec.track_blocks.insert(track_id.to_string(), block.clone());
+            } else {
+                return None;
+            }
+            (block, block_id)
+        } else {
+            let start = start_tick.unwrap_or(0);
+            let len = length_ticks.unwrap_or(3840);
+            let block_id = suggested_block_id
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    format!("{}_clip_{}_{}", track_id, start, now % 100000)
+                });
+            let block = crate::timeline::TrackBlock::new_timeline(&block_id, track_id, start, len);
+            self.timeline.timeline_blocks.push(block.clone());
+            (block, block_id)
+        };
+
+        self.timeline.rebuild_active_events();
+        self.rebake_block(track_id, &block_id);
+        Some(block)
+    }
+
+    pub fn update_block(&mut self, mut block: crate::timeline::TrackBlock) -> bool {
+        let track_id = block.track_id.clone();
+        let block_id = block.id.clone();
+
+        let mut updated = false;
+        if let Some(sec_id) = &block.section_id {
+            if let Some(sec) = self.timeline.sections.iter_mut().find(|s| &s.id == sec_id) {
+                sec.track_blocks.insert(track_id.clone(), block.clone());
+                updated = true;
+            }
+        }
+
+        if !updated {
+            // Check if it's in timeline_blocks
+            if let Some(pos) = self.timeline.timeline_blocks.iter().position(|b| b.id == block_id && b.track_id == track_id) {
+                block.section_id = None;
+                self.timeline.timeline_blocks[pos] = block.clone();
+                updated = true;
+            }
+        }
+
+        if !updated {
+            // Fallback: search sections by block_id
+            for sec in &mut self.timeline.sections {
+                if let Some(b) = sec.track_blocks.get_mut(&track_id) {
+                    if b.id == block_id {
+                        block.section_id = Some(sec.id.clone());
+                        *b = block.clone();
+                        updated = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if updated {
+            self.timeline.rebuild_active_events();
+            self.rebake_block(&track_id, &block_id);
+        }
+        updated
+    }
+
+    pub fn remove_block(&mut self, track_id: &str, block_id: &str, section_id: Option<&str>) -> bool {
+        let mut removed = false;
+        if let Some(sec_id) = section_id {
+            if let Some(sec) = self.timeline.sections.iter_mut().find(|s| s.id == sec_id) {
+                removed = sec.track_blocks.remove(track_id).is_some();
+            }
+        } else {
+            let orig_len = self.timeline.timeline_blocks.len();
+            self.timeline.timeline_blocks.retain(|b| !(b.id == block_id && b.track_id == track_id));
+            removed = self.timeline.timeline_blocks.len() < orig_len;
+            if !removed {
+                // Also check sections if section_id was not explicitly provided
+                for sec in &mut self.timeline.sections {
+                    if let Some(b) = sec.track_blocks.get(track_id) {
+                        if b.id == block_id {
+                            sec.track_blocks.remove(track_id);
+                            removed = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if removed {
+            if let Some(&idx) = self.track_map.get(track_id) {
+                self.tracks[idx].active_block_stems.retain(|bs| bs.block_id != block_id);
+            }
+            self.timeline.rebuild_active_events();
+        }
+        removed
+    }
+
+    pub fn set_track_block(&mut self, section_id: &str, mut block: crate::timeline::TrackBlock) -> bool {
+        block.section_id = Some(section_id.to_string());
         let track_id = block.track_id.clone();
         let block_id = block.id.clone();
         let res = self.timeline.set_track_block(section_id, block);
@@ -286,19 +409,13 @@ impl JamSeqHost {
     pub fn remove_track_block(&mut self, section_id: &str, track_id: &str) -> bool {
         let maybe_block_id = self.timeline.sections.iter()
             .find(|s| s.id == section_id)
-            .and_then(|s| s.track_blocks.get(track_id).map(|b| b.id.clone()));
-        let res = self.timeline.remove_track_block(section_id, track_id);
-        if res {
-            if let Some(block_id) = maybe_block_id {
-                if let Some(&idx) = self.track_map.get(track_id) {
-                    self.tracks[idx].active_block_stems.retain(|bs| bs.block_id != block_id);
-                }
-            }
-        }
-        res
+            .and_then(|s| s.track_blocks.get(track_id).map(|b| b.id.clone()))
+            .unwrap_or_default();
+        self.remove_block(track_id, &maybe_block_id, Some(section_id))
     }
 
-    pub fn set_timeline_block(&mut self, block: crate::timeline::TrackBlock) -> bool {
+    pub fn set_timeline_block(&mut self, mut block: crate::timeline::TrackBlock) -> bool {
+        block.section_id = None;
         let track_id = block.track_id.clone();
         let block_id = block.id.clone();
         let res = self.timeline.set_timeline_block(block);
@@ -309,16 +426,8 @@ impl JamSeqHost {
     }
 
     pub fn remove_timeline_block(&mut self, block_id: &str) -> bool {
-        let maybe_track_id = self.timeline.get_timeline_block(block_id).map(|b| b.track_id.clone());
-        let res = self.timeline.remove_timeline_block(block_id);
-        if res {
-            if let Some(track_id) = maybe_track_id {
-                if let Some(&idx) = self.track_map.get(&track_id) {
-                    self.tracks[idx].active_block_stems.retain(|bs| bs.block_id != block_id);
-                }
-            }
-        }
-        res
+        let maybe_track_id = self.timeline.get_timeline_block(block_id).map(|b| b.track_id.clone()).unwrap_or_default();
+        self.remove_block(&maybe_track_id, block_id, None)
     }
 
     pub fn set_track_arranger_mode(&mut self, track_id: &str, mode: crate::timeline::TrackArrangerMode) -> bool {

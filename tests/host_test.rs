@@ -3,7 +3,7 @@ use jamsynth::patch::JamSynthPatch;
 use jamsynth::JamSynthEngine;
 use jamseq::engine::JamSeqHost;
 use jamseq::sampler::{SamplerConfig, SamplerInstrument};
-use jamseq::timeline::{ScheduledAction, ScheduledEvent, TimelineArrangement, TrackBlock, TICKS_PER_16TH};
+use jamseq::timeline::{ScheduledAction, ScheduledEvent, SongSection, TimelineArrangement, TrackBlock, TICKS_PER_16TH};
 use jamseq::track::Track;
 use std::fs;
 use std::path::Path;
@@ -2196,5 +2196,37 @@ fn test_section_matrix_and_ad_hoc_timeline_tracks_dual_topology() {
     assert_eq!(host.tracks[drum_idx].active_block_stems.len(), 2);
 }
 
+#[test]
+fn test_block_crud_lifecycle_and_ipc() {
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    host.add_track(Track::new_synth("track_1", "Synth", JamSynthEngine::new(48000.0)));
+    host.timeline.add_section(SongSection::new("sec_1", "Intro", 0, 3840));
 
+    // 1. AddBlock in section
+    let block = host.add_block("track_1", Some("blk_sec_1"), Some("sec_1"), None, Some(3840))
+        .expect("Failed to add block in section");
+    assert_eq!(block.id, "blk_sec_1");
+    assert_eq!(block.section_id, Some("sec_1".to_string()));
+    assert_eq!(host.tracks[0].active_block_stems.len(), 1);
 
+    // 2. AddBlock on timeline
+    let tl_block = host.add_block("track_1", Some("blk_tl_1"), None, Some(3840), Some(3840))
+        .expect("Failed to add timeline block");
+    assert_eq!(tl_block.id, "blk_tl_1");
+    assert_eq!(tl_block.section_id, None);
+    assert_eq!(host.tracks[0].active_block_stems.len(), 2);
+
+    // 3. UpdateBlock (note edit)
+    let mut updated = block.clone();
+    updated.add_note(101, 102, 0, 480, 60, 0.8);
+    assert!(host.update_block(updated));
+    assert_eq!(host.tracks[0].active_block_stems.len(), 2);
+
+    // 4. RemoveBlock from section
+    assert!(host.remove_block("track_1", "blk_sec_1", Some("sec_1")));
+    assert_eq!(host.tracks[0].active_block_stems.len(), 1);
+
+    // 5. RemoveBlock from timeline
+    assert!(host.remove_block("track_1", "blk_tl_1", None));
+    assert_eq!(host.tracks[0].active_block_stems.len(), 0);
+}

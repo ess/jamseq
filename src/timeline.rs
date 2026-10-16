@@ -95,6 +95,8 @@ pub struct TrackBlock {
     pub id: String,
     pub track_id: String,
     #[serde(default)]
+    pub section_id: Option<String>,
+    #[serde(default)]
     pub start_offset_ticks: u64,
     #[serde(default)]
     pub base_length_ticks: u64,
@@ -115,6 +117,22 @@ impl TrackBlock {
         Self {
             id: id.to_string(),
             track_id: track_id.to_string(),
+            section_id: None,
+            start_offset_ticks: 0,
+            base_length_ticks: length_ticks,
+            loop_mode: LoopMode::OneShot,
+            tempo: None,
+            time_signature: None,
+            events: Vec::new(),
+            audio_file: None,
+        }
+    }
+
+    pub fn new_section(id: &str, track_id: &str, section_id: &str, length_ticks: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            track_id: track_id.to_string(),
+            section_id: Some(section_id.to_string()),
             start_offset_ticks: 0,
             base_length_ticks: length_ticks,
             loop_mode: LoopMode::OneShot,
@@ -129,6 +147,7 @@ impl TrackBlock {
         Self {
             id: id.to_string(),
             track_id: track_id.to_string(),
+            section_id: None,
             start_offset_ticks: start_tick,
             base_length_ticks: length_ticks,
             loop_mode: LoopMode::OneShot,
@@ -761,7 +780,15 @@ impl Timeline {
         self.bpm = arrangement.bpm;
         self.time_signature = arrangement.time_signature;
         self.sections = arrangement.sections;
+        for sec in &mut self.sections {
+            for b in sec.track_blocks.values_mut() {
+                b.section_id = Some(sec.id.clone());
+            }
+        }
         self.timeline_blocks = arrangement.timeline_blocks;
+        for b in &mut self.timeline_blocks {
+            b.section_id = None;
+        }
         let computed = self.computed_total_ticks();
         self.total_ticks = if computed > 0 {
             computed
@@ -1068,8 +1095,9 @@ impl Timeline {
     }
 
     /// Add or update a TrackBlock in a section
-    pub fn set_track_block(&mut self, section_id: &str, block: TrackBlock) -> bool {
+    pub fn set_track_block(&mut self, section_id: &str, mut block: TrackBlock) -> bool {
         if let Some(sec) = self.sections.iter_mut().find(|s| s.id == section_id) {
+            block.section_id = Some(section_id.to_string());
             sec.track_blocks.insert(block.track_id.clone(), block);
             self.rebuild_active_events();
             true
