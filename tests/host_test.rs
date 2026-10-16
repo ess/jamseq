@@ -94,6 +94,7 @@ fn test_offline_render_to_wav() {
         master_bus: None,
         aux_buses: Vec::new(),
         sections: vec![jamseq::SongSection::new("test_verse", "Test Verse", 1, 1)],
+        timeline_blocks: Vec::new(),
         events,
     };
 
@@ -741,13 +742,13 @@ fn test_autostem_mid_event_pause_and_unpause() {
     // Initial state: track is dirty
     let pad_idx = *host.track_map.get("pad_long").unwrap();
     assert!(host.tracks[pad_idx].stem_dirty);
-    assert!(host.tracks[pad_idx].cached_stem.is_none());
+    assert!(host.tracks[pad_idx].active_block_stems.is_empty());
 
     // 1. Bake stems
     let count = host.generate_stems_for_dirty_tracks();
     assert_eq!(count, 1, "Should generate exactly 1 dirty stem");
     assert!(!host.tracks[pad_idx].stem_dirty);
-    assert!(host.tracks[pad_idx].cached_stem.is_some(), "Stem clip must be attached to track");
+    assert!(!host.tracks[pad_idx].active_block_stems.is_empty(), "Discrete block stem must be attached to track");
 
     // 2. Play from tick 0 to halfway through the note (tick 960)
     host.timeline.seek_tick(0);
@@ -777,12 +778,12 @@ fn test_autostem_mid_event_pause_and_unpause() {
     // 5. Test dirty invalidation on parameter change
     host.mark_track_dirty("pad_long");
     assert!(host.tracks[pad_idx].stem_dirty);
-    assert!(host.tracks[pad_idx].cached_stem.is_none(), "Editing must invalidate cached stem for live editing");
+    assert!(host.tracks[pad_idx].active_block_stems.is_empty(), "Editing must invalidate cached stem for live editing");
 
     // 6. Test pause automatically regenerates dirty stems
     host.pause();
     assert!(!host.tracks[pad_idx].stem_dirty);
-    assert!(host.tracks[pad_idx].cached_stem.is_some(), "Pause must auto-bake dirty stems");
+    assert!(!host.tracks[pad_idx].active_block_stems.is_empty(), "Pause must auto-bake dirty stems");
 }
 
 #[test]
@@ -846,18 +847,19 @@ fn test_debug_playback_demo() {
         master_bus: None,
         aux_buses: Vec::new(),
         sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4)],
+        timeline_blocks: Vec::new(),
         events,
     };
     host.load_arrangement(arr);
 
     for (i, t) in host.tracks.iter().enumerate() {
-        if let Some(ref stem) = t.cached_stem {
-            if let Some(ref buf) = stem.buffer {
-                let max_l: f32 = buf.samples_left.iter().map(|s| s.abs()).fold(0.0, f32::max);
-                println!("Track {} ({}) stem len={}, max_l={}", i, t.id, buf.samples_left.len(), max_l);
+        if !t.active_block_stems.is_empty() {
+            for bs in &t.active_block_stems {
+                let max_l: f32 = bs.buffer.samples_left.iter().map(|s| s.abs()).fold(0.0, f32::max);
+                println!("Track {} ({}) block stem {} len={}, max_l={}", i, t.id, bs.block_id, bs.buffer.samples_left.len(), max_l);
             }
         } else {
-            println!("Track {} ({}) has NO cached stem", i, t.id);
+            println!("Track {} ({}) has NO cached stems", i, t.id);
         }
     }
 
@@ -918,6 +920,7 @@ fn test_server_playback_over_ipc() {
         master_bus: None,
         aux_buses: Vec::new(),
         sections: vec![jamseq::SongSection::new("verse", "Verse", 1, 4)],
+        timeline_blocks: Vec::new(),
         events,
     };
     host.load_arrangement(arr);
@@ -1414,12 +1417,15 @@ fn test_stem_cache_manager_and_granular_block_stems() {
 
     let track_idx = *host.track_map.get("sub808").unwrap();
     assert!(!host.tracks[track_idx].stem_dirty, "Track stem must no longer be dirty");
-    assert!(host.tracks[track_idx].cached_stem.is_some(), "Track must have stitched cached stem");
+    assert_eq!(host.tracks[track_idx].active_block_stems.len(), 2, "Track must have discrete active block stems for both sections");
+    assert_eq!(host.tracks[track_idx].active_block_stems[0].block_id, "tb_intro");
+    assert_eq!(host.tracks[track_idx].active_block_stems[1].block_id, "tb_verse");
 
-    // Stitched stem length should span both sections (Intro 3840 + Verse 3840 = 7680 ticks)
-    let expected_samples = host.timeline.ticks_to_samples(7680) as usize;
-    let actual_samples = host.tracks[track_idx].cached_stem.as_ref().unwrap().buffer.as_ref().unwrap().samples_left.len();
-    assert_eq!(actual_samples, expected_samples, "Stitched stem length must match total arrangement ticks");
+    // Each block stem starts at its respective section start sample
+    let sec_intro_start = host.timeline.ticks_to_samples(0) as usize;
+    let sec_verse_start = host.timeline.ticks_to_samples(3840) as usize;
+    assert_eq!(host.tracks[track_idx].active_block_stems[0].start_sample, sec_intro_start);
+    assert_eq!(host.tracks[track_idx].active_block_stems[1].start_sample, sec_verse_start);
 
     // Calling again without modifications generates 0 stems
     let generated_again = host.generate_stems_for_dirty_tracks();
@@ -1900,6 +1906,7 @@ fn test_load_arrangement_restores_lv2_and_auto_healing() {
         id: "drums".to_string(),
         name: "Drums".to_string(),
         track_type: avl_uri.to_string(),
+        arranger_mode: jamseq::timeline::TrackArrangerMode::Section,
         volume: 1.0,
         pan: 0.0,
         muted: false,
@@ -1943,6 +1950,7 @@ fn test_load_arrangement_restores_lv2_and_auto_healing() {
         id: "drums_healed".to_string(),
         name: "Drums".to_string(),
         track_type: "/path/to/target/release/libjamsynth.so".to_string(),
+        arranger_mode: jamseq::timeline::TrackArrangerMode::Section,
         volume: 1.0,
         pan: 0.0,
         muted: false,
@@ -2137,6 +2145,83 @@ fn test_track_block_single_source_of_truth_and_save_reload() {
     assert_eq!(reloaded_pitches, vec![67], "Reloaded project must not resurrect deleted notes");
 
     let _ = std::fs::remove_file(save_path);
+}
+
+#[test]
+fn test_section_matrix_and_ad_hoc_timeline_tracks_dual_topology() {
+    use jamseq::timeline::{SongSection, TrackArrangerMode, TrackBlock};
+    use jamseq::track::Track;
+    use jamsynth::JamSynthEngine;
+
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    let synth1 = JamSynthEngine::new(48000.0);
+    let synth2 = JamSynthEngine::new(48000.0);
+
+    host.add_track(Track::new_synth("drums", "Section Drums", synth1));
+    host.add_track(Track::new_synth("lead_vocal", "Timeline Vocal", synth2));
+
+    // Configure track arranger modes
+    host.tracks[0].arranger_mode = TrackArrangerMode::Section;
+    host.tracks[1].arranger_mode = TrackArrangerMode::Timeline;
+
+    // 1. Section 1 (Verse): Bar 1 (0..3840 ticks)
+    let mut sec_verse = SongSection::new_empty("sec_verse", "Verse");
+    let mut b_verse = TrackBlock::new("tb_drums_verse", "drums", 3840);
+    b_verse.add_note(1, 2, 0, 480, 36, 1.0);
+    sec_verse.set_block(b_verse);
+    host.add_section(sec_verse);
+
+    // Section 2 (Chorus): Bar 2 (3840..7680 ticks)
+    let mut sec_chorus = SongSection::new_empty("sec_chorus", "Chorus");
+    let mut b_chorus = TrackBlock::new("tb_drums_chorus", "drums", 3840);
+    b_chorus.add_note(3, 4, 0, 480, 38, 1.0);
+    sec_chorus.set_block(b_chorus);
+    host.add_section(sec_chorus);
+
+    // 2. Continuous timeline block spanning across section boundaries:
+    // Starts midway through Verse (tick 1920) and ends midway through Chorus (tick 5760).
+    let mut vocal_block = TrackBlock::new_timeline("vocal_take_1", "lead_vocal", 1920, 3840);
+    vocal_block.add_note(10, 11, 0, 1920, 60, 0.9); // Note spans across the boundary!
+    host.set_timeline_block(vocal_block);
+
+    // 3. Verify get_resolved_blocks_for_track returns both topologies accurately
+    let drum_resolved = host.timeline.get_resolved_blocks_for_track("drums");
+    assert_eq!(drum_resolved.len(), 2);
+    assert_eq!(drum_resolved[0].0.id, "tb_drums_verse");
+    assert_eq!(drum_resolved[0].1, 0); // Verse starts at tick 0
+    assert_eq!(drum_resolved[1].0.id, "tb_drums_chorus");
+    assert_eq!(drum_resolved[1].1, 3840); // Chorus starts at tick 3840
+
+    let vocal_resolved = host.timeline.get_resolved_blocks_for_track("lead_vocal");
+    assert_eq!(vocal_resolved.len(), 1);
+    assert_eq!(vocal_resolved[0].0.id, "vocal_take_1");
+    assert_eq!(vocal_resolved[0].1, 1920); // Absolute timeline start tick
+
+    // 4. Verify set_timeline_block immediately rebaked the vocal stem in real-time
+    let vocal_idx = *host.track_map.get("lead_vocal").unwrap();
+    assert_eq!(host.tracks[vocal_idx].active_block_stems.len(), 1, "set_timeline_block must immediately rebake vocal stem in RAM");
+
+    // Generate discrete stems for remaining dirty tracks (drums)
+    let generated = host.generate_stems_for_dirty_tracks();
+    assert_eq!(generated, 1, "Drums must have stems generated");
+
+    let drum_idx = *host.track_map.get("drums").unwrap();
+
+    assert_eq!(host.tracks[drum_idx].active_block_stems.len(), 2);
+    assert_eq!(host.tracks[vocal_idx].active_block_stems.len(), 1);
+
+    // Vocal stem starts at tick 1920 sample position
+    let expected_vocal_sample = host.timeline.ticks_to_samples(1920) as usize;
+    assert_eq!(host.tracks[vocal_idx].active_block_stems[0].start_sample, expected_vocal_sample);
+
+    // 5. Test real-time single block re-baking over IPC
+    let mut updated_vocal = TrackBlock::new_timeline("vocal_take_1", "lead_vocal", 1920, 3840);
+    updated_vocal.add_note(20, 21, 0, 960, 67, 0.95);
+    assert!(host.set_timeline_block(updated_vocal));
+
+    // Verify the single stem was updated atomically in active_block_stems without disturbing drums
+    assert_eq!(host.tracks[vocal_idx].active_block_stems.len(), 1);
+    assert_eq!(host.tracks[drum_idx].active_block_stems.len(), 2);
 }
 
 

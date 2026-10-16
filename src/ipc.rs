@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::timeline::{ScheduledEvent, SongSection, TempoOverride, TimeSignature, TrackBlock};
+use crate::timeline::{ScheduledEvent, SongSection, TempoOverride, TimeSignature, TrackArrangerMode, TrackBlock};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", content = "args")]
@@ -300,6 +300,19 @@ pub enum IpcCommand {
         track_id: String,
         time_signature: Option<TimeSignature>,
     },
+    /// Set an ad-hoc timeline block
+    SetTimelineBlock {
+        block: TrackBlock,
+    },
+    /// Remove an ad-hoc timeline block
+    RemoveTimelineBlock {
+        block_id: String,
+    },
+    /// Set a track's arranger mode (Section vs Timeline)
+    SetTrackArrangerMode {
+        track_id: String,
+        mode: TrackArrangerMode,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,7 +396,7 @@ pub struct TrackStatus {
     pub muted: bool,
     pub solo: bool,
     pub is_frozen: bool,
-    pub has_cached_stem: bool,
+    pub has_active_stems: bool,
     pub stem_dirty: bool,
     pub peak_level: f32,
     pub params: Vec<TrackParamStatus>,
@@ -395,6 +408,8 @@ pub struct TrackStatus {
     pub current_bpm: f64,
     #[serde(default)]
     pub current_time_signature: TimeSignature,
+    #[serde(default)]
+    pub arranger_mode: TrackArrangerMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,6 +433,8 @@ pub struct IpcStatusResponse {
     pub mic_peak: f32,
     pub active_section_id: Option<String>,
     pub sections: Vec<SongSection>,
+    #[serde(default)]
+    pub timeline_blocks: Vec<TrackBlock>,
     pub tracks: Vec<TrackStatus>,
     pub events: Vec<ScheduledEvent>,
     pub available_plugins: Vec<crate::plugin_scanner::DiscoveredPlugin>,
@@ -811,21 +828,9 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
         }
         IpcCommand::RegenerateStems { track_id } => {
             if let Some(id) = track_id {
-                let num_bars = ((h.timeline.total_ticks / (4 * crate::timeline::PPQ)) as u32).max(1);
-                if let Ok(buf) = h.render_track_to_buffer(&id, num_bars) {
-                    if let Some(&idx) = h.track_map.get(&id) {
-                        let clip = crate::audio_clip::AudioClip::from_buffer(
-                            std::path::PathBuf::from(format!("autostem_{}.wav", id)),
-                            0,
-                            buf,
-                        );
-                        h.tracks[idx].cached_stem = Some(clip);
-                        h.tracks[idx].stem_dirty = false;
-                    }
-                }
-            } else {
-                h.generate_stems_for_dirty_tracks();
+                h.mark_track_dirty(&id);
             }
+            h.generate_stems_for_dirty_tracks();
             build_status_response(&h)
         }
         IpcCommand::RescanPlugins => {
@@ -871,6 +876,18 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
         }
         IpcCommand::SetBlockTimeSignature { section_id, track_id, time_signature } => {
             let _ = h.set_block_time_signature(&section_id, &track_id, time_signature);
+            build_status_response(&h)
+        }
+        IpcCommand::SetTimelineBlock { block } => {
+            let _ = h.set_timeline_block(block);
+            build_status_response(&h)
+        }
+        IpcCommand::RemoveTimelineBlock { block_id } => {
+            let _ = h.remove_timeline_block(&block_id);
+            build_status_response(&h)
+        }
+        IpcCommand::SetTrackArrangerMode { track_id, mode } => {
+            let _ = h.set_track_arranger_mode(&track_id, mode);
             build_status_response(&h)
         }
         IpcCommand::GetStatus => build_status_response(&h),
@@ -925,7 +942,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 muted: t.muted,
                 solo: t.solo,
                 is_frozen: t.is_frozen,
-                has_cached_stem: t.cached_stem.is_some(),
+                has_active_stems: t.has_active_stems(),
                 stem_dirty: t.stem_dirty,
                 peak_level: t.peak_level,
                 params,
@@ -935,6 +952,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 current_plugin: t.current_plugin.clone(),
                 current_bpm: t.current_bpm,
                 current_time_signature: cur_ts,
+                arranger_mode: t.arranger_mode,
             }
         })
         .collect();
@@ -997,6 +1015,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
         mic_peak: h.recorder.get_peak_input(),
         active_section_id: active_section,
         sections: h.timeline.sections.clone(),
+        timeline_blocks: h.timeline.timeline_blocks.clone(),
         tracks: track_statuses,
         events: h.timeline.events.clone(),
         available_plugins: h.available_plugins.clone(),

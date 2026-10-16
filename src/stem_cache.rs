@@ -61,6 +61,34 @@ impl StemCacheManager {
         format!("{}_{}_{:016x}", section_id, track_id, hasher.finish())
     }
 
+    /// Computes a deterministic content-addressed hash key for an ad-hoc timeline block.
+    pub fn compute_timeline_block_key(
+        &self,
+        track_id: &str,
+        block: &TrackBlock,
+        dsp_patch: Option<&str>,
+        effective_bpm: f64,
+    ) -> String {
+        let mut hasher = DefaultHasher::new();
+        track_id.hash(&mut hasher);
+        "timeline".hash(&mut hasher);
+        block.id.hash(&mut hasher);
+        block.start_offset_ticks.hash(&mut hasher);
+        block.base_length_ticks.hash(&mut hasher);
+        if let Ok(events_json) = serde_json::to_string(&block.events) {
+            events_json.hash(&mut hasher);
+        }
+        if let Some(ref audio) = block.audio_file {
+            audio.hash(&mut hasher);
+        }
+        if let Some(patch) = dsp_patch {
+            patch.hash(&mut hasher);
+        }
+        effective_bpm.to_bits().hash(&mut hasher);
+
+        format!("timeline_{}_{}_{:016x}", track_id, block.id, hasher.finish())
+    }
+
     /// Check if a cached chunk exists in memory
     pub fn get_cached_chunk(&self, cache_key: &str) -> Option<&SampleBuffer> {
         self.cached_chunks.get(cache_key)
