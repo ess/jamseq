@@ -1,11 +1,13 @@
 pub mod audio;
 pub mod audio_clip;
+pub mod block_renderer;
 pub mod clap_host;
 pub mod engine;
 pub mod ipc;
 pub mod lv2_host;
 pub mod midi_input;
 pub mod plugin_scanner;
+pub mod project;
 pub mod recorder;
 pub mod sampler;
 pub mod stem_cache;

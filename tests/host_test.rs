@@ -1404,7 +1404,12 @@ fn test_stem_cache_manager_and_granular_block_stems() {
     assert_eq!(host.tracks[track_idx].active_block_stems[1].start_sample, sec_verse_start);
 
     // Verify individual block rendering
-    let chunk_intro = host.render_block("sub808", &b_intro).expect("Must render intro block");
+    let chunk_intro = jamseq::block_renderer::render_block(
+        &mut host.tracks[track_idx],
+        &b_intro,
+        host.timeline.bpm,
+        host.sample_rate,
+    ).expect("Must render intro block");
     assert!(!chunk_intro.samples_left.is_empty(), "Rendered intro block chunk must not be empty");
 }
 
