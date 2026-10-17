@@ -3,7 +3,10 @@ use jamsynth::patch::JamSynthPatch;
 use jamsynth::JamSynthEngine;
 use jamseq::engine::JamSeqHost;
 use jamseq::sampler::{SamplerConfig, SamplerInstrument};
-use jamseq::timeline::{ScheduledAction, ScheduledEvent, SongSection, TimelineArrangement, TrackBlock, TICKS_PER_16TH};
+use jamseq::timeline::{
+    ScheduledAction, ScheduledEvent, SongSection, TimeSignature, TimelineArrangement,
+    TrackArrangerMode, TrackBlock, TICKS_PER_16TH,
+};
 use jamseq::track::Track;
 use std::fs;
 use std::path::Path;
@@ -2605,4 +2608,353 @@ fn test_set_clip_offset_slip_editing() {
     let ipc_updated = guard.timeline.get_timeline_block("blk_slip").unwrap();
     assert_eq!(ipc_updated.start_offset_ticks, 960);
     assert_eq!(ipc_updated.length_ticks, 2880); // 3840 - 960 = 2880
+}
+
+fn create_test_smf_file(path: &Path, ppq: u16, bpm: f64, time_sig: (u8, u8)) {
+    use midly::num::{u15, u24, u28, u4, u7};
+    use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
+
+    let header = Header::new(Format::Parallel, Timing::Metrical(u15::from(ppq)));
+    let mut smf = Smf::new(header);
+
+    // Track 0: Conductor
+    let mut trk0 = Vec::new();
+    let den_power = (time_sig.1 as f64).log2().round() as u8;
+    trk0.push(TrackEvent {
+        delta: 0.into(),
+        kind: TrackEventKind::Meta(MetaMessage::TimeSignature(time_sig.0, den_power, 24, 8)),
+    });
+    let micros = (60_000_000.0 / bpm).round() as u32;
+    trk0.push(TrackEvent {
+        delta: 0.into(),
+        kind: TrackEventKind::Meta(MetaMessage::Tempo(u24::from(micros))),
+    });
+    trk0.push(TrackEvent {
+        delta: 0.into(),
+        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+    });
+    smf.tracks.push(trk0);
+
+    // Track 1: Bass
+    let mut trk1 = Vec::new();
+    trk1.push(TrackEvent {
+        delta: 0.into(),
+        kind: TrackEventKind::Meta(MetaMessage::TrackName(b"Synth Bass")),
+    });
+    // Note 36 at tick 0 for 1 beat (ppq ticks)
+    trk1.push(TrackEvent {
+        delta: 0.into(),
+        kind: TrackEventKind::Midi {
+            channel: u4::from(0u8),
+            message: MidiMessage::NoteOn {
+                key: u7::from(36u8),
+                vel: u7::from(100u8),
+            },
+        },
+    });
+    trk1.push(TrackEvent {
+        delta: u28::from(ppq as u32),
+        kind: TrackEventKind::Midi {
+            channel: u4::from(0u8),
+            message: MidiMessage::NoteOff {
+                key: u7::from(36u8),
+                vel: u7::from(64u8),
+            },
+        },
+    });
+    // Note 40 at next beat
+    trk1.push(TrackEvent {
+        delta: 0.into(),
+        kind: TrackEventKind::Midi {
+            channel: u4::from(0u8),
+            message: MidiMessage::NoteOn {
+                key: u7::from(40u8),
+                vel: u7::from(90u8),
+            },
+        },
+    });
+    trk1.push(TrackEvent {
+        delta: u28::from(ppq as u32),
+        kind: TrackEventKind::Midi {
+            channel: u4::from(0u8),
+            message: MidiMessage::NoteOff {
+                key: u7::from(40u8),
+                vel: u7::from(64u8),
+            },
+        },
+    });
+    trk1.push(TrackEvent {
+        delta: 0.into(),
+        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+    });
+    smf.tracks.push(trk1);
+
+    // Track 2: Lead
+    let mut trk2 = Vec::new();
+    trk2.push(TrackEvent {
+        delta: 0.into(),
+        kind: TrackEventKind::Meta(MetaMessage::TrackName(b"Lead Melody")),
+    });
+    trk2.push(TrackEvent {
+        delta: 0.into(),
+        kind: TrackEventKind::Midi {
+            channel: u4::from(0u8),
+            message: MidiMessage::NoteOn {
+                key: u7::from(60u8),
+                vel: u7::from(110u8),
+            },
+        },
+    });
+    trk2.push(TrackEvent {
+        delta: u28::from((ppq * 2) as u32),
+        kind: TrackEventKind::Midi {
+            channel: u4::from(0u8),
+            message: MidiMessage::NoteOff {
+                key: u7::from(60u8),
+                vel: u7::from(64u8),
+            },
+        },
+    });
+    trk2.push(TrackEvent {
+        delta: 0.into(),
+        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+    });
+    smf.tracks.push(trk2);
+
+    smf.save(path).unwrap();
+}
+
+#[test]
+fn test_midi_file_import_multitrack_type_1() {
+    let temp_dir = std::env::temp_dir();
+    let mid_path = temp_dir.join("jamseq_test_type1.mid");
+
+    // 480 PPQ in file, will scale 2x to Jamband's 960 PPQ standard
+    create_test_smf_file(&mid_path, 480, 135.0, (3, 4));
+
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    assert_eq!(host.tracks.len(), 0);
+
+    // Import full song onto continuous timeline tracks
+    let result = host.import_midi_file(&mid_path, None, None);
+    assert!(result.is_ok(), "Import should succeed: {:?}", result);
+
+    // Assert project BPM & meter updated from embedded meta-events
+    assert!((host.timeline.bpm - 135.0).abs() < 0.01, "BPM should be 135.0");
+    assert_eq!(host.timeline.time_signature.numerator, 3);
+    assert_eq!(host.timeline.time_signature.denominator, 4);
+
+    // Assert 2 tracks created with arranger_mode = Timeline
+    assert_eq!(host.tracks.len(), 2);
+    assert_eq!(host.tracks[0].name, "Synth Bass");
+    assert_eq!(host.tracks[0].arranger_mode, TrackArrangerMode::Timeline);
+    assert_eq!(host.tracks[1].name, "Lead Melody");
+    assert_eq!(host.tracks[1].arranger_mode, TrackArrangerMode::Timeline);
+
+    // Assert timeline blocks created and ticks scaled to 960 PPQ
+    assert_eq!(host.timeline.timeline_blocks.len(), 2);
+    let bass_block = &host.timeline.timeline_blocks[0];
+    assert_eq!(bass_block.track_id, host.tracks[0].id);
+
+    // 480 PPQ beat 1 in file becomes 960 PPQ in Jamband
+    let notes = bass_block.note_intervals(36);
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0], (0, 960));
+
+    let notes_40 = bass_block.note_intervals(40);
+    assert_eq!(notes_40.len(), 1);
+    assert_eq!(notes_40[0], (960, 1920));
+
+    let lead_block = &host.timeline.timeline_blocks[1];
+    let lead_notes = lead_block.note_intervals(60);
+    assert_eq!(lead_notes.len(), 1);
+    assert_eq!(lead_notes[0], (0, 1920)); // 2 beats at 960 PPQ = 1920
+
+    let _ = fs::remove_file(mid_path);
+}
+
+#[test]
+fn test_midi_file_import_targeted_block() {
+    let temp_dir = std::env::temp_dir();
+    let mid_path = temp_dir.join("jamseq_test_target.mid");
+    create_test_smf_file(&mid_path, 960, 120.0, (4, 4));
+
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    let synth = JamSynthEngine::new(48000.0);
+    host.add_track(Track::new_synth("track_bass", "Target Bass", synth));
+
+    let sec = SongSection::new("sec_hook", "Hook", 1, 4);
+    host.add_section(sec);
+
+    // Import into target section block
+    let res = host.import_midi_file(&mid_path, Some("track_bass"), Some("sec_hook"));
+    assert!(res.is_ok(), "{:?}", res);
+
+    let sec_ref = host.timeline.sections.iter().find(|s| s.id == "sec_hook").unwrap();
+    let block = sec_ref.track_blocks.get("track_bass").expect("Block must exist in section");
+
+    assert!(!block.events.is_empty());
+    assert!(block.events.iter().any(|e| matches!(e.action, ScheduledAction::NoteOn { note: 36, .. })));
+
+    let _ = fs::remove_file(mid_path);
+}
+
+#[test]
+fn test_midi_file_export_and_roundtrip() {
+    let temp_dir = std::env::temp_dir();
+    let export_path = temp_dir.join("jamseq_roundtrip_export.mid");
+
+    let mut host = JamSeqHost::new(140.0, 48000.0);
+    host.timeline.set_project_time_signature(TimeSignature::new(4, 4));
+
+    let synth_a = JamSynthEngine::new(48000.0);
+    host.add_track(Track::new_synth("trk_1", "Arp Synth", synth_a));
+
+    let synth_b = JamSynthEngine::new(48000.0);
+    host.add_track(Track::new_synth("trk_2", "Sub Bass", synth_b));
+
+    // Track 1 has a section block
+    let mut sec = SongSection::new("sec_main", "Main Section", 1, 2);
+    let mut blk_sec = TrackBlock::new_section("blk_sec", "trk_1", "sec_main", 3840);
+    blk_sec.add_note(1, 2, 0, 480, 60, 0.85);
+    blk_sec.add_note(3, 4, 960, 480, 64, 0.90);
+    sec.set_block(blk_sec);
+    host.add_section(sec);
+
+    // Track 2 has a continuous timeline block
+    let mut blk_time = TrackBlock::new_timeline("blk_time", "trk_2", 0, 3840);
+    blk_time.add_note(5, 6, 480, 960, 36, 1.0);
+    host.set_timeline_block(blk_time);
+
+    // Export to Standard MIDI File
+    let exp_res = host.export_midi_file(&export_path);
+    assert!(exp_res.is_ok(), "Export failed: {:?}", exp_res);
+    assert!(export_path.exists());
+
+    // Parse the exported file back
+    let imported = jamseq::midi_file::parse_midi_file(&export_path).unwrap();
+    assert_eq!(imported.bpm.map(|b| b.round()), Some(140.0));
+    assert_eq!(imported.time_signature, Some((4, 4)));
+
+    // Assert 2 musical tracks
+    assert_eq!(imported.tracks.len(), 2);
+    assert_eq!(imported.tracks[0].name, "Arp Synth");
+    assert_eq!(imported.tracks[1].name, "Sub Bass");
+
+    // Track 0 notes
+    let t0_notes = &imported.tracks[0].notes;
+    assert_eq!(t0_notes.len(), 2);
+    assert_eq!(t0_notes[0].pitch, 60);
+    assert_eq!(t0_notes[0].start_tick, 0);
+    assert_eq!(t0_notes[0].duration_ticks, 480);
+
+    assert_eq!(t0_notes[1].pitch, 64);
+    assert_eq!(t0_notes[1].start_tick, 960);
+    assert_eq!(t0_notes[1].duration_ticks, 480);
+
+    // Track 1 notes
+    let t1_notes = &imported.tracks[1].notes;
+    assert_eq!(t1_notes.len(), 1);
+    assert_eq!(t1_notes[0].pitch, 36);
+    assert_eq!(t1_notes[0].start_tick, 480);
+    assert_eq!(t1_notes[0].duration_ticks, 960);
+
+    let _ = fs::remove_file(export_path);
+}
+
+#[test]
+fn test_midi_file_pitch_non_overlap_invariant() {
+    let temp_dir = std::env::temp_dir();
+    let mid_path = temp_dir.join("jamseq_test_overlap.mid");
+
+    use midly::num::{u15, u28, u4, u7};
+    use midly::{Format, Header, MetaMessage, MidiMessage, Smf, Timing, TrackEvent, TrackEventKind};
+
+    let header = Header::new(Format::SingleTrack, Timing::Metrical(u15::from(960)));
+    let mut smf = Smf::new(header);
+    let mut trk = Vec::new();
+
+    // NoteOn 60 at tick 0
+    trk.push(TrackEvent {
+        delta: 0.into(),
+        kind: TrackEventKind::Midi {
+            channel: u4::from(0u8),
+            message: MidiMessage::NoteOn { key: u7::from(60u8), vel: u7::from(100u8) },
+        },
+    });
+    // Another NoteOn 60 at tick 240 before NoteOff
+    trk.push(TrackEvent {
+        delta: u28::from(240u32),
+        kind: TrackEventKind::Midi {
+            channel: u4::from(0u8),
+            message: MidiMessage::NoteOn { key: u7::from(60u8), vel: u7::from(100u8) },
+        },
+    });
+    // NoteOff 60 at tick 480
+    trk.push(TrackEvent {
+        delta: u28::from(240u32),
+        kind: TrackEventKind::Midi {
+            channel: u4::from(0u8),
+            message: MidiMessage::NoteOff { key: u7::from(60u8), vel: u7::from(64u8) },
+        },
+    });
+    trk.push(TrackEvent {
+        delta: 0.into(),
+        kind: TrackEventKind::Meta(MetaMessage::EndOfTrack),
+    });
+    smf.tracks.push(trk);
+    smf.save(&mid_path).unwrap();
+
+    let parsed = jamseq::midi_file::parse_midi_file(&mid_path).unwrap();
+    assert_eq!(parsed.tracks.len(), 1);
+    let notes = &parsed.tracks[0].notes;
+
+    // Both notes exist, and the first note was clamped so it ends before/at the start of the second
+    assert_eq!(notes.len(), 2);
+    assert_eq!(notes[0].start_tick, 0);
+    assert!(notes[0].start_tick + notes[0].duration_ticks <= notes[1].start_tick);
+    assert_eq!(notes[1].start_tick, 240);
+
+    let _ = fs::remove_file(mid_path);
+}
+
+#[test]
+fn test_midi_file_ipc_import_export() {
+    let temp_dir = std::env::temp_dir();
+    let mid_path = temp_dir.join("jamseq_test_ipc.mid");
+    let out_mid_path = temp_dir.join("jamseq_test_ipc_out.mid");
+    create_test_smf_file(&mid_path, 960, 128.0, (4, 4));
+
+    let host = JamSeqHost::new(120.0, 48000.0);
+    let host_arc = std::sync::Arc::new(std::sync::Mutex::new(host));
+
+    // Import via IPC
+    let resp = jamseq::ipc::execute_command(
+        jamseq::ipc::IpcCommand::ImportMidiFile {
+            file_path: mid_path.to_string_lossy().to_string(),
+            target_track_id: None,
+            target_section_id: None,
+        },
+        &host_arc,
+    );
+    assert!(resp.ok);
+
+    {
+        let guard = host_arc.lock().unwrap();
+        assert_eq!(guard.tracks.len(), 2);
+        assert!((guard.timeline.bpm - 128.0).abs() < 0.01);
+    }
+
+    // Export via IPC
+    let exp_resp = jamseq::ipc::execute_command(
+        jamseq::ipc::IpcCommand::ExportMidiFile {
+            file_path: out_mid_path.to_string_lossy().to_string(),
+        },
+        &host_arc,
+    );
+    assert!(exp_resp.ok);
+    assert!(out_mid_path.exists());
+
+    let _ = fs::remove_file(mid_path);
+    let _ = fs::remove_file(out_mid_path);
 }

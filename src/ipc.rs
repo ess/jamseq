@@ -327,6 +327,18 @@ pub enum IpcCommand {
         start_offset_ticks: u64,
         trim_end_ticks: u64,
     },
+    /// Import a Standard MIDI File (.mid)
+    ImportMidiFile {
+        file_path: String,
+        #[serde(default)]
+        target_track_id: Option<String>,
+        #[serde(default)]
+        target_section_id: Option<String>,
+    },
+    /// Export arrangement to a Standard MIDI File (.mid)
+    ExportMidiFile {
+        file_path: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -939,6 +951,34 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
         } => {
             h.set_clip_offset(&track_id, &clip_id, start_offset_ticks, trim_end_ticks);
             build_status_response(&h)
+        }
+        IpcCommand::ImportMidiFile {
+            file_path,
+            target_track_id,
+            target_section_id,
+        } => {
+            let path = std::path::Path::new(&file_path);
+            let res = h.import_midi_file(
+                path,
+                target_track_id.as_deref(),
+                target_section_id.as_deref(),
+            );
+            let mut resp = build_status_response(&h);
+            if let Err(e) = res {
+                resp.ok = false;
+                resp.error = Some(format!("Failed to import MIDI file: {}", e));
+            }
+            resp
+        }
+        IpcCommand::ExportMidiFile { file_path } => {
+            let path = std::path::Path::new(&file_path);
+            let res = h.export_midi_file(path);
+            let mut resp = build_status_response(&h);
+            if let Err(e) = res {
+                resp.ok = false;
+                resp.error = Some(format!("Failed to export MIDI file: {}", e));
+            }
+            resp
         }
         IpcCommand::GetStatus => build_status_response(&h),
     }

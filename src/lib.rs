@@ -5,6 +5,7 @@ pub mod clap_host;
 pub mod engine;
 pub mod ipc;
 pub mod lv2_host;
+pub mod midi_file;
 pub mod midi_input;
 pub mod plugin_scanner;
 pub mod project;
