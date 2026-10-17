@@ -120,6 +120,7 @@ impl SampleBuffer {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct SamplerVoice {
     pub note: u8,
     pub velocity: f32,
@@ -155,6 +156,7 @@ impl SamplerVoice {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct SamplerInstrument {
     pub config: SamplerConfig,
     pub buffer: Option<SampleBuffer>,

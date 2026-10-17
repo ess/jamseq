@@ -776,4 +776,75 @@ impl Track {
             self.peak_level = (self.peak_level * 0.85).max(0.0);
         }
     }
+
+    /// Capture a self-contained snapshot of this track's instrument and inserts for off-thread rendering
+    pub fn snapshot(&self) -> crate::worker::TrackDslSnapshot {
+        let instrument = match &self.instrument {
+            TrackInstrument::Synth(synth) => {
+                crate::worker::InstrumentSnapshot::Synth {
+                    patch_json: synth.patch.to_json().unwrap_or_default(),
+                }
+            }
+            TrackInstrument::Sampler(sampler) => {
+                crate::worker::InstrumentSnapshot::Sampler(sampler.clone())
+            }
+            TrackInstrument::AudioClips(clips) => {
+                crate::worker::InstrumentSnapshot::AudioClips(clips.clone())
+            }
+            TrackInstrument::Clap(clap) => {
+                crate::worker::InstrumentSnapshot::Clap {
+                    path: clap.path.clone(),
+                    params: clap.get_parameters().into_iter().map(|(n, v, _, _)| (n, v)).collect(),
+                }
+            }
+            TrackInstrument::Lv2(lv2) => {
+                crate::worker::InstrumentSnapshot::Lv2 {
+                    uri: lv2.uri.clone(),
+                    params: lv2.get_parameters().into_iter().map(|(n, v, _, _)| (n, v)).collect(),
+                }
+            }
+            TrackInstrument::Vst3(vst3) => {
+                crate::worker::InstrumentSnapshot::Vst3 {
+                    path: vst3.path.clone(),
+                    params: vst3.get_parameters().into_iter().map(|(n, v, _, _)| (n, v)).collect(),
+                }
+            }
+        };
+
+        let inserts = self.inserts.iter().map(|ins| {
+            match ins {
+                InsertEffect::Clap { name, uri, track } => {
+                    crate::worker::InsertSnapshot {
+                        name: name.clone(),
+                        kind: crate::worker::InsertKind::Clap,
+                        uri_or_path: uri.clone(),
+                        params: track.get_parameters().into_iter().map(|(n, v, _, _)| (n, v)).collect(),
+                    }
+                }
+                InsertEffect::Lv2 { name, uri, track } => {
+                    crate::worker::InsertSnapshot {
+                        name: name.clone(),
+                        kind: crate::worker::InsertKind::Lv2,
+                        uri_or_path: uri.clone(),
+                        params: track.get_parameters().into_iter().map(|(n, v, _, _)| (n, v)).collect(),
+                    }
+                }
+                InsertEffect::Vst3 { name, uri, track } => {
+                    crate::worker::InsertSnapshot {
+                        name: name.clone(),
+                        kind: crate::worker::InsertKind::Vst3,
+                        uri_or_path: uri.clone(),
+                        params: track.get_parameters().into_iter().map(|(n, v, _, _)| (n, v)).collect(),
+                    }
+                }
+            }
+        }).collect();
+
+        crate::worker::TrackDslSnapshot {
+            track_id: self.id.clone(),
+            track_name: self.name.clone(),
+            instrument,
+            inserts,
+        }
+    }
 }

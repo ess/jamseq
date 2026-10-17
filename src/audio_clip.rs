@@ -34,6 +34,7 @@ impl AudioClip {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct AudioClipTrack {
     pub clips: Vec<AudioClip>,
 }

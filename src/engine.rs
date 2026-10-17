@@ -4,8 +4,10 @@ use crate::timeline::{ScheduledAction, ScheduledEvent, Timeline};
 use crate::track::{AuxBus, MasterBus, Track, TrackInstrument};
 use anyhow::{Context, Result};
 use hound::{WavSpec, WavWriter};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 pub struct FrozenTrackState {
     pub instrument: TrackInstrument,
@@ -35,12 +37,23 @@ pub struct JamSeqHost {
     pub aux_right: Vec<Vec<f32>>,
     scratch_left: Vec<f32>,
     scratch_right: Vec<f32>,
+
+    pub bake_tx: Sender<crate::worker::BakeJob>,
+    pub bake_rx: Receiver<crate::worker::BakeResult>,
+    pub latest_jobs: Arc<Mutex<HashMap<(String, String), u64>>>,
+    pub pending_bakes: HashSet<(String, String)>,
+    pub next_job_id: u64,
 }
 
 impl JamSeqHost {
     pub fn new(bpm: f64, sample_rate: f32) -> Self {
         let sr = if sample_rate > 0.0 { sample_rate } else { 44100.0 };
         let available_plugins = crate::plugin_scanner::PluginScanner::scan_all();
+        let (bake_tx, worker_rx) = std::sync::mpsc::channel();
+        let (worker_tx, bake_rx) = std::sync::mpsc::channel();
+        let latest_jobs = Arc::new(Mutex::new(HashMap::new()));
+        crate::worker::StemBakeWorker::spawn(worker_rx, worker_tx, latest_jobs.clone());
+
         Self {
             timeline: Timeline::new(bpm, sr as f64),
             tracks: Vec::new(),
@@ -62,11 +75,76 @@ impl JamSeqHost {
             aux_right: Vec::new(),
             scratch_left: vec![0.0; 2048],
             scratch_right: vec![0.0; 2048],
+            bake_tx,
+            bake_rx,
+            latest_jobs,
+            pending_bakes: HashSet::new(),
+            next_job_id: 1,
         }
     }
 
     pub fn rescan_plugins(&mut self) {
         self.available_plugins = crate::plugin_scanner::PluginScanner::scan_all();
+    }
+
+    /// Non-blocking drain of all completed block stems from the background worker thread.
+    /// Atomically swaps newly baked audio into track.active_block_stems with zero audio thread locking.
+    pub fn drain_baked_stems(&mut self) {
+        while let Ok(result) = self.bake_rx.try_recv() {
+            let key = (result.track_id.clone(), result.block_id.clone());
+            self.pending_bakes.remove(&key);
+
+            let is_latest = {
+                let map = self.latest_jobs.lock().unwrap();
+                map.get(&key).map(|&id| result.job_id >= id).unwrap_or(true)
+            };
+
+            if !is_latest {
+                continue;
+            }
+
+            if let Some(&t_idx) = self.track_map.get(&result.track_id) {
+                let track = &mut self.tracks[t_idx];
+                let new_stem = crate::track::BlockStem {
+                    block_id: result.block_id.clone(),
+                    track_id: result.track_id.clone(),
+                    start_sample: result.start_sample,
+                    end_sample: result.end_sample,
+                    buffer: result.buffer,
+                };
+
+                if let Some(pos) = track.active_block_stems.iter().position(|bs| bs.block_id == result.block_id) {
+                    track.active_block_stems[pos] = new_stem;
+                } else {
+                    track.active_block_stems.push(new_stem);
+                }
+            }
+        }
+    }
+
+    /// Check if any background bake jobs are currently in flight
+    pub fn has_pending_bakes(&self) -> bool {
+        !self.pending_bakes.is_empty()
+    }
+
+    /// Check if a specific track has pending background bakes in flight
+    pub fn track_has_pending_bakes(&self, track_id: &str) -> bool {
+        self.pending_bakes.iter().any(|(t, _)| t == track_id)
+    }
+
+    /// Blockingly drain pending bakes until all in-flight jobs are completed (used by tests and offline bounce)
+    pub fn wait_for_pending_bakes(&mut self) {
+        let start = std::time::Instant::now();
+        while self.has_pending_bakes() {
+            self.drain_baked_stems();
+            if self.has_pending_bakes() {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if start.elapsed().as_secs() > 10 {
+                eprintln!("[jamseq] Warning: wait_for_pending_bakes timed out after 10s");
+                break;
+            }
+        }
     }
 
     pub fn add_section(&mut self, section: crate::timeline::SongSection) {
@@ -90,6 +168,9 @@ impl JamSeqHost {
                 if let Some(&idx) = self.track_map.get(&track_id) {
                     self.tracks[idx].active_block_stems.retain(|bs| bs.block_id != block_id);
                 }
+                let key = (track_id, block_id);
+                self.pending_bakes.remove(&key);
+                self.latest_jobs.lock().unwrap().insert(key, u64::MAX);
             }
         }
         res
@@ -225,6 +306,9 @@ impl JamSeqHost {
             if let Some(&idx) = self.track_map.get(track_id) {
                 self.tracks[idx].active_block_stems.retain(|bs| bs.block_id != block_id);
             }
+            let key = (track_id.to_string(), block_id.to_string());
+            self.pending_bakes.remove(&key);
+            self.latest_jobs.lock().unwrap().insert(key, u64::MAX);
             self.timeline.rebuild_active_events();
         }
         removed
@@ -948,6 +1032,9 @@ impl JamSeqHost {
 
     /// Render a block of stereo audio into master_left and master_right.
     pub fn process_block(&mut self, master_left: &mut [f32], master_right: &mut [f32]) {
+        // Drain newly baked stems from the background worker thread
+        self.drain_baked_stems();
+
         let num_samples = master_left.len().min(master_right.len());
         master_left[..num_samples].fill(0.0);
         master_right[..num_samples].fill(0.0);
@@ -1043,13 +1130,18 @@ impl JamSeqHost {
 
         // Render all tracks into master bus and tap aux sends & sidechains
         for &track_idx in &track_order {
-            let track = &mut self.tracks[track_idx];
-            if any_solo && !track.solo {
+            let track_id = self.tracks[track_idx].id.clone();
+            let is_solo = self.tracks[track_idx].solo;
+            if any_solo && !is_solo {
                 continue;
             }
+            let is_armed = self.armed_track_id.as_deref() == Some(&track_id);
+            let has_pending = self.pending_bakes.iter().any(|(t, _)| t == &track_id);
+            let bypass_stems = is_armed || has_pending;
+
+            let track = &mut self.tracks[track_idx];
             let effective_bpm = self.timeline.get_track_effective_bpm(&track.id, current_tick);
             track.set_tempo(effective_bpm);
-            let is_armed = self.armed_track_id.as_deref() == Some(&track.id);
             track.process_block(
                 current_sample,
                 &mut master_left[..num_samples],
@@ -1057,7 +1149,7 @@ impl JamSeqHost {
                 &mut self.scratch_left[..num_samples],
                 &mut self.scratch_right[..num_samples],
                 Some(&self.sidechain_buffers),
-                is_armed,
+                bypass_stems,
                 self.timeline.is_playing,
             );
 
@@ -1194,6 +1286,7 @@ impl JamSeqHost {
 
     /// Offline render the entire song timeline directly to a WAV file.
     pub fn render_to_wav(&mut self, out_path: &Path, num_bars: u32) -> Result<()> {
+        self.wait_for_pending_bakes();
         let spec = WavSpec {
             channels: 2,
             sample_rate: self.sample_rate as u32,
@@ -1237,6 +1330,7 @@ impl JamSeqHost {
 
     /// Offline render a single track directly to a stereo 24-bit WAV file.
     pub fn render_track_to_wav(&mut self, track_id: &str, out_path: &Path, num_bars: u32) -> Result<()> {
+        self.wait_for_pending_bakes();
         let spec = WavSpec {
             channels: 2,
             sample_rate: self.sample_rate as u32,
@@ -1411,7 +1505,7 @@ impl JamSeqHost {
         })
     }
 
-    /// Re-render only a single modified track block and atomically swap into track.active_block_stems
+    /// Asynchronously re-render a single modified track block via StemBakeWorker and atomically swap on completion
     pub fn rebake_block(&mut self, track_id: &str, block_id: &str) -> bool {
         let maybe_resolved = self.timeline.get_resolved_blocks_for_track(track_id)
             .into_iter()
@@ -1443,40 +1537,33 @@ impl JamSeqHost {
             block.effective_bpm(self.timeline.bpm)
         };
 
-        match crate::block_renderer::render_block(&mut self.tracks[t_idx], &block, eff_bpm, self.sample_rate) {
-            Ok(buf) => {
-                let start_sample = self.timeline.ticks_to_samples(abs_start_tick) as usize;
-                let end_sample = start_sample + buf.samples_left.len();
+        let start_sample = self.timeline.ticks_to_samples(abs_start_tick) as usize;
+        let track_snapshot = self.tracks[t_idx].snapshot();
 
-                let new_stem = crate::track::BlockStem {
-                    block_id: block.id.clone(),
-                    track_id: track_id.to_string(),
-                    start_sample,
-                    end_sample,
-                    buffer: buf,
-                };
+        let job_id = self.next_job_id;
+        self.next_job_id += 1;
+        let key = (track_id.to_string(), block.id.clone());
+        self.latest_jobs.lock().unwrap().insert(key.clone(), job_id);
+        self.pending_bakes.insert(key);
 
-                if let Some(pos) = self.tracks[t_idx].active_block_stems.iter().position(|bs| bs.block_id == block.id) {
-                    self.tracks[t_idx].active_block_stems[pos] = new_stem;
-                } else {
-                    self.tracks[t_idx].active_block_stems.push(new_stem);
-                }
-                true
-            }
-            Err(e) => {
-                eprintln!("[jamseq] Failed to rebake block {}: {}", block_id, e);
-                false
-            }
-        }
-    }
-
-    /// Rebake all blocks for a given track (e.g. after parameter or preset changes)
-    pub fn rebake_blocks_for_track(&mut self, track_id: &str) -> usize {
-        let &t_idx = match self.track_map.get(track_id) {
-            Some(idx) => idx,
-            None => return 0,
+        let job = crate::worker::BakeJob {
+            job_id,
+            track_id: track_id.to_string(),
+            block_id: block.id.clone(),
+            section_id: block.section_id.clone(),
+            abs_start_tick,
+            start_sample,
+            eff_bpm,
+            sample_rate: self.sample_rate,
+            block,
+            track_snapshot,
         };
 
+        self.bake_tx.send(job).is_ok()
+    }
+
+    /// Asynchronously rebake all blocks for a given track via StemBakeWorker
+    pub fn rebake_blocks_for_track(&mut self, track_id: &str) -> usize {
         let resolved: Vec<(crate::timeline::TrackBlock, u64)> = self.timeline
             .get_resolved_blocks_for_track(track_id)
             .into_iter()
@@ -1484,34 +1571,8 @@ impl JamSeqHost {
             .collect();
 
         let mut count = 0;
-        for (block, abs_start_tick) in resolved {
-            let eff_bpm = if let Some(ref sec_id) = block.section_id {
-                let sec_bpm = self.timeline.sections.iter()
-                    .find(|s| &s.id == sec_id)
-                    .map(|s| s.effective_bpm(self.timeline.bpm))
-                    .unwrap_or(self.timeline.bpm);
-                block.effective_bpm(sec_bpm)
-            } else {
-                block.effective_bpm(self.timeline.bpm)
-            };
-
-            if let Ok(buf) = crate::block_renderer::render_block(&mut self.tracks[t_idx], &block, eff_bpm, self.sample_rate) {
-                let start_sample = self.timeline.ticks_to_samples(abs_start_tick) as usize;
-                let end_sample = start_sample + buf.samples_left.len();
-
-                let new_stem = crate::track::BlockStem {
-                    block_id: block.id.clone(),
-                    track_id: track_id.to_string(),
-                    start_sample,
-                    end_sample,
-                    buffer: buf,
-                };
-
-                if let Some(pos) = self.tracks[t_idx].active_block_stems.iter().position(|bs| bs.block_id == block.id) {
-                    self.tracks[t_idx].active_block_stems[pos] = new_stem;
-                } else {
-                    self.tracks[t_idx].active_block_stems.push(new_stem);
-                }
+        for (block, _) in resolved {
+            if self.rebake_block(track_id, &block.id) {
                 count += 1;
             }
         }

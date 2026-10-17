@@ -738,6 +738,7 @@ fn test_autostem_mid_event_pause_and_unpause() {
     pad_block.add_note(1, 2, 0, 1920, 60, 1.0);
     sec.set_block(pad_block);
     host.add_section(sec);
+    host.wait_for_pending_bakes();
 
     // Active block stems are baked automatically when sections are added
     let pad_idx = *host.track_map.get("pad_long").unwrap();
@@ -1341,6 +1342,7 @@ fn test_discrete_granular_block_stems() {
     b_verse.add_note(20, 21, 0, 960, 38, 1.0);
     sec_verse.set_block(b_verse);
     host.add_section(sec_verse);
+    host.wait_for_pending_bakes();
 
     let track_idx = *host.track_map.get("sub808").unwrap();
     assert_eq!(host.tracks[track_idx].active_block_stems.len(), 2, "Track must have discrete active block stems for both sections");
@@ -2126,6 +2128,7 @@ fn test_section_matrix_and_ad_hoc_timeline_tracks_dual_topology() {
     let drum_idx = *host.track_map.get("drums").unwrap();
     let vocal_idx = *host.track_map.get("lead_vocal").unwrap();
 
+    host.wait_for_pending_bakes();
     assert_eq!(host.tracks[drum_idx].active_block_stems.len(), 2, "Drums must have 2 block stems from added sections");
     assert_eq!(host.tracks[vocal_idx].active_block_stems.len(), 1, "Vocal must have 1 block stem from timeline block");
 
@@ -2145,6 +2148,7 @@ fn test_section_matrix_and_ad_hoc_timeline_tracks_dual_topology() {
     assert!(host.timeline.is_playing, "Playback must NEVER pause when editing or adding notes in a block!");
 
     // Verify the single stem was updated atomically in active_block_stems without disturbing drums
+    host.wait_for_pending_bakes();
     assert_eq!(host.tracks[vocal_idx].active_block_stems.len(), 1);
     assert_eq!(host.tracks[drum_idx].active_block_stems.len(), 2);
 }
@@ -2160,6 +2164,7 @@ fn test_block_crud_lifecycle_and_ipc() {
         .expect("Failed to add block in section");
     assert_eq!(block.id, "blk_sec_1");
     assert_eq!(block.section_id, Some("sec_1".to_string()));
+    host.wait_for_pending_bakes();
     assert_eq!(host.tracks[0].active_block_stems.len(), 1);
 
     // 2. AddBlock on timeline
@@ -2167,12 +2172,14 @@ fn test_block_crud_lifecycle_and_ipc() {
         .expect("Failed to add timeline block");
     assert_eq!(tl_block.id, "blk_tl_1");
     assert_eq!(tl_block.section_id, None);
+    host.wait_for_pending_bakes();
     assert_eq!(host.tracks[0].active_block_stems.len(), 2);
 
     // 3. UpdateBlock (note edit)
     let mut updated = block.clone();
     updated.add_note(101, 102, 0, 480, 60, 0.8);
     assert!(host.update_block(updated));
+    host.wait_for_pending_bakes();
     assert_eq!(host.tracks[0].active_block_stems.len(), 2);
 
     // 4. RemoveBlock from section
@@ -2207,6 +2214,7 @@ fn test_param_and_insert_updates_rebake_active_stems() {
     block.add_note(1, 2, 0, 960, 48, 1.0);
     sec.set_block(block);
     host.add_section(sec);
+    host.wait_for_pending_bakes();
 
     assert_eq!(host.tracks[0].active_block_stems.len(), 1);
     let orig_samples = host.tracks[0].active_block_stems[0].buffer.samples_left.clone();
@@ -2227,7 +2235,8 @@ fn test_param_and_insert_updates_rebake_active_stems() {
     assert!(resp.ok, "SetTrackParam failed: {:?}", resp.error);
 
     let cutoff_modified_samples = {
-        let h = host.lock().unwrap();
+        let mut h = host.lock().unwrap();
+        h.wait_for_pending_bakes();
         assert_eq!(h.tracks[0].active_block_stems.len(), 1);
         let samples = h.tracks[0].active_block_stems[0].buffer.samples_left.clone();
         assert_ne!(
@@ -2249,7 +2258,8 @@ fn test_param_and_insert_updates_rebake_active_stems() {
     assert!(resp.ok, "AddTrackInsert failed: {:?}", resp.error);
 
     let insert_added_samples = {
-        let h = host.lock().unwrap();
+        let mut h = host.lock().unwrap();
+        h.wait_for_pending_bakes();
         assert_eq!(h.tracks[0].inserts.len(), 1);
         assert_eq!(h.tracks[0].active_block_stems.len(), 1);
         let samples = h.tracks[0].active_block_stems[0].buffer.samples_left.clone();
@@ -2271,7 +2281,8 @@ fn test_param_and_insert_updates_rebake_active_stems() {
     assert!(resp.ok, "RemoveTrackInsert failed: {:?}", resp.error);
 
     {
-        let h = host.lock().unwrap();
+        let mut h = host.lock().unwrap();
+        h.wait_for_pending_bakes();
         assert_eq!(h.tracks[0].inserts.len(), 0);
         let samples = &h.tracks[0].active_block_stems[0].buffer.samples_left;
         assert_ne!(
@@ -2283,4 +2294,54 @@ fn test_param_and_insert_updates_rebake_active_stems() {
             "Removing the insert should restore the pre-insert stem buffer"
         );
     }
+}
+
+#[test]
+fn test_async_background_stem_rendering_nonblocking_and_coalescing() {
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    let mut synth = JamSynthEngine::new(48000.0);
+    synth.load_patch(JamSynthPatch::preset_808_sub());
+    host.add_track(Track::new_synth("track_async", "Async Synth", synth));
+
+    let mut sec = SongSection::new_empty("sec_async", "Async Section");
+    let mut block = TrackBlock::new("blk_async", "track_async", 3840);
+    block.add_note(1, 2, 0, 960, 48, 1.0);
+    sec.set_block(block);
+    host.add_section(sec);
+
+    // Initial bake completes
+    host.wait_for_pending_bakes();
+    assert_eq!(host.tracks[0].active_block_stems.len(), 1);
+    let initial_stem = host.tracks[0].active_block_stems[0].buffer.samples_left.clone();
+
+    // Start playback
+    host.play();
+    assert!(host.timeline.is_playing);
+
+    // Rapidly sweep the filter cutoff 20 times (simulating slider drag in jamout)
+    for i in 1..=20 {
+        let cutoff_val = 100.0 + (i as f32 * 100.0);
+        host.tracks[0].set_parameter("cutoff", cutoff_val);
+        host.rebake_blocks_for_track("track_async");
+    }
+
+    // Verify track is in live auditioning passthrough mode while bakes are pending
+    assert!(host.track_has_pending_bakes("track_async"));
+
+    // Audio callback executes continuously without blocking or underrun
+    let mut master_l = vec![0.0f32; 256];
+    let mut master_r = vec![0.0f32; 256];
+    for _ in 0..10 {
+        host.process_block(&mut master_l, &mut master_r);
+        assert!(!master_l.iter().all(|&s| s == 0.0), "Live auditioning should output audio");
+    }
+
+    // Now wait for background bakes to settle
+    host.wait_for_pending_bakes();
+    assert!(!host.track_has_pending_bakes("track_async"));
+
+    // Completed stem matches the final settled state
+    assert_eq!(host.tracks[0].active_block_stems.len(), 1);
+    let final_stem = &host.tracks[0].active_block_stems[0].buffer.samples_left;
+    assert_ne!(final_stem, &initial_stem, "Stem should reflect the final settled cutoff value");
 }
