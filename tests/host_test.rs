@@ -2345,3 +2345,264 @@ fn test_async_background_stem_rendering_nonblocking_and_coalescing() {
     let final_stem = &host.tracks[0].active_block_stems[0].buffer.samples_left;
     assert_ne!(final_stem, &initial_stem, "Stem should reflect the final settled cutoff value");
 }
+
+#[test]
+fn test_dynamic_track_reordering_during_active_playback() {
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+
+    let mut synth_a = JamSynthEngine::new(48000.0);
+    synth_a.load_patch(JamSynthPatch::preset_808_sub());
+    let mut trk_a = Track::new_synth("track_a", "Track A (808)", synth_a);
+    trk_a.pan = -0.5;
+    host.add_track(trk_a);
+
+    let mut synth_b = JamSynthEngine::new(48000.0);
+    synth_b.load_patch(JamSynthPatch::preset_reese_bass());
+    let mut trk_b = Track::new_synth("track_b", "Track B (Reese)", synth_b);
+    trk_b.pan = 0.5;
+    host.add_track(trk_b);
+
+    let mut synth_c = JamSynthEngine::new(48000.0);
+    synth_c.load_patch(JamSynthPatch::preset_cold_pad());
+    let mut trk_c = Track::new_synth("track_c", "Track C (Pad)", synth_c);
+    trk_c.volume = 0.8;
+    host.add_track(trk_c);
+
+    assert_eq!(host.tracks.len(), 3);
+    assert_eq!(host.tracks[0].id, "track_a");
+    assert_eq!(host.tracks[1].id, "track_b");
+    assert_eq!(host.tracks[2].id, "track_c");
+    assert_eq!(*host.track_map.get("track_a").unwrap(), 0);
+    assert_eq!(*host.track_map.get("track_b").unwrap(), 1);
+    assert_eq!(*host.track_map.get("track_c").unwrap(), 2);
+
+    // Schedule active notes on all 3 tracks
+    host.tracks[0].note_on(36, 1.0);
+    host.tracks[1].note_on(48, 0.8);
+    host.tracks[2].note_on(60, 0.6);
+
+    host.play();
+
+    // Process a block of audio while notes are playing
+    let mut left = vec![0.0f32; 512];
+    let mut right = vec![0.0f32; 512];
+    host.process_block(&mut left, &mut right);
+    let max_pre = left.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(max_pre > 0.01, "Expected non-silent audio before reorder");
+
+    // Dynamically reorder Track A (index 0) to index 2 during live playback
+    let ok = host.reorder_tracks(0, 2);
+    assert!(ok, "reorder_tracks should return true for valid indices");
+
+    // Verify track list order is updated: [track_b, track_c, track_a]
+    assert_eq!(host.tracks[0].id, "track_b");
+    assert_eq!(host.tracks[1].id, "track_c");
+    assert_eq!(host.tracks[2].id, "track_a");
+
+    // Verify track_map reflects new indexing
+    assert_eq!(*host.track_map.get("track_b").unwrap(), 0);
+    assert_eq!(*host.track_map.get("track_c").unwrap(), 1);
+    assert_eq!(*host.track_map.get("track_a").unwrap(), 2);
+
+    // Continue processing audio during live playback - no stutter, no dropouts, no NaN
+    left.fill(0.0);
+    right.fill(0.0);
+    host.process_block(&mut left, &mut right);
+    let max_post = left.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(max_post > 0.01, "Audio should continue seamlessly after reorder");
+    assert!(left.iter().all(|s| !s.is_nan() && !s.is_infinite()));
+    assert!(right.iter().all(|s| !s.is_nan() && !s.is_infinite()));
+
+    // Test reorder via IPC command structure
+    let host_arc = std::sync::Arc::new(std::sync::Mutex::new(host));
+    let resp = jamseq::ipc::execute_command(
+        jamseq::ipc::IpcCommand::ReorderTrack {
+            from_index: 2,
+            to_index: 0,
+        },
+        &host_arc,
+    );
+    assert!(resp.ok);
+    let guard = host_arc.lock().unwrap();
+    assert_eq!(guard.tracks[0].id, "track_a");
+    assert_eq!(guard.tracks[1].id, "track_b");
+    assert_eq!(guard.tracks[2].id, "track_c");
+}
+
+#[test]
+fn test_slice_audio_clip_track_continuous_playback() {
+    let temp_dir = std::env::temp_dir();
+    let wav_path = temp_dir.join("jamseq_slice_test.wav");
+    create_test_wav(&wav_path);
+
+    // 1. Render unsliced clip into a reference buffer
+    let mut ref_track = jamseq::audio_clip::AudioClipTrack::new();
+    let unsliced_clip = jamseq::audio_clip::AudioClip::with_id("take_1", &wav_path, 0);
+    ref_track.add_clip(unsliced_clip);
+
+    let total_samples = 4410; // length of create_test_wav
+    let mut ref_left = vec![0.0f32; total_samples];
+    let mut ref_right = vec![0.0f32; total_samples];
+    ref_track.process_block(0, &mut ref_left, &mut ref_right);
+
+    let ref_max = ref_left.iter().map(|s| s.abs()).fold(0.0, f32::max);
+    assert!(ref_max > 0.1, "Reference audio must not be silent");
+
+    // 2. Setup host with an audio track and slice it in the middle
+    let mut host = JamSeqHost::new(120.0, 44100.0);
+    let mut clip_track = jamseq::audio_clip::AudioClipTrack::new();
+    let test_clip = jamseq::audio_clip::AudioClip::with_id("take_1", &wav_path, 0);
+    clip_track.add_clip(test_clip);
+
+    let trk = Track::new_audio_clips("audio_1", "Vocal Take", clip_track);
+    host.add_track(trk);
+
+    // Split tick corresponding to sample 2205 (halfway)
+    let split_sample = 2205u64;
+    let split_tick = host.timeline.samples_to_ticks(split_sample);
+
+    let slice_result = host.slice_clip("audio_1", "take_1", split_tick).unwrap();
+    assert!(slice_result.is_some(), "slice_clip should succeed on active clip");
+    let (left_id, right_id) = slice_result.unwrap();
+    assert_eq!(left_id, "take_1");
+    assert_eq!(right_id, "take_1_b");
+
+    // Verify track now has 2 clips sharing the buffer with adjusted sample_offset and duration_samples
+    if let jamseq::track::TrackInstrument::AudioClips(ref act) = host.tracks[0].instrument {
+        assert_eq!(act.clips.len(), 2);
+        assert_eq!(act.clips[0].id, "take_1");
+        assert_eq!(act.clips[0].start_sample, 0);
+        assert_eq!(act.clips[0].sample_offset, 0);
+        assert_eq!(act.clips[0].duration_samples, Some(split_sample as usize));
+
+        assert_eq!(act.clips[1].id, "take_1_b");
+        assert_eq!(act.clips[1].start_sample, split_sample);
+        assert_eq!(act.clips[1].sample_offset, split_sample as usize);
+        assert_eq!(act.clips[1].duration_samples, Some(total_samples - split_sample as usize));
+    } else {
+        panic!("Track 0 must be AudioClipTrack");
+    }
+
+    // 3. Process the sliced track and assert bit-accurate continuous audio equivalence with unsliced reference
+    let mut sliced_left = vec![0.0f32; total_samples];
+    let mut sliced_right = vec![0.0f32; total_samples];
+
+    if let jamseq::track::TrackInstrument::AudioClips(ref mut act) = host.tracks[0].instrument {
+        act.process_block(0, &mut sliced_left, &mut sliced_right);
+    }
+
+    // Assert that the sliced clips produce identical continuous audio playback
+    for i in 0..total_samples {
+        let diff_l = (ref_left[i] - sliced_left[i]).abs();
+        let diff_r = (ref_right[i] - sliced_right[i]).abs();
+        assert!(
+            diff_l < 1e-6,
+            "Sample mismatch at {}: ref={:.6}, sliced={:.6}",
+            i,
+            ref_left[i],
+            sliced_left[i]
+        );
+        assert!(
+            diff_r < 1e-6,
+            "Sample mismatch at {}: ref={:.6}, sliced={:.6}",
+            i,
+            ref_right[i],
+            sliced_right[i]
+        );
+    }
+
+    let _ = fs::remove_file(wav_path);
+}
+
+#[test]
+fn test_slice_track_block_continuous_events() {
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    let mut synth = JamSynthEngine::new(48000.0);
+    synth.load_patch(JamSynthPatch::preset_808_sub());
+    host.add_track(Track::new_synth("track_midi", "MIDI Synth", synth));
+
+    // Create an ad-hoc timeline block of length 3840 ticks (1 bar at 4/4)
+    // Note 1: 0 .. 480 (in left half)
+    // Note 2: 720 .. 1440 (straddles split at 960)
+    // Note 3: 1920 .. 2400 (in right half)
+    let mut block = TrackBlock::new_timeline("blk_1", "track_midi", 0, 3840);
+    block.add_note(1, 2, 0, 480, 60, 0.9);
+    block.add_note(3, 4, 720, 720, 64, 0.8); // 720 + 720 = 1440
+    block.add_note(5, 6, 1920, 480, 67, 0.7);
+
+    host.set_timeline_block(block);
+    assert_eq!(host.timeline.timeline_blocks.len(), 1);
+
+    // Slice block at tick 960 (beat 2)
+    let split_res = host.slice_clip("track_midi", "blk_1", 960).unwrap();
+    assert!(split_res.is_some());
+    let (left_id, right_id) = split_res.unwrap();
+    assert_eq!(left_id, "blk_1");
+    assert_eq!(right_id, "blk_1_b");
+
+    // Verify 2 timeline blocks exist
+    assert_eq!(host.timeline.timeline_blocks.len(), 2);
+    let left_block = &host.timeline.timeline_blocks[0];
+    let right_block = &host.timeline.timeline_blocks[1];
+
+    assert_eq!(left_block.start_offset_ticks, 0);
+    assert_eq!(left_block.length_ticks, 960);
+
+    assert_eq!(right_block.start_offset_ticks, 960);
+    assert_eq!(right_block.length_ticks, 2880);
+
+    // Verify Note 2 was cleanly split across the boundary:
+    // Left block has Note 2 ending at tick 960
+    assert!(left_block.events.iter().any(|e| e.tick == 960 && matches!(e.action, ScheduledAction::NoteOff { note: 64 })));
+
+    // Right block has Note 2 starting at tick 0 and ending at tick 480 (1440 - 960)
+    assert!(right_block.events.iter().any(|e| e.tick == 0 && matches!(e.action, ScheduledAction::NoteOn { note: 64, .. })));
+    assert!(right_block.events.iter().any(|e| e.tick == 480 && matches!(e.action, ScheduledAction::NoteOff { note: 64 })));
+
+    // Note 3 is shifted in right block: 1920 - 960 = 960
+    assert!(right_block.events.iter().any(|e| e.tick == 960 && matches!(e.action, ScheduledAction::NoteOn { note: 67, .. })));
+    assert!(right_block.events.iter().any(|e| e.tick == 1440 && matches!(e.action, ScheduledAction::NoteOff { note: 67 })));
+
+    // Materialized events on timeline span smoothly across the entire range
+    let materialized = host.timeline.materialize_all_events();
+    assert!(materialized.iter().any(|e| e.tick == 0 && matches!(e.action, ScheduledAction::NoteOn { note: 60, .. })));
+    assert!(materialized.iter().any(|e| e.tick == 720 && matches!(e.action, ScheduledAction::NoteOn { note: 64, .. })));
+    assert!(materialized.iter().any(|e| e.tick == 960 && matches!(e.action, ScheduledAction::NoteOn { note: 64, .. })));
+    assert!(materialized.iter().any(|e| e.tick == 1920 && matches!(e.action, ScheduledAction::NoteOn { note: 67, .. })));
+}
+
+#[test]
+fn test_set_clip_offset_slip_editing() {
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    let mut synth = JamSynthEngine::new(48000.0);
+    synth.load_patch(JamSynthPatch::preset_808_sub());
+    host.add_track(Track::new_synth("track_slip", "Slip Track", synth));
+
+    let block = TrackBlock::new_timeline("blk_slip", "track_slip", 960, 1920);
+    host.set_timeline_block(block);
+
+    // Non-destructive slip edit: move start to 480 and trim end to 2880
+    let ok = host.set_clip_offset("track_slip", "blk_slip", 480, 2880);
+    assert!(ok);
+
+    let updated = host.timeline.get_timeline_block("blk_slip").unwrap();
+    assert_eq!(updated.start_offset_ticks, 480);
+    assert_eq!(updated.length_ticks, 2400); // 2880 - 480 = 2400
+
+    // Test through IPC
+    let host_arc = std::sync::Arc::new(std::sync::Mutex::new(host));
+    let resp = jamseq::ipc::execute_command(
+        jamseq::ipc::IpcCommand::SetClipOffset {
+            track_id: "track_slip".to_string(),
+            clip_id: "blk_slip".to_string(),
+            start_offset_ticks: 960,
+            trim_end_ticks: 3840,
+        },
+        &host_arc,
+    );
+    assert!(resp.ok);
+    let guard = host_arc.lock().unwrap();
+    let ipc_updated = guard.timeline.get_timeline_block("blk_slip").unwrap();
+    assert_eq!(ipc_updated.start_offset_ticks, 960);
+    assert_eq!(ipc_updated.length_ticks, 2880); // 3840 - 960 = 2880
+}

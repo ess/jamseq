@@ -118,8 +118,8 @@ pub enum IpcCommand {
     },
     /// Reorder a track from index to index
     ReorderTrack {
-        from: usize,
-        to: usize,
+        from_index: usize,
+        to_index: usize,
     },
     /// Schedule an automation point on the timeline
     AddAutomationPoint {
@@ -313,6 +313,19 @@ pub enum IpcCommand {
     SetTrackArrangerMode {
         track_id: String,
         mode: TrackArrangerMode,
+    },
+    /// Split a clip or track block at the given timeline tick
+    SliceAudioClip {
+        track_id: String,
+        clip_id: String,
+        split_tick: u64,
+    },
+    /// Set clip offset and trim boundary for non-destructive slip editing
+    SetClipOffset {
+        track_id: String,
+        clip_id: String,
+        start_offset_ticks: u64,
+        trim_end_ticks: u64,
     },
 }
 
@@ -811,8 +824,8 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
             h.delete_track(&track_id);
             build_status_response(&h)
         }
-        IpcCommand::ReorderTrack { from, to } => {
-            h.reorder_tracks(from, to);
+        IpcCommand::ReorderTrack { from_index, to_index } => {
+            h.reorder_tracks(from_index, to_index);
             build_status_response(&h)
         }
         IpcCommand::AddAutomationPoint { id, tick, track_id, param_name, value } => {
@@ -908,6 +921,23 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
         }
         IpcCommand::SetTrackArrangerMode { track_id, mode } => {
             let _ = h.set_track_arranger_mode(&track_id, mode);
+            build_status_response(&h)
+        }
+        IpcCommand::SliceAudioClip {
+            track_id,
+            clip_id,
+            split_tick,
+        } => {
+            let _ = h.slice_clip(&track_id, &clip_id, split_tick);
+            build_status_response(&h)
+        }
+        IpcCommand::SetClipOffset {
+            track_id,
+            clip_id,
+            start_offset_ticks,
+            trim_end_ticks,
+        } => {
+            h.set_clip_offset(&track_id, &clip_id, start_offset_ticks, trim_end_ticks);
             build_status_response(&h)
         }
         IpcCommand::GetStatus => build_status_response(&h),

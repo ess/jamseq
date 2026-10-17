@@ -566,19 +566,148 @@ impl JamSeqHost {
         }
     }
 
-    /// Reorder a track from index `from` to `to`
-    pub fn reorder_tracks(&mut self, from: usize, to: usize) -> bool {
-        if from >= self.tracks.len() || to >= self.tracks.len() {
+    /// Reorder a track from index `from_index` to `to_index`
+    pub fn reorder_tracks(&mut self, from_index: usize, to_index: usize) -> bool {
+        if from_index >= self.tracks.len() || to_index >= self.tracks.len() {
             return false;
         }
-        let track = self.tracks.remove(from);
-        self.tracks.insert(to, track);
+        let track = self.tracks.remove(from_index);
+        self.tracks.insert(to_index, track);
         // Rebuild track_map indices
         self.track_map.clear();
         for (i, t) in self.tracks.iter().enumerate() {
             self.track_map.insert(t.id.clone(), i);
         }
         true
+    }
+
+    /// Slice a clip or track block at the specified timeline tick.
+    /// Returns (original_clip_id, new_split_clip_id) if sliced successfully.
+    pub fn slice_clip(
+        &mut self,
+        track_id: &str,
+        clip_id: &str,
+        split_tick: u64,
+    ) -> anyhow::Result<Option<(String, String)>> {
+        // 1. Check if track has an AudioClipTrack containing this clip
+        if let Some(&t_idx) = self.track_map.get(track_id) {
+            if let TrackInstrument::AudioClips(ref mut act) = self.tracks[t_idx].instrument {
+                let split_sample = self.timeline.ticks_to_samples(split_tick);
+                if let Some(res) = act.slice_clip(clip_id, split_sample) {
+                    return Ok(Some(res));
+                }
+            }
+        }
+
+        // 2. Check ad-hoc timeline blocks
+        if let Some(pos) = self
+            .timeline
+            .timeline_blocks
+            .iter()
+            .position(|b| b.id == clip_id && b.track_id == track_id)
+        {
+            let b = &self.timeline.timeline_blocks[pos];
+            if split_tick > b.start_offset_ticks && split_tick < b.end_tick() {
+                let rel_split = split_tick - b.start_offset_ticks;
+                let right_id = format!("{}_b", b.id);
+                let (left, right) = b.split_at(rel_split, &right_id);
+                let left_id = left.id.clone();
+                self.timeline.timeline_blocks[pos] = left;
+                self.timeline.timeline_blocks.insert(pos + 1, right);
+                self.timeline.rebuild_active_events();
+                self.rebake_block(track_id, &left_id);
+                self.rebake_block(track_id, &right_id);
+                return Ok(Some((left_id, right_id)));
+            }
+            return Ok(None);
+        }
+
+        // 3. Check section track blocks
+        for sec in &mut self.timeline.sections {
+            if let Some(b) = sec.track_blocks.get(track_id) {
+                if b.id == clip_id {
+                    let sec_start = sec.start_tick();
+                    let block_start = sec_start + b.start_offset_ticks;
+                    let block_end = block_start + b.length_ticks;
+                    if split_tick > block_start && split_tick < block_end {
+                        let rel_split = split_tick - block_start;
+                        let right_id = format!("{}_b", b.id);
+                        let (left, mut right) = b.split_at(rel_split, &right_id);
+                        right.section_id = None;
+                        right.start_offset_ticks = split_tick;
+                        let left_id = left.id.clone();
+                        sec.track_blocks.insert(track_id.to_string(), left);
+                        self.timeline.timeline_blocks.push(right);
+                        self.timeline.rebuild_active_events();
+                        self.rebake_block(track_id, &left_id);
+                        self.rebake_block(track_id, &right_id);
+                        return Ok(Some((left_id, right_id)));
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Non-destructive slip editing and trimming of audio/MIDI clips on timeline tracks
+    pub fn set_clip_offset(
+        &mut self,
+        track_id: &str,
+        clip_id: &str,
+        start_offset_ticks: u64,
+        trim_end_ticks: u64,
+    ) -> bool {
+        // 1. Audio clip track
+        if let Some(&t_idx) = self.track_map.get(track_id) {
+            if let TrackInstrument::AudioClips(ref mut act) = self.tracks[t_idx].instrument {
+                let start_sample = self.timeline.ticks_to_samples(start_offset_ticks);
+                let duration_samples = self
+                    .timeline
+                    .ticks_to_samples(trim_end_ticks.saturating_sub(start_offset_ticks))
+                    as usize;
+                if act.set_clip_offset(clip_id, start_sample, duration_samples) {
+                    return true;
+                }
+            }
+        }
+
+        // 2. Timeline blocks
+        if let Some(pos) = self
+            .timeline
+            .timeline_blocks
+            .iter()
+            .position(|b| b.id == clip_id && b.track_id == track_id)
+        {
+            let b = &mut self.timeline.timeline_blocks[pos];
+            b.start_offset_ticks = start_offset_ticks;
+            if trim_end_ticks > start_offset_ticks {
+                b.length_ticks = trim_end_ticks - start_offset_ticks;
+            }
+            let bid = b.id.clone();
+            self.timeline.rebuild_active_events();
+            self.rebake_block(track_id, &bid);
+            return true;
+        }
+
+        // 3. Sections
+        for sec in &mut self.timeline.sections {
+            if let Some(b) = sec.track_blocks.get_mut(track_id) {
+                if b.id == clip_id {
+                    b.start_offset_ticks = start_offset_ticks;
+                    if trim_end_ticks > start_offset_ticks {
+                        b.length_ticks = trim_end_ticks - start_offset_ticks;
+                    }
+                    let bid = b.id.clone();
+                    self.timeline.rebuild_active_events();
+                    self.rebake_block(track_id, &bid);
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     /// Dynamically switch a track's instrument to an internal synth patch or plugin

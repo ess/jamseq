@@ -95,6 +95,8 @@ pub struct TrackBlock {
     pub events: Vec<ScheduledEvent>,
     #[serde(default)]
     pub audio_file: Option<String>,
+    #[serde(default)]
+    pub audio_offset_ticks: u64,
 }
 
 impl TrackBlock {
@@ -109,6 +111,7 @@ impl TrackBlock {
             time_signature: None,
             events: Vec::new(),
             audio_file: None,
+            audio_offset_ticks: 0,
         }
     }
 
@@ -123,6 +126,7 @@ impl TrackBlock {
             time_signature: None,
             events: Vec::new(),
             audio_file: None,
+            audio_offset_ticks: 0,
         }
     }
 
@@ -137,6 +141,7 @@ impl TrackBlock {
             time_signature: None,
             events: Vec::new(),
             audio_file: None,
+            audio_offset_ticks: 0,
         }
     }
 
@@ -245,6 +250,109 @@ impl TrackBlock {
         self.events.push(on);
         self.events.push(off);
         self.events.sort_by_key(|e| e.tick);
+    }
+
+    /// Split this block into two blocks at the specified relative tick boundary (0 < rel_split < length_ticks).
+    /// Returns (left_block, right_block).
+    pub fn split_at(&self, rel_split: u64, new_right_id: &str) -> (TrackBlock, TrackBlock) {
+        let rel_split = rel_split.min(self.length_ticks);
+        let mut left = self.clone();
+        left.length_ticks = rel_split;
+        left.events.clear();
+
+        let mut right = self.clone();
+        right.id = new_right_id.to_string();
+        right.start_offset_ticks = self.start_offset_ticks + rel_split;
+        right.length_ticks = self.length_ticks.saturating_sub(rel_split);
+        right.audio_offset_ticks = self.audio_offset_ticks + rel_split;
+        right.events.clear();
+
+        for (i, ev) in self.events.iter().enumerate() {
+            match ev.action {
+                ScheduledAction::NoteOn { note, velocity } => {
+                    let end_tick = self
+                        .events
+                        .iter()
+                        .skip(i + 1)
+                        .find(|off_ev| {
+                            off_ev.tick >= ev.tick
+                                && match off_ev.action {
+                                    ScheduledAction::NoteOff { note: off_n } => off_n == note,
+                                    _ => false,
+                                }
+                        })
+                        .map(|off_ev| off_ev.tick)
+                        .unwrap_or(ev.tick + 240);
+
+                    let note_start = ev.tick;
+                    let note_end = end_tick.max(note_start + 1);
+
+                    if note_end <= rel_split {
+                        // Entirely in left block
+                        left.events.push(ev.clone());
+                        left.events.push(ScheduledEvent::new(
+                            ev.id + 1_000_000,
+                            note_end,
+                            &self.track_id,
+                            ScheduledAction::NoteOff { note },
+                        ));
+                    } else if note_start >= rel_split {
+                        // Entirely in right block
+                        let mut on_ev = ev.clone();
+                        on_ev.tick = note_start - rel_split;
+                        right.events.push(on_ev);
+                        right.events.push(ScheduledEvent::new(
+                            ev.id + 1_000_000,
+                            note_end - rel_split,
+                            &self.track_id,
+                            ScheduledAction::NoteOff { note },
+                        ));
+                    } else {
+                        // Straddles the boundary!
+                        // Left part: starts at note_start, ends at rel_split
+                        left.events.push(ev.clone());
+                        left.events.push(ScheduledEvent::new(
+                            ev.id + 1_000_000,
+                            rel_split,
+                            &self.track_id,
+                            ScheduledAction::NoteOff { note },
+                        ));
+
+                        // Right part: starts at 0, ends at note_end - rel_split
+                        let on_ev = ScheduledEvent::new(
+                            ev.id + 2_000_000,
+                            0,
+                            &self.track_id,
+                            ScheduledAction::NoteOn { note, velocity },
+                        );
+                        let off_ev = ScheduledEvent::new(
+                            ev.id + 3_000_000,
+                            note_end - rel_split,
+                            &self.track_id,
+                            ScheduledAction::NoteOff { note },
+                        );
+                        right.events.push(on_ev);
+                        right.events.push(off_ev);
+                    }
+                }
+                ScheduledAction::NoteOff { .. } => {
+                    // Handled along with NoteOn above
+                }
+                _ => {
+                    if ev.tick < rel_split {
+                        left.events.push(ev.clone());
+                    } else {
+                        let mut shifted = ev.clone();
+                        shifted.tick = ev.tick - rel_split;
+                        right.events.push(shifted);
+                    }
+                }
+            }
+        }
+
+        left.events.sort_by_key(|e| e.tick);
+        right.events.sort_by_key(|e| e.tick);
+        (left, right)
     }
 }
 
