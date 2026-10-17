@@ -603,26 +603,68 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
         }
         IpcCommand::ReplaceSectionEvents { section_id, track_id, events } => {
             h.timeline.replace_section_track_events(&section_id, &track_id, events);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::AddNote { note_on_id, note_off_id, track_id, tick, duration_ticks, note, velocity } => {
             h.timeline.add_note(note_on_id, note_off_id, &track_id, tick, duration_ticks, note, velocity);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::DeleteNoteAt { track_id, tick, note } => {
             h.timeline.delete_note_at(&track_id, tick, note);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::MoveEvent { event_id, new_tick } => {
+            let track_id = h.timeline.events.iter().find(|e| e.id == event_id).map(|e| e.track_id.clone())
+                .or_else(|| {
+                    for s in &h.timeline.sections {
+                        for (t_id, b) in &s.track_blocks {
+                            if b.events.iter().any(|e| e.id == event_id) {
+                                return Some(t_id.clone());
+                            }
+                        }
+                    }
+                    for b in &h.timeline.timeline_blocks {
+                        if b.events.iter().any(|e| e.id == event_id) {
+                            return Some(b.track_id.clone());
+                        }
+                    }
+                    None
+                });
             h.timeline.move_event(event_id, new_tick);
+            if let Some(t_id) = track_id {
+                h.rebake_blocks_for_track(&t_id);
+            }
             build_status_response(&h)
         }
         IpcCommand::RemoveEvent { event_id } => {
+            let track_id = h.timeline.events.iter().find(|e| e.id == event_id).map(|e| e.track_id.clone())
+                .or_else(|| {
+                    for s in &h.timeline.sections {
+                        for (t_id, b) in &s.track_blocks {
+                            if b.events.iter().any(|e| e.id == event_id) {
+                                return Some(t_id.clone());
+                            }
+                        }
+                    }
+                    for b in &h.timeline.timeline_blocks {
+                        if b.events.iter().any(|e| e.id == event_id) {
+                            return Some(b.track_id.clone());
+                        }
+                    }
+                    None
+                });
             h.timeline.remove_event(event_id);
+            if let Some(t_id) = track_id {
+                h.rebake_blocks_for_track(&t_id);
+            }
             build_status_response(&h)
         }
         IpcCommand::HumanizeTrack { track_id, section_id, timing_drift_ticks, drag_bias_ticks, velocity_jitter } => {
             h.timeline.humanize_track(&track_id, section_id.as_deref(), timing_drift_ticks, drag_bias_ticks, velocity_jitter);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::LoadProject { path } => {
@@ -660,6 +702,7 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
         IpcCommand::SetTrackParam { track_id, param_name, value } => {
             if let Some(&idx) = h.track_map.get(&track_id) {
                 h.tracks[idx].set_parameter(&param_name, value);
+                h.rebake_blocks_for_track(&track_id);
             }
             build_status_response(&h)
         }
@@ -689,23 +732,28 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
                 } else if fallback_path.exists() {
                     let _ = h.tracks[idx].load_patch_from_file(&fallback_path);
                 }
+                h.rebake_blocks_for_track(&track_id);
             }
             build_status_response(&h)
         }
         IpcCommand::SwitchTrackPlugin { track_id, plugin_uri_or_type, plugin_name } => {
             h.switch_track_instrument(&track_id, &plugin_uri_or_type, &plugin_name);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::AddTrackInsert { track_id, plugin_uri_or_path, plugin_name } => {
             h.add_track_insert(&track_id, &plugin_uri_or_path, &plugin_name);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::RemoveTrackInsert { track_id, insert_index } => {
             h.remove_track_insert(&track_id, insert_index);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::SetTrackInsertParam { track_id, insert_index, param_name, value } => {
             h.set_track_insert_param(&track_id, insert_index, &param_name, value);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::AddMasterInsert { plugin_uri_or_path, plugin_name } => {

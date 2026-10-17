@@ -1328,51 +1328,10 @@ fn test_polytempo_block_playback_and_loop_modes() {
 }
 
 #[test]
-fn test_stem_cache_manager_and_granular_block_stems() {
-    use jamseq::stem_cache::StemCacheManager;
-    use jamseq::timeline::{LoopMode, SongSection, TempoOverride, TrackBlock};
+fn test_discrete_granular_block_stems() {
+    use jamseq::timeline::{SongSection, TrackBlock};
 
-    let mut cache_mgr = StemCacheManager::new();
-    cache_mgr.clear().expect("Failed to clear in-memory cache");
-
-    // 1. Verify Content-Addressed Hash Stability & Invalidation
-    let mut block1 = TrackBlock::new("block_1", "bass_track", 1920)
-        .with_tempo(TempoOverride::AbsoluteBpm(120.0))
-        .with_loop_mode(LoopMode::OneShot);
-    block1.add_note(1, 2, 0, 480, 40, 1.0);
-
-    let key1 = cache_mgr.compute_block_key("bass_track", "verse", &block1, Some("patch_a"), 120.0);
-    let key1_repeat = cache_mgr.compute_block_key("bass_track", "verse", &block1, Some("patch_a"), 120.0);
-    assert_eq!(key1, key1_repeat, "Identical block parameters must produce identical content hash");
-
-    // Changing note pitch or velocity changes key
-    let mut block2 = block1.clone();
-    block2.events[0].action = jamseq::timeline::ScheduledAction::NoteOn { note: 41, velocity: 1.0 };
-    let key2 = cache_mgr.compute_block_key("bass_track", "verse", &block2, Some("patch_a"), 120.0);
-    assert_ne!(key1, key2, "Mutating a note must yield a distinct cache key");
-
-    // Changing tempo override changes key
-    let block3 = block1.clone().with_tempo(TempoOverride::Ratio(3, 2));
-    let key3 = cache_mgr.compute_block_key("bass_track", "verse", &block3, Some("patch_a"), 180.0);
-    assert_ne!(key1, key3, "Metric modulation tempo override must yield a distinct cache key");
-
-    // 2. Store and Load Chunks in RAM
-    let left_samples = vec![0.5f32; 512];
-    let right_samples = vec![-0.5f32; 512];
-    cache_mgr.store_chunk(&key1, &left_samples, &right_samples, 48000).expect("Store chunk failed");
-    assert!(cache_mgr.get_cached_chunk(&key1).is_some());
-
-    let loaded = cache_mgr.load_chunk(&key1).expect("Load chunk failed");
-    assert_eq!(loaded.samples_left.len(), 512);
-    assert_eq!(loaded.samples_right.len(), 512);
-    assert!((loaded.samples_left[0] - 0.5).abs() < 0.01);
-    assert!((loaded.samples_right[0] - (-0.5)).abs() < 0.01);
-
-    // Invalidate track
-    cache_mgr.invalidate_track("bass_track");
-    assert!(cache_mgr.get_cached_chunk(&key1).is_none(), "Invalidated track chunks must be purged");
-
-    // 3. Engine Granular Block Stem Rendering & Stitching
+    // Engine Granular Block Stem Rendering & Stitching
     let mut host = JamSeqHost::new(120.0, 48000.0);
     let mut bass = JamSynthEngine::new(48000.0);
     bass.load_patch(JamSynthPatch::preset_808_sub());
@@ -2234,4 +2193,105 @@ fn test_block_crud_lifecycle_and_ipc() {
     // 5. RemoveBlock from timeline
     assert!(host.remove_block("track_1", "blk_tl_1", None));
     assert_eq!(host.tracks[0].active_block_stems.len(), 0);
+}
+
+#[test]
+fn test_param_and_insert_updates_rebake_active_stems() {
+    use std::sync::{Arc, Mutex};
+    use jamseq::ipc::{execute_command, IpcCommand};
+
+    let jamsynth_path = if std::path::Path::new("target/debug/libjamsynth.so").exists() {
+        "target/debug/libjamsynth.so"
+    } else if std::path::Path::new("../target/debug/libjamsynth.so").exists() {
+        "../target/debug/libjamsynth.so"
+    } else {
+        panic!("libjamsynth.so not found");
+    };
+
+    let mut host = JamSeqHost::new(120.0, 48000.0);
+    let mut bass = JamSynthEngine::new(48000.0);
+    bass.load_patch(JamSynthPatch::preset_808_sub());
+    host.add_track(Track::new_synth("track_0", "Sub 808", bass));
+
+    let mut sec = SongSection::new_empty("sec_1", "Intro");
+    let mut block = TrackBlock::new("tb_1", "track_0", 3840);
+    block.add_note(1, 2, 0, 960, 48, 1.0);
+    sec.set_block(block);
+    host.add_section(sec);
+
+    assert_eq!(host.tracks[0].active_block_stems.len(), 1);
+    let orig_samples = host.tracks[0].active_block_stems[0].buffer.samples_left.clone();
+    assert!(!orig_samples.is_empty());
+    assert!(orig_samples.iter().any(|&s| s.abs() > 0.001), "Original stem should contain audio");
+
+    let host = Arc::new(Mutex::new(host));
+
+    // Update track param via IPC
+    let resp = execute_command(
+        IpcCommand::SetTrackParam {
+            track_id: "track_0".to_string(),
+            param_name: "cutoff".to_string(),
+            value: 150.0,
+        },
+        &host,
+    );
+    assert!(resp.ok, "SetTrackParam failed: {:?}", resp.error);
+
+    let cutoff_modified_samples = {
+        let h = host.lock().unwrap();
+        assert_eq!(h.tracks[0].active_block_stems.len(), 1);
+        let samples = h.tracks[0].active_block_stems[0].buffer.samples_left.clone();
+        assert_ne!(
+            samples, orig_samples,
+            "Altering cutoff must trigger re-bake resulting in different audio samples"
+        );
+        samples
+    };
+
+    // Add track insert effect via IPC
+    let resp = execute_command(
+        IpcCommand::AddTrackInsert {
+            track_id: "track_0".to_string(),
+            plugin_uri_or_path: jamsynth_path.to_string(),
+            plugin_name: "JamSynth Insert".to_string(),
+        },
+        &host,
+    );
+    assert!(resp.ok, "AddTrackInsert failed: {:?}", resp.error);
+
+    let insert_added_samples = {
+        let h = host.lock().unwrap();
+        assert_eq!(h.tracks[0].inserts.len(), 1);
+        assert_eq!(h.tracks[0].active_block_stems.len(), 1);
+        let samples = h.tracks[0].active_block_stems[0].buffer.samples_left.clone();
+        assert_ne!(
+            samples, cutoff_modified_samples,
+            "Adding an insert effect must trigger re-bake updating the active stem buffer"
+        );
+        samples
+    };
+
+    // Remove track insert via IPC
+    let resp = execute_command(
+        IpcCommand::RemoveTrackInsert {
+            track_id: "track_0".to_string(),
+            insert_index: 0,
+        },
+        &host,
+    );
+    assert!(resp.ok, "RemoveTrackInsert failed: {:?}", resp.error);
+
+    {
+        let h = host.lock().unwrap();
+        assert_eq!(h.tracks[0].inserts.len(), 0);
+        let samples = &h.tracks[0].active_block_stems[0].buffer.samples_left;
+        assert_ne!(
+            samples, &insert_added_samples,
+            "Removing an insert effect must trigger re-bake restoring the active stem buffer"
+        );
+        assert_eq!(
+            samples, &cutoff_modified_samples,
+            "Removing the insert should restore the pre-insert stem buffer"
+        );
+    }
 }

@@ -35,14 +35,12 @@ pub struct JamSeqHost {
     pub aux_right: Vec<Vec<f32>>,
     scratch_left: Vec<f32>,
     scratch_right: Vec<f32>,
-    pub stem_cache: crate::stem_cache::StemCacheManager,
 }
 
 impl JamSeqHost {
     pub fn new(bpm: f64, sample_rate: f32) -> Self {
         let sr = if sample_rate > 0.0 { sample_rate } else { 44100.0 };
         let available_plugins = crate::plugin_scanner::PluginScanner::scan_all();
-        let stem_cache = crate::stem_cache::StemCacheManager::new();
         Self {
             timeline: Timeline::new(bpm, sr as f64),
             tracks: Vec::new(),
@@ -64,7 +62,6 @@ impl JamSeqHost {
             aux_right: Vec::new(),
             scratch_left: vec![0.0; 2048],
             scratch_right: vec![0.0; 2048],
-            stem_cache,
         }
     }
 
