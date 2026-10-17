@@ -23,7 +23,7 @@ pub use plugin_scanner::{DiscoveredPlugin, PluginScanner};
 pub use recorder::{AudioRecorder, RecordedClipInfo};
 pub use sampler::{SamplerConfig, SamplerInstrument};
 pub use timeline::{
-    AutomationPoint, LoopMode, ScheduledAction, ScheduledEvent, SongSection, TempoOverride,
+    AutomationPoint, ScheduledAction, ScheduledEvent, SongSection, TempoOverride,
     TimeSignature, Timeline, TimelineArrangement, TrackBlock, PPQ, TICKS_PER_16TH,
 };
 pub use track::{InsertEffect, Track, TrackInstrument};

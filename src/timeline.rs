@@ -74,19 +74,6 @@ impl TempoOverride {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
-pub enum LoopMode {
-    OneShot,
-    LoopToSection,
-    FixedLoops(u32),
-}
-
-impl Default for LoopMode {
-    fn default() -> Self {
-        Self::OneShot
-    }
-}
-
 /// An individual musical block / clip assigned to a specific track inside a section.
 /// Follows REAPER-style item orientation within a region: plays once by default
 /// at its specified start offset relative to the section downbeat.
@@ -99,9 +86,7 @@ pub struct TrackBlock {
     #[serde(default)]
     pub start_offset_ticks: u64,
     #[serde(default)]
-    pub base_length_ticks: u64,
-    #[serde(default)]
-    pub loop_mode: LoopMode,
+    pub length_ticks: u64,
     #[serde(default)]
     pub tempo: Option<TempoOverride>,
     #[serde(default)]
@@ -119,8 +104,7 @@ impl TrackBlock {
             track_id: track_id.to_string(),
             section_id: None,
             start_offset_ticks: 0,
-            base_length_ticks: length_ticks,
-            loop_mode: LoopMode::OneShot,
+            length_ticks,
             tempo: None,
             time_signature: None,
             events: Vec::new(),
@@ -134,8 +118,7 @@ impl TrackBlock {
             track_id: track_id.to_string(),
             section_id: Some(section_id.to_string()),
             start_offset_ticks: 0,
-            base_length_ticks: length_ticks,
-            loop_mode: LoopMode::OneShot,
+            length_ticks,
             tempo: None,
             time_signature: None,
             events: Vec::new(),
@@ -149,8 +132,7 @@ impl TrackBlock {
             track_id: track_id.to_string(),
             section_id: None,
             start_offset_ticks: start_tick,
-            base_length_ticks: length_ticks,
-            loop_mode: LoopMode::OneShot,
+            length_ticks,
             tempo: None,
             time_signature: None,
             events: Vec::new(),
@@ -163,11 +145,11 @@ impl TrackBlock {
     }
 
     pub fn length_ticks(&self) -> u64 {
-        self.base_length_ticks
+        self.length_ticks
     }
 
     pub fn end_tick(&self) -> u64 {
-        self.start_offset_ticks + self.base_length_ticks
+        self.start_offset_ticks + self.length_ticks
     }
 
     pub fn with_offset(mut self, offset_ticks: u64) -> Self {
@@ -185,11 +167,6 @@ impl TrackBlock {
         self
     }
 
-    pub fn with_loop_mode(mut self, loop_mode: LoopMode) -> Self {
-        self.loop_mode = loop_mode;
-        self
-    }
-
     pub fn effective_bpm(&self, section_bpm: f64) -> f64 {
         match &self.tempo {
             Some(t) => t.compute(section_bpm),
@@ -202,16 +179,12 @@ impl TrackBlock {
     }
 
     pub fn effective_length_ticks(&self) -> u64 {
-        match self.loop_mode {
-            LoopMode::OneShot => self.base_length_ticks,
-            LoopMode::FixedLoops(count) => self.base_length_ticks * count as u64,
-            LoopMode::LoopToSection => self.base_length_ticks,
-        }
+        self.length_ticks
     }
 
     /// End tick boundary within the section (start_offset_ticks + effective_length_ticks)
     pub fn effective_end_tick(&self) -> u64 {
-        self.start_offset_ticks + self.effective_length_ticks()
+        self.start_offset_ticks + self.length_ticks
     }
 
     /// Returns all (start_tick, end_tick) intervals for notes of the given pitch in this block.
@@ -832,7 +805,7 @@ impl Timeline {
                         let block = sec.track_blocks.entry(ev.track_id.clone()).or_insert_with(|| {
                             TrackBlock::new(&format!("{}_{}", sec.id, ev.track_id), &ev.track_id, sec_len)
                         });
-                        block.base_length_ticks = block.base_length_ticks.max(sec_len);
+                        block.length_ticks = block.length_ticks.max(sec_len);
                         let mut local_ev = ev.clone();
                         local_ev.tick = (ev.tick.saturating_sub(sec_start)).saturating_sub(block.start_offset_ticks);
                         block.events.push(local_ev);
@@ -844,8 +817,8 @@ impl Timeline {
                 for block in sec.track_blocks.values_mut() {
                     block.events.sort_by_key(|e| e.tick);
                     if let Some(max_tick) = block.events.iter().map(|e| e.tick).max() {
-                        if max_tick >= block.base_length_ticks {
-                            block.base_length_ticks = ((max_tick / 240) + 1) * 240;
+                        if max_tick >= block.length_ticks {
+                            block.length_ticks = ((max_tick / 240) + 1) * 240;
                         }
                     }
                 }
@@ -1299,35 +1272,14 @@ impl Timeline {
                 let block_bpm = block.effective_bpm(sec_bpm);
                 let tempo_scale = if block_bpm > 0.0 { sec_bpm / block_bpm } else { 1.0 };
                 let block_start = sec_start + block.start_offset_ticks;
-                let iter_sec_len = (block.base_length_ticks as f64 * tempo_scale).round() as u64;
 
-                let num_loops = match block.loop_mode {
-                    LoopMode::OneShot => 1,
-                    LoopMode::FixedLoops(count) => count,
-                    LoopMode::LoopToSection => {
-                        if iter_sec_len > 0 && sec_len > block.start_offset_ticks {
-                            let available = sec_len - block.start_offset_ticks;
-                            ((available as f64 / iter_sec_len as f64).ceil() as u32).max(1)
-                        } else {
-                            1
-                        }
-                    }
-                };
+                for ev in &block.events {
+                    let scaled_tick = (ev.tick as f64 * tempo_scale).round() as u64;
+                    let abs_tick = block_start + scaled_tick;
 
-                for loop_idx in 0..num_loops {
-                    let iter_start = block_start + loop_idx as u64 * iter_sec_len;
-                    for ev in &block.events {
-                        let scaled_tick = (ev.tick as f64 * tempo_scale).round() as u64;
-                        let abs_tick = iter_start + scaled_tick;
-
-                        if block.loop_mode == LoopMode::LoopToSection && abs_tick >= sec_start + sec_len {
-                            continue;
-                        }
-
-                        let mut materialized = ev.clone();
-                        materialized.tick = abs_tick;
-                        all_events.push(materialized);
-                    }
+                    let mut materialized = ev.clone();
+                    materialized.tick = abs_tick;
+                    all_events.push(materialized);
                 }
             }
             accum_tick += sec_len;

@@ -1222,51 +1222,45 @@ fn test_block_hierarchy_and_tempo_inheritance() {
 }
 
 #[test]
-fn test_polytempo_block_playback_and_loop_modes() {
-    use jamseq::timeline::{LoopMode, SongSection, TempoOverride, TrackBlock};
+fn test_polytempo_block_playback_and_studio_arrangement() {
+    use jamseq::timeline::{SongSection, TempoOverride, TrackBlock};
 
     let mut timeline = jamseq::Timeline::new(120.0, 48000.0);
 
     // Section A (starts at 0)
     let mut sec_a = SongSection::new_empty("sec_a", "Section A");
 
-    // Track 1: Synth (standard 120 BPM, repeats 2 times via FixedLoops)
-    let mut synth_block = TrackBlock::new("tb_synth", "synth", 1920)
-        .with_loop_mode(LoopMode::FixedLoops(2));
+    // Track 1: Synth (standard 120 BPM, length 1920 ticks)
+    let mut synth_block = TrackBlock::new("tb_synth", "synth", 1920);
     synth_block.add_note(101, 102, 0, 480, 60, 0.8);
     sec_a.set_block(synth_block);
 
     // Track 2: Polytempo Lead (Ratio 3:2 = 180 BPM, starts at offset 960 ticks)
     let mut lead_block = TrackBlock::new("tb_lead", "lead", 1920)
         .with_offset(960)
-        .with_tempo(TempoOverride::Ratio(3, 2))
-        .with_loop_mode(LoopMode::OneShot);
+        .with_tempo(TempoOverride::Ratio(3, 2));
     // Note in lead local time: duration 480 ticks
     lead_block.add_note(201, 202, 0, 480, 72, 0.9);
     sec_a.set_block(lead_block);
 
-    // Track 3: Drum Loop (1 bar = 1920 ticks, LoopToSection to fill 3840 ticks)
-    let mut drum_block = TrackBlock::new("tb_drums", "drums", 1920)
-        .with_loop_mode(LoopMode::LoopToSection);
+    // Track 3: Drum Loop (1 bar = 1920 ticks)
+    let mut drum_block = TrackBlock::new("tb_drums", "drums", 1920);
     drum_block.add_note(301, 302, 0, 240, 36, 1.0);
     sec_a.set_block(drum_block);
 
     timeline.add_section(sec_a);
 
-    // Section extent: synth is 1920*2 = 3840 ticks. drums loop to 3840 ticks.
-    // lead is 960 + 1920 = 2880 ticks.
-    assert_eq!(timeline.total_ticks, 3840);
+    // Section extent: lead has offset 960 + 1920 = 2880 ticks.
+    assert_eq!(timeline.total_ticks, 2880);
 
     // Verify materialized active events
     let events = timeline.materialize_all_events();
 
-    // Synth: Loop 0 (NoteOn @ 0, NoteOff @ 480), Loop 1 (NoteOn @ 1920, NoteOff @ 2400)
+    // Synth: Pure studio placement without hidden loop repetitions (NoteOn @ 0, NoteOff @ 480)
     let synth_notes: Vec<&ScheduledEvent> = events.iter().filter(|e| e.track_id == "synth").collect();
-    assert_eq!(synth_notes.len(), 4);
+    assert_eq!(synth_notes.len(), 2);
     assert_eq!(synth_notes[0].tick, 0);
     assert_eq!(synth_notes[1].tick, 480);
-    assert_eq!(synth_notes[2].tick, 1920);
-    assert_eq!(synth_notes[3].tick, 2400);
 
     // Lead (Ratio 3:2): NoteOn @ 960 (960 + 0).
     // Note duration scaled by 120/180 = 2/3: 480 * 2/3 = 320 ticks!
@@ -1276,13 +1270,11 @@ fn test_polytempo_block_playback_and_loop_modes() {
     assert_eq!(lead_notes[0].tick, 960);
     assert_eq!(lead_notes[1].tick, 1280);
 
-    // Drums (LoopToSection over 3840 ticks with base 1920): 2 iterations (0 and 1920)
+    // Drums: NoteOn @ 0, NoteOff @ 240
     let drum_notes: Vec<&ScheduledEvent> = events.iter().filter(|e| e.track_id == "drums").collect();
-    assert_eq!(drum_notes.len(), 4);
+    assert_eq!(drum_notes.len(), 2);
     assert_eq!(drum_notes[0].tick, 0);
     assert_eq!(drum_notes[1].tick, 240);
-    assert_eq!(drum_notes[2].tick, 1920);
-    assert_eq!(drum_notes[3].tick, 2160);
 
     // Test Audio Advance & Playback Cursors
     timeline.seek_tick(0);
@@ -1310,8 +1302,7 @@ fn test_polytempo_block_playback_and_loop_modes() {
 
     let mut bass_sec = SongSection::new_empty("b_sec", "Bass Section");
     let mut bass_block = TrackBlock::new("tb_bass", "poly_bass", 1920)
-        .with_tempo(TempoOverride::Ratio(3, 2))
-        .with_loop_mode(LoopMode::OneShot);
+        .with_tempo(TempoOverride::Ratio(3, 2));
     bass_block.add_note(401, 402, 0, 480, 48, 0.9);
     bass_sec.set_block(bass_block);
     host.add_section(bass_sec);
@@ -1442,8 +1433,7 @@ fn test_project_track_persistence_and_auto_discovery() {
                         "id": "intro_track_1",
                         "track_id": "track_1",
                         "start_offset_ticks": 0,
-                        "base_length_ticks": 3840,
-                        "loop_mode": "OneShot",
+                        "length_ticks": 3840,
                         "tempo": null,
                         "events": [],
                         "audio_file": null
@@ -1464,8 +1454,7 @@ fn test_project_track_persistence_and_auto_discovery() {
                         "id": "verse_track_2",
                         "track_id": "track_2",
                         "start_offset_ticks": 0,
-                        "base_length_ticks": 3840,
-                        "loop_mode": "OneShot",
+                        "length_ticks": 3840,
                         "tempo": null,
                         "events": [],
                         "audio_file": null
