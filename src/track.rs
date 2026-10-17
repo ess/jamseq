@@ -123,6 +123,16 @@ impl Default for MasterBus {
     }
 }
 
+/// Independent discrete in-memory audio stem for a single block.
+#[derive(Debug, Clone)]
+pub struct BlockStem {
+    pub block_id: String,
+    pub track_id: String,
+    pub start_sample: usize,
+    pub end_sample: usize,
+    pub buffer: crate::sampler::SampleBuffer,
+}
+
 pub struct Track {
     pub id: String,
     pub name: String,
@@ -133,8 +143,8 @@ pub struct Track {
     pub muted: bool,
     pub solo: bool,
     pub is_frozen: bool,
-    pub cached_stem: Option<crate::audio_clip::AudioClip>,
-    pub stem_dirty: bool,
+    pub active_block_stems: Vec<BlockStem>,
+    pub arranger_mode: crate::timeline::TrackArrangerMode,
     pub volume: f32, // Gain multiplier (0.0 to 2.0)
     pub pan: f32,    // -1.0 (hard left) to 1.0 (hard right)
     pub current_plugin: Option<String>,
@@ -143,6 +153,10 @@ pub struct Track {
 }
 
 impl Track {
+    pub fn has_active_stems(&self) -> bool {
+        !self.active_block_stems.is_empty()
+    }
+
     pub fn new_synth(id: &str, name: &str, engine: JamSynthEngine) -> Self {
         Self {
             id: id.to_string(),
@@ -154,8 +168,8 @@ impl Track {
             muted: false,
             solo: false,
             is_frozen: false,
-            cached_stem: None,
-            stem_dirty: true,
+            active_block_stems: Vec::new(),
+            arranger_mode: crate::timeline::TrackArrangerMode::Section,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some("JamSynth (Built-in)".to_string()),
@@ -175,8 +189,8 @@ impl Track {
             muted: false,
             solo: false,
             is_frozen: false,
-            cached_stem: None,
-            stem_dirty: true,
+            active_block_stems: Vec::new(),
+            arranger_mode: crate::timeline::TrackArrangerMode::Section,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some(plugin_name.to_string()),
@@ -196,8 +210,8 @@ impl Track {
             muted: false,
             solo: false,
             is_frozen: false,
-            cached_stem: None,
-            stem_dirty: true,
+            active_block_stems: Vec::new(),
+            arranger_mode: crate::timeline::TrackArrangerMode::Section,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some(plugin_name.to_string()),
@@ -217,8 +231,8 @@ impl Track {
             muted: false,
             solo: false,
             is_frozen: false,
-            cached_stem: None,
-            stem_dirty: true,
+            active_block_stems: Vec::new(),
+            arranger_mode: crate::timeline::TrackArrangerMode::Section,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some("Sampler".to_string()),
@@ -238,8 +252,8 @@ impl Track {
             muted: false,
             solo: false,
             is_frozen: false,
-            cached_stem: None,
-            stem_dirty: false,
+            active_block_stems: Vec::new(),
+            arranger_mode: crate::timeline::TrackArrangerMode::Timeline,
             volume: 1.0,
             pan: 0.0,
             current_plugin: None,
@@ -259,8 +273,8 @@ impl Track {
             muted: false,
             solo: false,
             is_frozen: false,
-            cached_stem: None,
-            stem_dirty: true,
+            active_block_stems: Vec::new(),
+            arranger_mode: crate::timeline::TrackArrangerMode::Section,
             volume: 1.0,
             pan: 0.0,
             current_plugin: Some(plugin_name.to_string()),
@@ -301,11 +315,6 @@ impl Track {
 
     pub fn remove_sidechain(&mut self, target_track_id: &str, target_insert_index: usize) {
         self.sidechains.retain(|s| !(s.target_track_id == target_track_id && s.target_insert_index == target_insert_index));
-    }
-
-    pub fn mark_stem_dirty(&mut self) {
-        self.cached_stem = None;
-        self.stem_dirty = true;
     }
 
     pub fn set_sample_rate(&mut self, rate: f32) {
@@ -388,7 +397,6 @@ impl Track {
 
     /// Set a named DSP / engine parameter live
     pub fn set_parameter(&mut self, param_name: &str, value: f32) {
-        self.mark_stem_dirty();
         match &mut self.instrument {
             TrackInstrument::Synth(synth) => {
                 match param_name {
@@ -555,7 +563,6 @@ impl Track {
 
     /// Load a synth patch from a JSON preset file into this track
     pub fn load_patch_from_file(&mut self, path: &std::path::Path) -> anyhow::Result<()> {
-        self.mark_stem_dirty();
         let content = std::fs::read_to_string(path)?;
         match &mut self.instrument {
             TrackInstrument::Clap(clap) => {
@@ -635,7 +642,7 @@ impl Track {
         scratch_left: &mut [f32],
         scratch_right: &mut [f32],
         sidechain_buffers: Option<&std::collections::HashMap<(String, usize), (Vec<f32>, Vec<f32>)>>,
-        bypass_cached_stem: bool,
+        bypass_stems: bool,
         is_playing: bool,
     ) {
         if self.muted {
@@ -646,28 +653,22 @@ impl Track {
         scratch_left[..num_samples].fill(0.0);
         scratch_right[..num_samples].fill(0.0);
 
-        // If a pre-rendered stem is available and not bypassed, stream directly from the cached stem (only while playing)!
+        // If pre-rendered discrete block stems are available and not bypassed, stream additively from block stems (only while playing)!
         let mut played_from_stem = false;
-        if !bypass_cached_stem && !self.is_frozen && is_playing {
-            if let Some(ref stem) = self.cached_stem {
-                if let Some(ref buf) = stem.buffer {
-                    let clip_len = buf.samples_left.len() as u64;
-                    if clip_len > 0 {
-                        let rel_sample = if current_timeline_sample >= stem.start_sample {
-                            current_timeline_sample - stem.start_sample
-                        } else {
-                            0
-                        };
+        if !bypass_stems && !self.is_frozen && is_playing {
+            for block_stem in &self.active_block_stems {
+                let start = block_stem.start_sample as u64;
+                let end = block_stem.end_sample as u64;
+                if current_timeline_sample < end && (current_timeline_sample + num_samples as u64) > start {
+                    let offset = (current_timeline_sample as usize).saturating_sub(block_stem.start_sample);
+                    let available = block_stem.buffer.samples_left.len().saturating_sub(offset);
+                    let count = num_samples.min(available);
 
-                        for i in 0..num_samples {
-                            let offset = ((rel_sample + i as u64) % clip_len) as usize;
-                            if offset < buf.samples_left.len() {
-                                scratch_left[i] += buf.samples_left[offset];
-                                scratch_right[i] += buf.samples_right[offset];
-                            }
-                        }
-                        played_from_stem = true;
+                    for i in 0..count {
+                        scratch_left[i] += block_stem.buffer.samples_left[offset + i];
+                        scratch_right[i] += block_stem.buffer.samples_right[offset + i];
                     }
+                    played_from_stem = true;
                 }
             }
         }

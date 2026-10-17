@@ -95,6 +95,8 @@ pub struct TrackBlock {
     pub id: String,
     pub track_id: String,
     #[serde(default)]
+    pub section_id: Option<String>,
+    #[serde(default)]
     pub start_offset_ticks: u64,
     #[serde(default)]
     pub base_length_ticks: u64,
@@ -115,6 +117,7 @@ impl TrackBlock {
         Self {
             id: id.to_string(),
             track_id: track_id.to_string(),
+            section_id: None,
             start_offset_ticks: 0,
             base_length_ticks: length_ticks,
             loop_mode: LoopMode::OneShot,
@@ -123,6 +126,48 @@ impl TrackBlock {
             events: Vec::new(),
             audio_file: None,
         }
+    }
+
+    pub fn new_section(id: &str, track_id: &str, section_id: &str, length_ticks: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            track_id: track_id.to_string(),
+            section_id: Some(section_id.to_string()),
+            start_offset_ticks: 0,
+            base_length_ticks: length_ticks,
+            loop_mode: LoopMode::OneShot,
+            tempo: None,
+            time_signature: None,
+            events: Vec::new(),
+            audio_file: None,
+        }
+    }
+
+    pub fn new_timeline(id: &str, track_id: &str, start_tick: u64, length_ticks: u64) -> Self {
+        Self {
+            id: id.to_string(),
+            track_id: track_id.to_string(),
+            section_id: None,
+            start_offset_ticks: start_tick,
+            base_length_ticks: length_ticks,
+            loop_mode: LoopMode::OneShot,
+            tempo: None,
+            time_signature: None,
+            events: Vec::new(),
+            audio_file: None,
+        }
+    }
+
+    pub fn start_tick(&self) -> u64 {
+        self.start_offset_ticks
+    }
+
+    pub fn length_ticks(&self) -> u64 {
+        self.base_length_ticks
+    }
+
+    pub fn end_tick(&self) -> u64 {
+        self.start_offset_ticks + self.base_length_ticks
     }
 
     pub fn with_offset(mut self, offset_ticks: u64) -> Self {
@@ -227,6 +272,20 @@ impl TrackBlock {
         self.events.push(on);
         self.events.push(off);
         self.events.sort_by_key(|e| e.tick);
+    }
+}
+
+/// Track Arranger Mode distinguishing between Grid-based section looping
+/// and Ad-hoc free-floating timeline tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TrackArrangerMode {
+    Section,  // Grid-based, bound to song sections
+    Timeline, // Ad-hoc, free-floating across the timeline ruler
+}
+
+impl Default for TrackArrangerMode {
+    fn default() -> Self {
+        TrackArrangerMode::Section
     }
 }
 
@@ -476,6 +535,8 @@ pub struct TrackConfig {
     pub name: String,
     #[serde(default = "default_track_type")]
     pub track_type: String,
+    #[serde(default)]
+    pub arranger_mode: TrackArrangerMode,
     #[serde(default = "default_volume")]
     pub volume: f32,
     #[serde(default)]
@@ -547,6 +608,8 @@ pub struct TimelineArrangement {
     #[serde(default)]
     pub aux_buses: Vec<AuxBusConfig>,
     pub sections: Vec<SongSection>,
+    #[serde(default)]
+    pub timeline_blocks: Vec<TrackBlock>,
     #[serde(skip_serializing, default)]
     pub events: Vec<ScheduledEvent>,
 }
@@ -563,6 +626,7 @@ impl Default for TimelineArrangement {
             master_bus: None,
             aux_buses: Vec::new(),
             sections: Vec::new(),
+            timeline_blocks: Vec::new(),
             events: Vec::new(),
         }
     }
@@ -581,6 +645,11 @@ impl TimelineArrangement {
                 if !discovered_ids.contains(t_id) {
                     discovered_ids.push(t_id.clone());
                 }
+            }
+        }
+        for tb in &self.timeline_blocks {
+            if !discovered_ids.contains(&tb.track_id) {
+                discovered_ids.push(tb.track_id.clone());
             }
         }
         for ev in &self.events {
@@ -612,6 +681,7 @@ impl TimelineArrangement {
                 id,
                 name,
                 track_type,
+                arranger_mode: TrackArrangerMode::Section,
                 volume: 1.0,
                 pan: 0.0,
                 muted: false,
@@ -659,6 +729,7 @@ pub struct Timeline {
     pub loop_end_tick: u64,
     pub is_playing: bool,
     pub sections: Vec<SongSection>,
+    pub timeline_blocks: Vec<TrackBlock>,
     pub events: Vec<ScheduledEvent>,
     pub active_events: Vec<ScheduledEvent>,
     pub track_cursors: HashMap<String, TrackPlaybackCursor>,
@@ -682,6 +753,7 @@ impl Timeline {
             loop_end_tick: 0,
             is_playing: false,
             sections: Vec::new(),
+            timeline_blocks: Vec::new(),
             events: Vec::new(),
             active_events: Vec::new(),
             track_cursors: HashMap::new(),
@@ -708,6 +780,15 @@ impl Timeline {
         self.bpm = arrangement.bpm;
         self.time_signature = arrangement.time_signature;
         self.sections = arrangement.sections;
+        for sec in &mut self.sections {
+            for b in sec.track_blocks.values_mut() {
+                b.section_id = Some(sec.id.clone());
+            }
+        }
+        self.timeline_blocks = arrangement.timeline_blocks;
+        for b in &mut self.timeline_blocks {
+            b.section_id = None;
+        }
         let computed = self.computed_total_ticks();
         self.total_ticks = if computed > 0 {
             computed
@@ -794,6 +875,7 @@ impl Timeline {
             master_bus: None,
             aux_buses: Vec::new(),
             sections: self.sections.clone(),
+            timeline_blocks: self.timeline_blocks.clone(),
             events: Vec::new(),
         }
     }
@@ -947,9 +1029,11 @@ impl Timeline {
         self.sections.iter().take(section_idx).map(|s| s.length_ticks()).sum()
     }
 
-    /// Total arrangement ticks derived from all sections.
+    /// Total arrangement ticks derived from all sections and ad-hoc timeline blocks.
     pub fn computed_total_ticks(&self) -> u64 {
-        self.sections.iter().map(|s| s.length_ticks()).sum()
+        let sec_total: u64 = self.sections.iter().map(|s| s.length_ticks()).sum();
+        let tb_max = self.timeline_blocks.iter().map(|b| b.end_tick()).max().unwrap_or(0);
+        sec_total.max(tb_max)
     }
 
     /// Refresh timeline derived boundaries (total_ticks and loop points)
@@ -1011,8 +1095,9 @@ impl Timeline {
     }
 
     /// Add or update a TrackBlock in a section
-    pub fn set_track_block(&mut self, section_id: &str, block: TrackBlock) -> bool {
+    pub fn set_track_block(&mut self, section_id: &str, mut block: TrackBlock) -> bool {
         if let Some(sec) = self.sections.iter_mut().find(|s| s.id == section_id) {
+            block.section_id = Some(section_id.to_string());
             sec.track_blocks.insert(block.track_id.clone(), block);
             self.rebuild_active_events();
             true
@@ -1032,6 +1117,58 @@ impl Timeline {
         } else {
             false
         }
+    }
+
+    /// Add or update an ad-hoc timeline block
+    pub fn set_timeline_block(&mut self, block: TrackBlock) -> bool {
+        if let Some(pos) = self.timeline_blocks.iter().position(|b| b.id == block.id) {
+            self.timeline_blocks[pos] = block;
+        } else {
+            self.timeline_blocks.push(block);
+        }
+        self.rebuild_active_events();
+        true
+    }
+
+    /// Remove an ad-hoc timeline block by id
+    pub fn remove_timeline_block(&mut self, block_id: &str) -> bool {
+        let orig_len = self.timeline_blocks.len();
+        self.timeline_blocks.retain(|b| b.id != block_id);
+        let removed = self.timeline_blocks.len() < orig_len;
+        if removed {
+            self.rebuild_active_events();
+        }
+        removed
+    }
+
+    pub fn get_timeline_block(&self, block_id: &str) -> Option<&TrackBlock> {
+        self.timeline_blocks.iter().find(|b| b.id == block_id)
+    }
+
+    pub fn get_timeline_blocks_for_track(&self, track_id: &str) -> Vec<&TrackBlock> {
+        self.timeline_blocks.iter().filter(|b| b.track_id == track_id).collect()
+    }
+
+    /// Returns all blocks for the given track along with their absolute start tick on the timeline:
+    /// (block, absolute_start_tick)
+    pub fn get_resolved_blocks_for_track<'a>(&'a self, track_id: &str) -> Vec<(&'a TrackBlock, u64)> {
+        let mut resolved = Vec::new();
+
+        // 1. Blocks from sections:
+        for (sec_idx, sec) in self.sections.iter().enumerate() {
+            if let Some(block) = sec.track_blocks.get(track_id) {
+                let sec_start_tick = self.section_start_tick(sec_idx);
+                let block_start_tick = sec_start_tick + block.start_offset_ticks;
+                resolved.push((block, block_start_tick));
+            }
+        }
+
+        // 2. Timeline blocks (where start_offset_ticks is the absolute timeline tick):
+        for block in self.timeline_blocks.iter().filter(|b| b.track_id == track_id) {
+            resolved.push((block, block.start_offset_ticks));
+        }
+
+        resolved
     }
 
     /// Set tempo override on a section
@@ -1129,6 +1266,9 @@ impl Timeline {
                 self.track_cursors.entry(track_id.clone()).or_insert_with(|| TrackPlaybackCursor::new(self.current_tick as f64));
             }
         }
+        for tb in &self.timeline_blocks {
+            self.track_cursors.entry(tb.track_id.clone()).or_insert_with(|| TrackPlaybackCursor::new(self.current_tick as f64));
+        }
     }
 
     /// Get effective tempo for a specific track at a given tick position
@@ -1145,7 +1285,7 @@ impl Timeline {
         }
     }
 
-    /// Materialize all scheduled events from block-based events
+    /// Materialize all scheduled events from block-based events and ad-hoc timeline blocks
     pub fn materialize_all_events(&self) -> Vec<ScheduledEvent> {
         let mut all_events = Vec::new();
         let mut accum_tick = 0u64;
@@ -1191,6 +1331,16 @@ impl Timeline {
                 }
             }
             accum_tick += sec_len;
+        }
+
+        // Materialize ad-hoc continuous timeline blocks
+        for block in &self.timeline_blocks {
+            for ev in &block.events {
+                let mut materialized = ev.clone();
+                materialized.tick = block.start_offset_ticks + ev.tick;
+                materialized.track_id = block.track_id.clone();
+                all_events.push(materialized);
+            }
         }
 
         all_events.sort_by_key(|e| e.tick);

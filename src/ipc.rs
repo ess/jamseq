@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use crate::timeline::{ScheduledEvent, SongSection, TempoOverride, TimeSignature, TrackBlock};
+use crate::timeline::{ScheduledEvent, SongSection, TempoOverride, TimeSignature, TrackArrangerMode, TrackBlock};
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", content = "args")]
@@ -242,10 +242,6 @@ pub enum IpcCommand {
         track_id: String,
         new_track_name: String,
     },
-    /// Regenerate cached stems in memory for dirty tracks or a specific track
-    RegenerateStems {
-        track_id: Option<String>,
-    },
     /// Rescan system for newly installed LV2 and CLAP plugins
     RescanPlugins,
     /// Add or append a song section with tick precision
@@ -263,15 +259,28 @@ pub enum IpcCommand {
     UpdateSection {
         section: SongSection,
     },
-    /// Add or update a TrackBlock in a section
-    SetTrackBlock {
-        section_id: String,
+    /// Create and allocate a new TrackBlock (in a section or on the timeline)
+    AddBlock {
+        track_id: String,
+        #[serde(default)]
+        block_id: Option<String>,
+        #[serde(default)]
+        section_id: Option<String>,
+        #[serde(default)]
+        start_tick: Option<u64>,
+        #[serde(default)]
+        length_ticks: Option<u64>,
+    },
+    /// Update an existing TrackBlock in place
+    UpdateBlock {
         block: TrackBlock,
     },
-    /// Remove a TrackBlock from a section
-    RemoveTrackBlock {
-        section_id: String,
+    /// Remove a TrackBlock (from a section or the timeline)
+    RemoveBlock {
         track_id: String,
+        block_id: String,
+        #[serde(default)]
+        section_id: Option<String>,
     },
     /// Set a section's tempo override
     SetSectionTempo {
@@ -299,6 +308,11 @@ pub enum IpcCommand {
         section_id: String,
         track_id: String,
         time_signature: Option<TimeSignature>,
+    },
+    /// Set a track's arranger mode (Section vs Timeline)
+    SetTrackArrangerMode {
+        track_id: String,
+        mode: TrackArrangerMode,
     },
 }
 
@@ -383,8 +397,7 @@ pub struct TrackStatus {
     pub muted: bool,
     pub solo: bool,
     pub is_frozen: bool,
-    pub has_cached_stem: bool,
-    pub stem_dirty: bool,
+    pub has_active_stems: bool,
     pub peak_level: f32,
     pub params: Vec<TrackParamStatus>,
     pub inserts: Vec<TrackInsertStatus>,
@@ -395,6 +408,8 @@ pub struct TrackStatus {
     pub current_bpm: f64,
     #[serde(default)]
     pub current_time_signature: TimeSignature,
+    #[serde(default)]
+    pub arranger_mode: TrackArrangerMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,6 +433,8 @@ pub struct IpcStatusResponse {
     pub mic_peak: f32,
     pub active_section_id: Option<String>,
     pub sections: Vec<SongSection>,
+    #[serde(default)]
+    pub timeline_blocks: Vec<TrackBlock>,
     pub tracks: Vec<TrackStatus>,
     pub events: Vec<ScheduledEvent>,
     pub available_plugins: Vec<crate::plugin_scanner::DiscoveredPlugin>,
@@ -585,37 +602,69 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
             build_status_response(&h)
         }
         IpcCommand::ReplaceSectionEvents { section_id, track_id, events } => {
-            h.mark_track_dirty(&track_id);
             h.timeline.replace_section_track_events(&section_id, &track_id, events);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::AddNote { note_on_id, note_off_id, track_id, tick, duration_ticks, note, velocity } => {
-            h.mark_track_dirty(&track_id);
             h.timeline.add_note(note_on_id, note_off_id, &track_id, tick, duration_ticks, note, velocity);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::DeleteNoteAt { track_id, tick, note } => {
-            h.mark_track_dirty(&track_id);
             h.timeline.delete_note_at(&track_id, tick, note);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::MoveEvent { event_id, new_tick } => {
+            let track_id = h.timeline.events.iter().find(|e| e.id == event_id).map(|e| e.track_id.clone())
+                .or_else(|| {
+                    for s in &h.timeline.sections {
+                        for (t_id, b) in &s.track_blocks {
+                            if b.events.iter().any(|e| e.id == event_id) {
+                                return Some(t_id.clone());
+                            }
+                        }
+                    }
+                    for b in &h.timeline.timeline_blocks {
+                        if b.events.iter().any(|e| e.id == event_id) {
+                            return Some(b.track_id.clone());
+                        }
+                    }
+                    None
+                });
             h.timeline.move_event(event_id, new_tick);
-            for t in &mut h.tracks {
-                t.mark_stem_dirty();
+            if let Some(t_id) = track_id {
+                h.rebake_blocks_for_track(&t_id);
             }
             build_status_response(&h)
         }
         IpcCommand::RemoveEvent { event_id } => {
+            let track_id = h.timeline.events.iter().find(|e| e.id == event_id).map(|e| e.track_id.clone())
+                .or_else(|| {
+                    for s in &h.timeline.sections {
+                        for (t_id, b) in &s.track_blocks {
+                            if b.events.iter().any(|e| e.id == event_id) {
+                                return Some(t_id.clone());
+                            }
+                        }
+                    }
+                    for b in &h.timeline.timeline_blocks {
+                        if b.events.iter().any(|e| e.id == event_id) {
+                            return Some(b.track_id.clone());
+                        }
+                    }
+                    None
+                });
             h.timeline.remove_event(event_id);
-            for t in &mut h.tracks {
-                t.mark_stem_dirty();
+            if let Some(t_id) = track_id {
+                h.rebake_blocks_for_track(&t_id);
             }
             build_status_response(&h)
         }
         IpcCommand::HumanizeTrack { track_id, section_id, timing_drift_ticks, drag_bias_ticks, velocity_jitter } => {
-            h.mark_track_dirty(&track_id);
             h.timeline.humanize_track(&track_id, section_id.as_deref(), timing_drift_ticks, drag_bias_ticks, velocity_jitter);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::LoadProject { path } => {
@@ -651,9 +700,9 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
             build_status_response(&h)
         }
         IpcCommand::SetTrackParam { track_id, param_name, value } => {
-            h.mark_track_dirty(&track_id);
             if let Some(&idx) = h.track_map.get(&track_id) {
                 h.tracks[idx].set_parameter(&param_name, value);
+                h.rebake_blocks_for_track(&track_id);
             }
             build_status_response(&h)
         }
@@ -670,7 +719,6 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
             build_status_response(&h)
         }
         IpcCommand::LoadTrackPreset { track_id, preset_name } => {
-            h.mark_track_dirty(&track_id);
             let filename = if preset_name.ends_with(".json") {
                 preset_name.clone()
             } else {
@@ -684,26 +732,28 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
                 } else if fallback_path.exists() {
                     let _ = h.tracks[idx].load_patch_from_file(&fallback_path);
                 }
+                h.rebake_blocks_for_track(&track_id);
             }
             build_status_response(&h)
         }
         IpcCommand::SwitchTrackPlugin { track_id, plugin_uri_or_type, plugin_name } => {
-            h.mark_track_dirty(&track_id);
             h.switch_track_instrument(&track_id, &plugin_uri_or_type, &plugin_name);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::AddTrackInsert { track_id, plugin_uri_or_path, plugin_name } => {
-            h.mark_track_dirty(&track_id);
             h.add_track_insert(&track_id, &plugin_uri_or_path, &plugin_name);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::RemoveTrackInsert { track_id, insert_index } => {
-            h.mark_track_dirty(&track_id);
             h.remove_track_insert(&track_id, insert_index);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::SetTrackInsertParam { track_id, insert_index, param_name, value } => {
             h.set_track_insert_param(&track_id, insert_index, &param_name, value);
+            h.rebake_blocks_for_track(&track_id);
             build_status_response(&h)
         }
         IpcCommand::AddMasterInsert { plugin_uri_or_path, plugin_name } => {
@@ -788,12 +838,10 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
             build_status_response(&h)
         }
         IpcCommand::SetInsertSidechain { track_id, insert_index, source_track_id, gain } => {
-            h.mark_track_dirty(&track_id);
             h.set_insert_sidechain(&track_id, insert_index, &source_track_id, gain);
             build_status_response(&h)
         }
         IpcCommand::RemoveInsertSidechain { track_id, insert_index } => {
-            h.mark_track_dirty(&track_id);
             h.remove_insert_sidechain(&track_id, insert_index);
             build_status_response(&h)
         }
@@ -807,25 +855,6 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
         }
         IpcCommand::BounceTrack { track_id, new_track_name } => {
             let _ = h.bounce_track(&track_id, &new_track_name);
-            build_status_response(&h)
-        }
-        IpcCommand::RegenerateStems { track_id } => {
-            if let Some(id) = track_id {
-                let num_bars = ((h.timeline.total_ticks / (4 * crate::timeline::PPQ)) as u32).max(1);
-                if let Ok(buf) = h.render_track_to_buffer(&id, num_bars) {
-                    if let Some(&idx) = h.track_map.get(&id) {
-                        let clip = crate::audio_clip::AudioClip::from_buffer(
-                            std::path::PathBuf::from(format!("autostem_{}.wav", id)),
-                            0,
-                            buf,
-                        );
-                        h.tracks[idx].cached_stem = Some(clip);
-                        h.tracks[idx].stem_dirty = false;
-                    }
-                }
-            } else {
-                h.generate_stems_for_dirty_tracks();
-            }
             build_status_response(&h)
         }
         IpcCommand::RescanPlugins => {
@@ -845,12 +874,16 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
             let _ = h.update_section(section);
             build_status_response(&h)
         }
-        IpcCommand::SetTrackBlock { section_id, block } => {
-            let _ = h.set_track_block(&section_id, block);
+        IpcCommand::AddBlock { track_id, block_id, section_id, start_tick, length_ticks } => {
+            let _ = h.add_block(&track_id, block_id.as_deref(), section_id.as_deref(), start_tick, length_ticks);
             build_status_response(&h)
         }
-        IpcCommand::RemoveTrackBlock { section_id, track_id } => {
-            let _ = h.remove_track_block(&section_id, &track_id);
+        IpcCommand::UpdateBlock { block } => {
+            let _ = h.update_block(block);
+            build_status_response(&h)
+        }
+        IpcCommand::RemoveBlock { track_id, block_id, section_id } => {
+            let _ = h.remove_block(&track_id, &block_id, section_id.as_deref());
             build_status_response(&h)
         }
         IpcCommand::SetSectionTempo { section_id, tempo } => {
@@ -871,6 +904,10 @@ pub fn execute_command(cmd: IpcCommand, host: &Arc<Mutex<JamSeqHost>>) -> IpcRes
         }
         IpcCommand::SetBlockTimeSignature { section_id, track_id, time_signature } => {
             let _ = h.set_block_time_signature(&section_id, &track_id, time_signature);
+            build_status_response(&h)
+        }
+        IpcCommand::SetTrackArrangerMode { track_id, mode } => {
+            let _ = h.set_track_arranger_mode(&track_id, mode);
             build_status_response(&h)
         }
         IpcCommand::GetStatus => build_status_response(&h),
@@ -925,8 +962,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 muted: t.muted,
                 solo: t.solo,
                 is_frozen: t.is_frozen,
-                has_cached_stem: t.cached_stem.is_some(),
-                stem_dirty: t.stem_dirty,
+                has_active_stems: t.has_active_stems(),
                 peak_level: t.peak_level,
                 params,
                 inserts,
@@ -935,6 +971,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
                 current_plugin: t.current_plugin.clone(),
                 current_bpm: t.current_bpm,
                 current_time_signature: cur_ts,
+                arranger_mode: t.arranger_mode,
             }
         })
         .collect();
@@ -997,6 +1034,7 @@ fn build_status_struct(h: &JamSeqHost) -> IpcStatusResponse {
         mic_peak: h.recorder.get_peak_input(),
         active_section_id: active_section,
         sections: h.timeline.sections.clone(),
+        timeline_blocks: h.timeline.timeline_blocks.clone(),
         tracks: track_statuses,
         events: h.timeline.events.clone(),
         available_plugins: h.available_plugins.clone(),
